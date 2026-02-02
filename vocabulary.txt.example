@@ -1,0 +1,10 @@
+# Custom vocabulary for push-to-talk
+# Add words/phrases one per line, or they'll be learned from corrections
+# Examples of correction phrases: "correction: [word]", "no, [word]", "I meant [word]"
+
+Accenture
+Anthropic
+Brace Yourself Solutions
+Claude
+Ethan Brace
+Hello World
