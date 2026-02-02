@@ -9,3 +9,4 @@ Claude
 Ethan Brace
 Hello World
 to do formatting as we've discussed using HTML so that Google Docs understands it appropriately
+to use proper HTML formatting specifically for Google Docs
