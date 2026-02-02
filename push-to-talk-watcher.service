@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch Push-to-Talk files and auto-sync changes
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/projects/push-to-talk/push-to-talk-watcher.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
