@@ -37,10 +37,23 @@ echo "Installing Python dependencies (this may take a while)..."
 # Install systemd service
 cp push-to-talk.service "$HOME/.config/systemd/user/"
 
+# Install auto-update timer
+if [ -f push-to-talk-update.service ]; then
+    cp push-to-talk-update.service "$HOME/.config/systemd/user/"
+    cp push-to-talk-update.timer "$HOME/.config/systemd/user/"
+fi
+
 # Reload and enable service
 systemctl --user daemon-reload
 systemctl --user enable push-to-talk.service
 systemctl --user start push-to-talk.service
+
+# Enable auto-update timer
+if [ -f "$HOME/.config/systemd/user/push-to-talk-update.timer" ]; then
+    systemctl --user enable push-to-talk-update.timer
+    systemctl --user start push-to-talk-update.timer
+    echo "Auto-updates enabled (checks daily)"
+fi
 
 echo ""
 echo "Installation complete!"
