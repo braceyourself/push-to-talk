@@ -1,24 +1,18 @@
 #!/bin/bash
-# Update push-to-talk from git and reinstall
-
+# Update push-to-talk from git
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$HOME/.local/share/push-to-talk"
+cd "$INSTALL_DIR"
 
-cd "$SCRIPT_DIR"
+# Pull latest
+git pull --ff-only origin main 2>/dev/null || git pull --ff-only
 
-# Pull latest changes
-echo "Pulling latest changes..."
-git pull --ff-only
-
-# Copy updated files
-echo "Updating installed files..."
-cp push-to-talk.py "$INSTALL_DIR/"
-cp indicator.py "$INSTALL_DIR/"
+# Reinstall any new pip dependencies
+if [ -f requirements.txt ] && [ -f venv/bin/pip ]; then
+    venv/bin/pip install -q -r requirements.txt 2>/dev/null
+fi
 
 # Restart service
-echo "Restarting service..."
 systemctl --user restart push-to-talk.service
-
-echo "Update complete!"
+echo "[$(date)] Push-to-Talk updated"

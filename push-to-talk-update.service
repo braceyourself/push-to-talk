@@ -3,4 +3,4 @@ Description=Update Push-to-Talk from Git
 
 [Service]
 Type=oneshot
-ExecStart=%h/projects/push-to-talk/update.sh
+ExecStart=%h/.local/share/push-to-talk/update.sh

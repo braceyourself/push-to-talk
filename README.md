@@ -39,6 +39,14 @@ cd push-to-talk
 4. Release **Right Ctrl**
 5. Text appears in the focused input
 
+### AI Assistant Mode
+1. Hold **Right Ctrl + Right Shift**
+2. Ask your question
+3. Release to send to Claude AI
+4. Listen to the spoken response
+5. Auto-listen kicks in for follow-up questions
+6. Press **Escape** to interrupt the assistant at any time
+
 ### Status Indicator
 - **Gray dot** - Idle, ready
 - **Red dot** - Recording

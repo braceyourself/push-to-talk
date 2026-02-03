@@ -1,0 +1,20 @@
+# Push-to-Talk Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Speech recognition
+openai-whisper
+
+# Keyboard listener
+pynput
+
+# OpenAI API (for TTS and Realtime)
+openai
+
+# WebSockets for Realtime API
+websockets
+
+# Local TTS
+piper-tts
+
+# Audio processing helpers (optional, for noise detection)
+numpy
