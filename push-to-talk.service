@@ -1,17 +1,18 @@
 [Unit]
 Description=Push-to-Talk Dictation Service
 After=graphical-session.target
-Wants=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
 ExecStart=%h/.local/share/push-to-talk/venv/bin/python %h/.local/share/push-to-talk/push-to-talk.py
 Restart=on-failure
 RestartSec=5
+StartLimitIntervalSec=120
+StartLimitBurst=10
 
-# Environment for X11/Wayland and notifications
-Environment=DISPLAY=:1
-Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+# DISPLAY is auto-detected by push-to-talk.py
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

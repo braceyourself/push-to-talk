@@ -15,6 +15,7 @@ websockets
 
 # Local TTS
 piper-tts
+pathvalidate
 
 # Audio processing helpers (optional, for noise detection)
 numpy

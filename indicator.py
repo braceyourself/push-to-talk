@@ -62,6 +62,13 @@ def load_config():
         "indicator_style": "floating",
         "indicator_x": None,
         "indicator_y": None,
+        "smart_transcription": False,
+        "dictation_mode": "live",
+        "save_audio": False,
+        "audio_dir": "~/Audio/push-to-talk",
+        "interview_topic": "",
+        "interview_context_dirs": [],
+        "conversation_project_dir": "",
     }
     try:
         if CONFIG_FILE.exists():
@@ -302,19 +309,154 @@ class SettingsWindow(Gtk.Window):
 
         self.ai_mode_combo = Gtk.ComboBoxText()
         self.ai_mode_combo.append("claude", "Claude + Whisper")
+        self.ai_mode_combo.append("conversation", "Conversation (Claude + Tools)")
         self.ai_mode_combo.append("realtime", "OpenAI Realtime (GPT-4o)")
+        self.ai_mode_combo.append("interview", "Interview Mode")
         self.ai_mode_combo.set_active_id(config.get('ai_mode', 'claude'))
         self.ai_mode_combo.connect("changed", self.on_ai_mode_changed)
         ai_mode_box.pack_end(self.ai_mode_combo, False, False, 0)
 
         ai_section.pack_start(ai_mode_box, False, False, 0)
 
-        ai_info = Gtk.Label(label="Claude mode uses local Whisper + Claude CLI.\nRealtime mode uses OpenAI's voice-to-voice API.")
+        # Interview topic (shown when interview mode selected)
+        self.interview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+        topic_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        topic_label = Gtk.Label(label="Interview Topic:")
+        topic_label.set_xalign(0)
+        topic_row.pack_start(topic_label, False, False, 0)
+
+        self.interview_topic_entry = Gtk.Entry()
+        self.interview_topic_entry.set_placeholder_text("e.g., My journey building X")
+        self.interview_topic_entry.set_text(config.get('interview_topic', ''))
+        self.interview_topic_entry.connect("changed", self.on_interview_topic_changed)
+        topic_row.pack_end(self.interview_topic_entry, True, True, 0)
+
+        self.interview_box.pack_start(topic_row, False, False, 0)
+
+        interview_info = Gtk.Label(label="Leave blank to be prompted when starting.\nPress AI hotkey to start, PTT to answer.")
+        interview_info.set_xalign(0)
+        interview_info.get_style_context().add_class('info-text')
+        self.interview_box.pack_start(interview_info, False, False, 0)
+
+        # Show/hide based on current mode
+        self.interview_box.set_no_show_all(config.get('ai_mode', 'claude') != 'interview')
+        if config.get('ai_mode', 'claude') == 'interview':
+            self.interview_box.set_no_show_all(False)
+
+        ai_section.pack_start(self.interview_box, False, False, 0)
+
+        # Conversation project dir (shown when conversation mode selected)
+        self.conversation_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+        conv_dir_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        conv_dir_label = Gtk.Label(label="Project Directory:")
+        conv_dir_label.set_xalign(0)
+        conv_dir_row.pack_start(conv_dir_label, False, False, 0)
+
+        conv_dir_path = config.get('conversation_project_dir', '')
+        self.conv_dir_display = Gtk.Label(label=conv_dir_path or "(not set — will prompt)")
+        self.conv_dir_display.set_xalign(0)
+        self.conv_dir_display.set_ellipsize(Pango.EllipsizeMode.START)
+        self.conv_dir_display.get_style_context().add_class('info-text')
+        conv_dir_row.pack_start(self.conv_dir_display, True, True, 0)
+
+        conv_choose_btn = Gtk.Button(label="Choose...")
+        conv_choose_btn.connect("clicked", self.on_choose_conversation_dir)
+        conv_dir_row.pack_end(conv_choose_btn, False, False, 0)
+
+        self.conversation_box.pack_start(conv_dir_row, False, False, 0)
+
+        conv_info = Gtk.Label(label="Claude gets full tool access in this directory.\nSay 'goodbye' to end the conversation.")
+        conv_info.set_xalign(0)
+        conv_info.get_style_context().add_class('info-text')
+        self.conversation_box.pack_start(conv_info, False, False, 0)
+
+        # Show/hide based on current mode
+        self.conversation_box.set_no_show_all(config.get('ai_mode', 'claude') != 'conversation')
+        if config.get('ai_mode', 'claude') == 'conversation':
+            self.conversation_box.set_no_show_all(False)
+
+        ai_section.pack_start(self.conversation_box, False, False, 0)
+
+        ai_info = Gtk.Label(label="Claude: local Whisper + Claude CLI.\nConversation: Claude with full tool access.\nRealtime: OpenAI voice-to-voice.\nInterview: AI podcast interviewer.")
         ai_info.set_xalign(0)
         ai_info.get_style_context().add_class('info-text')
         ai_section.pack_start(ai_info, False, False, 0)
 
         box.pack_start(ai_section, False, False, 0)
+
+        # Transcription Section
+        trans_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        trans_label = Gtk.Label(label="Transcription")
+        trans_label.set_xalign(0)
+        trans_label.get_style_context().add_class('section-title')
+        trans_section.pack_start(trans_label, False, False, 0)
+
+        # Dictation Mode
+        mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        mode_label = Gtk.Label(label="Dictation Mode:")
+        mode_label.set_xalign(0)
+        mode_box.pack_start(mode_label, False, False, 0)
+
+        self.mode_combo = Gtk.ComboBoxText()
+        self.mode_combo.append("live", "Live (instant typing)")
+        self.mode_combo.append("prompt", "Prompt (preview first)")
+        self.mode_combo.append("stream", "Stream (real-time chunks)")
+        self.mode_combo.set_active_id(config.get('dictation_mode', 'live'))
+        self.mode_combo.connect("changed", self.on_mode_changed)
+        mode_box.pack_end(self.mode_combo, False, False, 0)
+
+        trans_section.pack_start(mode_box, False, False, 0)
+
+        self.smart_trans_check = Gtk.CheckButton(label="Smart Transcription (AI-powered)")
+        self.smart_trans_check.set_active(config.get('smart_transcription', False))
+        self.smart_trans_check.connect("toggled", self.on_smart_trans_toggled)
+        trans_section.pack_start(self.smart_trans_check, False, False, 0)
+
+        trans_info = Gtk.Label(label="Live: types after release. Stream: types while speaking.\nPrompt: preview dialog. Voice: 'go live/stream/prompt'")
+        trans_info.set_xalign(0)
+        trans_info.get_style_context().add_class('info-text')
+        trans_section.pack_start(trans_info, False, False, 0)
+
+        box.pack_start(trans_section, False, False, 0)
+
+        # Audio Recording Section
+        audio_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        audio_label = Gtk.Label(label="Audio Recording")
+        audio_label.set_xalign(0)
+        audio_label.get_style_context().add_class('section-title')
+        audio_section.pack_start(audio_label, False, False, 0)
+
+        self.save_audio_check = Gtk.CheckButton(label="Save audio recordings")
+        self.save_audio_check.set_active(config.get('save_audio', False))
+        self.save_audio_check.connect("toggled", self.on_save_audio_toggled)
+        audio_section.pack_start(self.save_audio_check, False, False, 0)
+
+        audio_dir_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        audio_dir_label = Gtk.Label(label="Save to:")
+        audio_dir_label.set_xalign(0)
+        audio_dir_box.pack_start(audio_dir_label, False, False, 0)
+
+        audio_dir_path = config.get('audio_dir', '~/Audio/push-to-talk')
+        self.audio_dir_display = Gtk.Label(label=audio_dir_path)
+        self.audio_dir_display.set_xalign(0)
+        self.audio_dir_display.set_ellipsize(Pango.EllipsizeMode.START)
+        self.audio_dir_display.get_style_context().add_class('info-text')
+        audio_dir_box.pack_start(self.audio_dir_display, True, True, 0)
+
+        open_folder_btn = Gtk.Button(label="Open Folder")
+        open_folder_btn.connect("clicked", self.on_open_audio_folder)
+        audio_dir_box.pack_end(open_folder_btn, False, False, 0)
+
+        audio_section.pack_start(audio_dir_box, False, False, 0)
+
+        audio_info = Gtk.Label(label="Saves .wav + .txt pairs for each recording.\nVoice: 'save audio' / 'stop saving'")
+        audio_info.set_xalign(0)
+        audio_info.get_style_context().add_class('info-text')
+        audio_section.pack_start(audio_info, False, False, 0)
+
+        box.pack_start(audio_section, False, False, 0)
 
         # TTS Section
         tts_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -661,6 +803,52 @@ class SettingsWindow(Gtk.Window):
         config = load_config()
         config['ai_mode'] = combo.get_active_id()
         save_config(config)
+        active = combo.get_active_id()
+        # Show/hide interview options
+        is_interview = active == 'interview'
+        self.interview_box.set_no_show_all(not is_interview)
+        if is_interview:
+            self.interview_box.show_all()
+        else:
+            self.interview_box.hide()
+        # Show/hide conversation options
+        is_conversation = active == 'conversation'
+        self.conversation_box.set_no_show_all(not is_conversation)
+        if is_conversation:
+            self.conversation_box.show_all()
+        else:
+            self.conversation_box.hide()
+
+    def on_interview_topic_changed(self, entry):
+        """Handle interview topic change."""
+        config = load_config()
+        config['interview_topic'] = entry.get_text().strip()
+        save_config(config)
+
+    def on_choose_conversation_dir(self, button):
+        """Choose project directory for conversation mode."""
+        dialog = Gtk.FileChooserDialog(
+            title="Choose Project Directory",
+            parent=self,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_OPEN, Gtk.ResponseType.OK,
+        )
+        # Start in current configured dir if set
+        config = load_config()
+        current = config.get('conversation_project_dir', '')
+        if current and os.path.isdir(current):
+            dialog.set_current_folder(current)
+
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            chosen = dialog.get_filename()
+            config['conversation_project_dir'] = chosen
+            save_config(config)
+            self.conv_dir_display.set_text(chosen)
+        dialog.destroy()
 
     def on_tts_backend_changed(self, combo):
         """Handle TTS backend change."""
@@ -680,13 +868,41 @@ class SettingsWindow(Gtk.Window):
         config['debug_mode'] = button.get_active()
         save_config(config)
 
+    def on_smart_trans_toggled(self, button):
+        """Handle smart transcription toggle."""
+        config = load_config()
+        config['smart_transcription'] = button.get_active()
+        save_config(config)
+
+    def on_save_audio_toggled(self, button):
+        """Handle save audio toggle."""
+        config = load_config()
+        config['save_audio'] = button.get_active()
+        save_config(config)
+
+    def on_open_audio_folder(self, button):
+        """Open the audio save directory in file manager."""
+        config = load_config()
+        audio_dir = os.path.expanduser(config.get('audio_dir', '~/Audio/push-to-talk'))
+        os.makedirs(audio_dir, exist_ok=True)
+        subprocess.Popen(['xdg-open', audio_dir])
+
+    def on_mode_changed(self, combo):
+        """Handle dictation mode change."""
+        config = load_config()
+        config['dictation_mode'] = combo.get_active_id()
+        save_config(config)
+
     def on_indicator_style_changed(self, combo):
-        """Handle indicator style change."""
+        """Handle indicator style change — auto-restart service."""
         config = load_config()
         config['indicator_style'] = combo.get_active_id()
         save_config(config)
         self.ind_restart_label.set_markup(
-            "<span foreground='#fbbf24'>Restart service for this to take effect</span>")
+            "<span foreground='#fbbf24'>Restarting...</span>")
+        GLib.timeout_add(300, lambda: subprocess.Popen([
+            'systemctl', '--user', 'restart', 'push-to-talk.service'
+        ]))
 
 
 class StatusPopup(Gtk.Window):
@@ -717,6 +933,11 @@ class StatusPopup(Gtk.Window):
         self.status_label = Gtk.Label()
         self.status_label.set_xalign(0)
         vbox.pack_start(self.status_label, False, False, 0)
+
+        # Dictation Mode
+        self.dictation_mode_label = Gtk.Label()
+        self.dictation_mode_label.set_xalign(0)
+        vbox.pack_start(self.dictation_mode_label, False, False, 0)
 
         # AI Mode
         self.ai_mode_label = Gtk.Label()
@@ -797,13 +1018,20 @@ class StatusPopup(Gtk.Window):
         status = self.parent_indicator.status
         self.status_label.set_text(f"Status: {STATUS_TEXT.get(status, status)}")
 
-        # AI Mode & TTS Backend
+        # Dictation Mode & AI Mode & TTS Backend
         config = load_config()
+
+        # Dictation mode display
+        mode_names = {'live': 'Manual', 'prompt': 'Review', 'stream': 'Flow'}
+        dictation_mode = config.get('dictation_mode', 'live')
+        self.dictation_mode_label.set_markup(f"<b>Mode: {mode_names.get(dictation_mode, dictation_mode).upper()}</b>")
+
         ai_mode = config.get('ai_mode', 'claude')
         tts = config.get('tts_backend', 'piper')
         voice = config.get('openai_voice', 'nova')
 
-        ai_display = "Realtime (GPT-4o)" if ai_mode == 'realtime' else "Claude + Whisper"
+        ai_displays = {'realtime': 'Realtime (GPT-4o)', 'interview': 'Interview Mode', 'conversation': 'Conversation (Tools)', 'claude': 'Claude + Whisper'}
+        ai_display = ai_displays.get(ai_mode, "Claude + Whisper")
         self.ai_mode_label.set_text(f"AI: {ai_display}")
 
         tts_display = f"OpenAI ({voice})" if tts == 'openai' else "Piper (local)"
@@ -1065,6 +1293,227 @@ class StatusIndicator(Gtk.Window):
         return False
 
 
+class QuickControlWindow(Gtk.Window):
+    """Quick control popup for push-to-talk."""
+
+    def __init__(self, parent_indicator=None):
+        super().__init__(title="Push-to-Talk")
+        self.parent_indicator = parent_indicator
+        self.set_default_size(280, -1)
+        self.set_keep_above(True)
+        self.stick()  # Show on all workspaces
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_decorated(False)
+        self.set_resizable(False)
+
+        # Drag state (prevents focus-out close during drag)
+        self.dragging = False
+
+        # Position directly below mouse, but below taskbar
+        display = Gdk.Display.get_default()
+        seat = display.get_default_seat()
+        pointer = seat.get_pointer()
+        _, pointer_x, pointer_y = pointer.get_position()
+
+        # Find the monitor the pointer is on
+        monitor = display.get_monitor_at_point(pointer_x, pointer_y)
+        if monitor:
+            geom = monitor.get_geometry()
+            win_width = 280
+            # X: centered on mouse, but keep on screen
+            x = pointer_x - (win_width // 2)
+            x = max(geom.x, min(x, geom.x + geom.width - win_width))
+            # Y: below taskbar (50px from top of monitor)
+            y = geom.y + 50
+            self.move(x, y)
+
+        # Close when focus is lost (but not during drag)
+        self.connect('focus-out-event', self.on_focus_out)
+        self.connect('key-press-event', self.on_key_press)
+
+        # Main box with border
+        frame = Gtk.Frame()
+        frame.set_shadow_type(Gtk.ShadowType.OUT)
+        self.add(frame)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(10)
+        box.set_margin_bottom(10)
+        box.set_margin_start(10)
+        box.set_margin_end(10)
+        frame.add(box)
+
+        # Draggable title bar area
+        title_event_box = Gtk.EventBox()
+        title_event_box.connect('button-press-event', self.on_title_press)
+        box.pack_start(title_event_box, False, False, 0)
+
+        title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        title_box.set_margin_bottom(4)
+        title_event_box.add(title_box)
+
+        # Drag handle icon
+        drag_icon = Gtk.Label(label="⋮⋮")
+        drag_icon.get_style_context().add_class('drag-handle')
+        title_box.pack_start(drag_icon, False, False, 0)
+
+        title = Gtk.Label()
+        title.set_markup("  <b>Push-to-Talk</b>")
+        title_box.pack_start(title, False, False, 0)
+
+        status = "Idle"
+        if parent_indicator:
+            status = STATUS_TEXT.get(parent_indicator.status, parent_indicator.status)
+        status_label = Gtk.Label(label=f"  •  {status}")
+        status_label.get_style_context().add_class('dim-label')
+        title_box.pack_start(status_label, False, False, 0)
+
+        # Spacer to make the whole title bar draggable
+        title_box.pack_end(Gtk.Label(), True, True, 0)
+
+        box.pack_start(Gtk.Separator(), False, False, 4)
+
+        # Mode section
+        mode_label = Gtk.Label()
+        mode_label.set_markup("<b>Mode</b>")
+        mode_label.set_xalign(0)
+        box.pack_start(mode_label, False, False, 0)
+
+        config = load_config()
+        current_mode = config.get('dictation_mode', 'live')
+
+        modes = [
+            ('live', 'Manual', 'types after release'),
+            ('prompt', 'Review', 'preview before typing'),
+            ('stream', 'Flow', 'types while speaking'),
+        ]
+
+        self.radios = {}
+        first_radio = None
+        for mode_id, mode_name, mode_desc in modes:
+            hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+            radio = Gtk.RadioButton.new_with_label_from_widget(first_radio, mode_name)
+            if first_radio is None:
+                first_radio = radio
+            radio.set_active(mode_id == current_mode)
+            radio.connect('toggled', self.on_mode_toggled, mode_id)
+            hbox.pack_start(radio, False, False, 0)
+
+            desc = Gtk.Label(label=f"- {mode_desc}")
+            desc.get_style_context().add_class('dim-label')
+            hbox.pack_start(desc, False, False, 0)
+
+            box.pack_start(hbox, False, False, 0)
+            self.radios[mode_id] = radio
+
+        box.pack_start(Gtk.Separator(), False, False, 4)
+
+        # Save Audio toggle
+        self.save_audio_check = Gtk.CheckButton(label="Save Audio")
+        self.save_audio_check.set_active(config.get('save_audio', False))
+        self.save_audio_check.connect('toggled', self.on_save_audio_toggled)
+        box.pack_start(self.save_audio_check, False, False, 0)
+
+        box.pack_start(Gtk.Separator(), False, False, 4)
+
+        # Quick actions
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        settings_btn = Gtk.Button(label="Settings")
+        settings_btn.connect('clicked', self.on_settings)
+        btn_box.pack_start(settings_btn, True, True, 0)
+
+        restart_btn = Gtk.Button(label="Restart")
+        restart_btn.connect('clicked', self.on_restart)
+        btn_box.pack_start(restart_btn, True, True, 0)
+
+        logs_btn = Gtk.Button(label="Logs")
+        logs_btn.connect('clicked', self.on_logs)
+        btn_box.pack_start(logs_btn, True, True, 0)
+
+        box.pack_start(btn_box, False, False, 0)
+
+        # Apply dark style
+        css = Gtk.CssProvider()
+        css.load_from_data(b'''
+            window, frame { background-color: #2d2d2d; }
+            frame { border: 1px solid #555; border-radius: 6px; }
+            label { color: #ffffff; }
+            .dim-label { color: #888888; font-size: 10px; }
+            .drag-handle { color: #666666; font-size: 12px; }
+            radiobutton { color: #ffffff; }
+            button {
+                background: #444;
+                color: white;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }
+            button:hover { background: #555; }
+        ''')
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+    def on_mode_toggled(self, widget, mode_id):
+        if widget.get_active():
+            config = load_config()
+            config['dictation_mode'] = mode_id
+            save_config(config)
+            mode_names = {'live': 'Manual', 'prompt': 'Review', 'stream': 'Flow'}
+            print(f"Mode changed to {mode_names.get(mode_id, mode_id)}", flush=True)
+
+    def on_save_audio_toggled(self, widget):
+        config = load_config()
+        config['save_audio'] = widget.get_active()
+        save_config(config)
+        state = "enabled" if widget.get_active() else "disabled"
+        print(f"Save audio {state}", flush=True)
+
+    def on_settings(self, widget):
+        self.destroy()
+        settings = SettingsWindow(self.parent_indicator)
+        settings.show_all()
+
+    def on_restart(self, widget):
+        self.destroy()
+        subprocess.Popen(['systemctl', '--user', 'restart', 'push-to-talk.service'])
+
+    def on_logs(self, widget):
+        self.destroy()
+        subprocess.Popen(['gnome-terminal', '--', 'journalctl', '--user', '-u',
+                         'push-to-talk', '-f', '--no-pager'])
+
+    def on_key_press(self, widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.destroy()
+            return True
+        return False
+
+    def on_focus_out(self, widget, event):
+        # Don't close if we're in the middle of a drag
+        if not self.dragging:
+            self.destroy()
+        return False
+
+    def on_title_press(self, widget, event):
+        if event.button == 1:
+            self.dragging = True
+            # Use GTK's built-in window move
+            self.begin_move_drag(event.button, int(event.x_root), int(event.y_root), event.time)
+            # Reset dragging after a delay (move is handled by window manager)
+            GLib.timeout_add(100, self._reset_dragging)
+        return True
+
+    def _reset_dragging(self):
+        self.dragging = False
+        return False
+
+
 class TrayIndicator:
     """System tray indicator using AppIndicator3."""
 
@@ -1089,34 +1538,24 @@ class TrayIndicator:
         self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
         self.indicator.set_title('Push-to-Talk')
 
-        # Build menu
+        # Build minimal menu - just opens the control window
         self.menu = Gtk.Menu()
 
-        self.status_item = Gtk.MenuItem(label=STATUS_TEXT.get('idle', 'Idle'))
-        self.status_item.set_sensitive(False)
-        self.menu.append(self.status_item)
+        open_item = Gtk.MenuItem(label='Open Controls')
+        open_item.connect('activate', self.on_open_controls)
+        self.menu.append(open_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
-        settings_item = Gtk.MenuItem(label='Settings')
-        settings_item.connect('activate', self.on_settings)
-        self.menu.append(settings_item)
-
-        restart_item = Gtk.MenuItem(label='Restart Service')
-        restart_item.connect('activate', lambda w: subprocess.Popen([
-            'systemctl', '--user', 'restart', 'push-to-talk.service'
-        ]))
-        self.menu.append(restart_item)
-
-        logs_item = Gtk.MenuItem(label='View Logs')
-        logs_item.connect('activate', lambda w: subprocess.Popen([
-            'gnome-terminal', '--', 'journalctl', '--user', '-u',
-            'push-to-talk', '-f', '--no-pager'
-        ]))
-        self.menu.append(logs_item)
+        quit_item = Gtk.MenuItem(label='Quit')
+        quit_item.connect('activate', lambda w: Gtk.main_quit())
+        self.menu.append(quit_item)
 
         self.menu.show_all()
         self.indicator.set_menu(self.menu)
+
+        # Auto-open controls when menu is shown
+        self.menu.connect('show', lambda w: GLib.idle_add(self.on_open_controls, None))
 
         # Watch status file
         GLib.timeout_add(100, self.check_status)
@@ -1156,6 +1595,17 @@ class TrayIndicator:
         """Open settings window."""
         settings = SettingsWindow(self)
         settings.show_all()
+
+    def on_open_controls(self, widget):
+        """Show the quick control window."""
+        # Hide the menu first
+        self.menu.popdown()
+        # Show control window
+        control = QuickControlWindow(self)
+        control.show_all()
+        control.present_with_time(Gdk.CURRENT_TIME)
+        # Force to front after a moment
+        GLib.timeout_add(50, lambda: control.present() or False)
 
     def check_status(self):
         try:
