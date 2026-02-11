@@ -1845,8 +1845,18 @@ class PushToTalk:
         )
         print(f"Conversation started in {self.conversation_session.project_dir}", flush=True)
 
-        # Start recording the first question
-        self.start_recording(force=True)
+        # Speak a ready prompt, then auto-listen for first question
+        threading.Thread(target=self._conversation_ready, daemon=True).start()
+
+    def _conversation_ready(self):
+        """Speak ready message and auto-listen for the first question."""
+        self.tts_process = self.speak("Ready. What would you like to know?")
+        if self.tts_process:
+            self.tts_process.wait()
+            self.tts_process = None
+
+        if self.conversation_session and self.conversation_session.active:
+            self._conversation_auto_listen()
 
     def _conversation_process_question(self, question):
         """Send a question to Claude with full tool access and speak the response."""
