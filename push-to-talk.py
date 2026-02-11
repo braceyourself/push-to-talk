@@ -1889,6 +1889,9 @@ class PushToTalk:
             )
             response = result.stdout.strip()
 
+            # Strip thinking blocks from response
+            response = re.sub(r'<thinking>.*?</thinking>', '', response, flags=re.DOTALL).strip()
+
             if not response:
                 print("No response from Claude in conversation", flush=True)
                 set_status('error')
