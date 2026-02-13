@@ -1662,6 +1662,7 @@ class LiveOverlayWidget(Gtk.Window):
         'idle':         (0.42, 0.45, 0.50),   # #6b7280 gray
         'disconnected': (0.42, 0.45, 0.50),   # #6b7280 gray
         'error':        (1.0,  0.2,  0.2),    # red
+        'muted':        (0.8,  0.4,  0.0),    # orange
     }
 
     STATUS_LABELS = {
@@ -1673,6 +1674,7 @@ class LiveOverlayWidget(Gtk.Window):
         'error':        'Error',
         'recording':    'Listening',
         'success':      'Ready',
+        'muted':        'Muted',
     }
 
     def __init__(self):
@@ -1800,14 +1802,28 @@ class LiveOverlayWidget(Gtk.Window):
         return True
 
     def on_button_release(self, widget, event):
-        """End drag and save position."""
-        if event.button == 1 and self.dragging:
-            self.dragging = False
-            config = load_config()
-            config['live_overlay_x'] = self.pos_x
-            config['live_overlay_y'] = self.pos_y
-            save_config(config)
+        """End drag or toggle mute on click."""
+        if event.button == 1:
+            if self.dragging:
+                self.dragging = False
+                config = load_config()
+                config['live_overlay_x'] = self.pos_x
+                config['live_overlay_y'] = self.pos_y
+                save_config(config)
+            else:
+                # Click (not drag) — toggle mute
+                self._toggle_mute()
         return True
+
+    def _toggle_mute(self):
+        """Toggle live session mute via signal file."""
+        signal_file = Path(__file__).parent / "live_mute_toggle"
+        signal_file.write_text("toggle")
+        # Optimistically update display
+        if self.status == 'muted':
+            self.update_status('listening')
+        elif self.status in ('listening', 'idle'):
+            self.update_status('muted')
 
     def on_motion(self, widget, event):
         """Handle drag motion."""

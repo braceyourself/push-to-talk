@@ -61,6 +61,7 @@ class LiveSession:
         self._idle_timer = None
         self._idle_timeout = 120  # 2 minutes
         self._ducked_inputs = {}  # sink_input_index -> original_volume
+        self.muted = False  # User-toggled mute via overlay click
 
     def _build_personality(self):
         """Load personality from multiple .md files in personality/ directory."""
@@ -366,13 +367,25 @@ class LiveSession:
         print("Live session: Audio recording started", flush=True)
         chunks_sent = 0
 
+        mute_signal = Path(__file__).parent / "live_mute_toggle"
         try:
             while self.running:
+                # Check for mute toggle signal from overlay
+                if mute_signal.exists():
+                    try:
+                        mute_signal.unlink()
+                        self.muted = not self.muted
+                        status = "muted" if self.muted else "listening"
+                        self._set_status(status)
+                        print(f"Live session: {'Muted' if self.muted else 'Unmuted'} by user", flush=True)
+                    except Exception:
+                        pass
+
                 audio_data = await process.stdout.read(CHUNK_SIZE)
                 if audio_data:
-                    # Skip sending while AI is speaking to avoid echo
+                    # Skip sending while AI is speaking, or while user-muted
                     time_since_audio = time.time() - self.audio_done_time
-                    if not self.playing_audio and time_since_audio > 1.0:
+                    if not self.muted and not self.playing_audio and time_since_audio > 1.0:
                         await self.send_audio(audio_data)
                         chunks_sent += 1
                         if chunks_sent % 200 == 0:
