@@ -59,6 +59,18 @@ Hover over the dot to see:
 - Recent transcriptions
 - Buttons: Restart, Vocabulary, Logs
 
+### Dictation Modes
+- **Dictate** - Types text after you release the key (default)
+- **Prompt** - Shows a preview dialog before typing
+- **Stream** - Types while you speak in real-time chunks
+
+Switch modes by voice:
+- `"dictate mode"` or `"go dictate"`
+- `"prompt mode"` or `"go prompt"`
+- `"stream mode"` or `"go stream"`
+
+Or use the Settings window (right-click the status dot).
+
 ### Teaching Vocabulary
 Say these commands (they won't be typed):
 - `"add word: Kubernetes"`
