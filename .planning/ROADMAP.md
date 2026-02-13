@@ -28,11 +28,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. User can hold PTT to speak, release to send, and hear AI respond through speakers in live mode
   4. Conversation context persists across multiple PTT presses within a single live session
   5. Starting and stopping a live session cleanly initializes and tears down without errors
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 01-01: Rename "live" dictation mode to "dictate" across codebase, config, and UI
-- [ ] 01-02: Implement new live mode session with PTT voice conversation
+- [ ] 01-01-PLAN.md -- Rename "live" dictation mode to "dictate" across codebase, config, and UI
+- [ ] 01-02-PLAN.md -- Implement new live mode with LiveSession, personality system, and overlay widget
 
 ### Phase 2: Async Task Infrastructure
 **Goal**: A TaskManager can spawn, track, query, and cancel isolated Claude CLI subprocesses without blocking the asyncio event loop
