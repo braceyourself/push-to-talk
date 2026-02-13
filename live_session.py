@@ -550,6 +550,15 @@ class LiveSession:
         """Run the live session main loop."""
         self._set_status("processing")
         self.running = True
+        self.muted = False
+
+        # Clean up stale toggle signal from previous session
+        stale_signal = Path(__file__).parent / "live_mute_toggle"
+        if stale_signal.exists():
+            try:
+                stale_signal.unlink()
+            except Exception:
+                pass
 
         try:
             await self.connect()

@@ -771,9 +771,11 @@ class PushToTalk:
                 if restart_signal.exists():
                     try:
                         content = restart_signal.read_text().strip()
-                        if content == "restart_live" and not self.live_session:
-                            print("Config watcher: Restart live session requested", flush=True)
-                            self.start_live_session()
+                        if content == "restart_live":
+                            restart_signal.write_text("idle")  # Clear signal
+                            if not self.live_session:
+                                print("Config watcher: Restart live session requested", flush=True)
+                                self.start_live_session()
                     except Exception:
                         pass
 
