@@ -63,7 +63,7 @@ def load_config():
         "indicator_x": None,
         "indicator_y": None,
         "smart_transcription": False,
-        "dictation_mode": "live",
+        "dictation_mode": "dictate",
         "save_audio": False,
         "audio_dir": "~/Audio/push-to-talk",
         "interview_topic": "",
@@ -74,7 +74,12 @@ def load_config():
         if CONFIG_FILE.exists():
             with open(CONFIG_FILE) as f:
                 config = json.load(f)
-                return {**default, **config}
+                merged = {**default, **config}
+                # Migrate old "live" dictation mode to "dictate"
+                if merged.get('dictation_mode') == 'live':
+                    merged['dictation_mode'] = 'dictate'
+                    # Don't save from indicator - push-to-talk.py handles persistence
+                return merged
     except:
         pass
     return default
@@ -400,10 +405,10 @@ class SettingsWindow(Gtk.Window):
         mode_box.pack_start(mode_label, False, False, 0)
 
         self.mode_combo = Gtk.ComboBoxText()
-        self.mode_combo.append("live", "Live (instant typing)")
+        self.mode_combo.append("dictate", "Dictate (instant typing)")
         self.mode_combo.append("prompt", "Prompt (preview first)")
         self.mode_combo.append("stream", "Stream (real-time chunks)")
-        self.mode_combo.set_active_id(config.get('dictation_mode', 'live'))
+        self.mode_combo.set_active_id(config.get('dictation_mode', 'dictate'))
         self.mode_combo.connect("changed", self.on_mode_changed)
         mode_box.pack_end(self.mode_combo, False, False, 0)
 
@@ -414,7 +419,7 @@ class SettingsWindow(Gtk.Window):
         self.smart_trans_check.connect("toggled", self.on_smart_trans_toggled)
         trans_section.pack_start(self.smart_trans_check, False, False, 0)
 
-        trans_info = Gtk.Label(label="Live: types after release. Stream: types while speaking.\nPrompt: preview dialog. Voice: 'go live/stream/prompt'")
+        trans_info = Gtk.Label(label="Dictate: types after release. Stream: types while speaking.\nPrompt: preview dialog. Voice: 'go dictate/stream/prompt'")
         trans_info.set_xalign(0)
         trans_info.get_style_context().add_class('info-text')
         trans_section.pack_start(trans_info, False, False, 0)
@@ -1022,8 +1027,8 @@ class StatusPopup(Gtk.Window):
         config = load_config()
 
         # Dictation mode display
-        mode_names = {'live': 'Manual', 'prompt': 'Review', 'stream': 'Flow'}
-        dictation_mode = config.get('dictation_mode', 'live')
+        mode_names = {'dictate': 'Manual', 'prompt': 'Review', 'stream': 'Flow'}
+        dictation_mode = config.get('dictation_mode', 'dictate')
         self.dictation_mode_label.set_markup(f"<b>Mode: {mode_names.get(dictation_mode, dictation_mode).upper()}</b>")
 
         ai_mode = config.get('ai_mode', 'claude')
@@ -1382,10 +1387,10 @@ class QuickControlWindow(Gtk.Window):
         box.pack_start(mode_label, False, False, 0)
 
         config = load_config()
-        current_mode = config.get('dictation_mode', 'live')
+        current_mode = config.get('dictation_mode', 'dictate')
 
         modes = [
-            ('live', 'Manual', 'types after release'),
+            ('dictate', 'Manual', 'types after release'),
             ('prompt', 'Review', 'preview before typing'),
             ('stream', 'Flow', 'types while speaking'),
         ]
@@ -1464,7 +1469,7 @@ class QuickControlWindow(Gtk.Window):
             config = load_config()
             config['dictation_mode'] = mode_id
             save_config(config)
-            mode_names = {'live': 'Manual', 'prompt': 'Review', 'stream': 'Flow'}
+            mode_names = {'dictate': 'Manual', 'prompt': 'Review', 'stream': 'Flow'}
             print(f"Mode changed to {mode_names.get(mode_id, mode_id)}", flush=True)
 
     def on_save_audio_toggled(self, widget):

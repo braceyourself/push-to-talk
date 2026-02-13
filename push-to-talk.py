@@ -225,7 +225,7 @@ def load_config():
         "indicator_x": None,
         "indicator_y": None,
         "smart_transcription": False,  # Use AI to fix transcription errors
-        "dictation_mode": "live",  # "live", "prompt", or "stream"
+        "dictation_mode": "dictate",  # "dictate", "prompt", or "stream"
         "save_audio": False,  # Save recordings to disk
         "audio_dir": "~/Audio/push-to-talk",  # Where to save recordings
         "interview_topic": "",  # Topic for interview mode
@@ -242,7 +242,12 @@ def load_config():
         if CONFIG_FILE.exists():
             with open(CONFIG_FILE) as f:
                 config = json.load(f)
-                return {**default, **config}
+                merged = {**default, **config}
+                # Migrate old "live" dictation mode to "dictate"
+                if merged.get('dictation_mode') == 'live':
+                    merged['dictation_mode'] = 'dictate'
+                    save_config(merged)
+                return merged
     except Exception as e:
         print(f"Error loading config: {e}", flush=True)
     return default
@@ -1003,11 +1008,11 @@ class PushToTalk:
                     subprocess.run(['xdotool', 'key', 'Return'], check=True)
                     set_status('success')
                     return
-                if text_lower in ['go live', 'live mode', 'going live']:
-                    print(f"Voice command: switching to live mode", flush=True)
-                    self.config['dictation_mode'] = 'live'
+                if text_lower in ['dictate mode', 'go dictate', 'dictation mode']:
+                    print(f"Voice command: switching to dictate mode", flush=True)
+                    self.config['dictation_mode'] = 'dictate'
                     save_config(self.config)
-                    subprocess.Popen(['notify-send', '-t', '2000', 'Push-to-Talk', 'Live mode activated'],
+                    subprocess.Popen(['notify-send', '-t', '2000', 'Push-to-Talk', 'Dictate mode activated'],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     set_status('success')
                     return
@@ -1077,7 +1082,7 @@ class PushToTalk:
                     return
 
                 # Prompt mode: show dialog to edit before typing
-                if self.config.get('dictation_mode', 'live') == 'prompt':
+                if self.config.get('dictation_mode', 'dictate') == 'prompt':
                     text = show_prompt_dialog(text)
                     if text is None:
                         print("Prompt cancelled", flush=True)
@@ -1214,12 +1219,12 @@ class PushToTalk:
             if text:
                 # Check for mode-switching voice commands in stream mode
                 text_lower = text.lower().strip().rstrip('.,!?')
-                if text_lower in ['go live', 'live mode', 'going live']:
-                    print(f"Stream: switching to live mode", flush=True)
-                    self.config['dictation_mode'] = 'live'
+                if text_lower in ['dictate mode', 'go dictate', 'dictation mode']:
+                    print(f"Stream: switching to dictate mode", flush=True)
+                    self.config['dictation_mode'] = 'dictate'
                     save_config(self.config)
                     self.stop_stream_mode()
-                    subprocess.Popen(['notify-send', '-t', '2000', 'Push-to-Talk', 'Live mode activated'],
+                    subprocess.Popen(['notify-send', '-t', '2000', 'Push-to-Talk', 'Dictate mode activated'],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     return
                 if text_lower in ['prompt mode', 'preview mode', 'go prompt']:
