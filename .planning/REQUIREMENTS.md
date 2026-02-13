@@ -7,10 +7,10 @@
 
 ### Mode Rename
 
-- [ ] **RENAME-01**: Current "live" dictation mode renamed to "dictate" in all code references
-- [ ] **RENAME-02**: Settings UI updated — combo box shows "Dictate" instead of "Live"
-- [ ] **RENAME-03**: Voice commands updated — "dictate mode" activates dictate, "live mode" activates new live mode
-- [ ] **RENAME-04**: Config default value changed from "live" to "dictate" where appropriate
+- [x] **RENAME-01**: Current "live" dictation mode renamed to "dictate" in all code references
+- [x] **RENAME-02**: Settings UI updated — combo box shows "Dictate" instead of "Live"
+- [x] **RENAME-03**: Voice commands updated — "dictate mode" activates dictate, "live mode" activates new live mode
+- [x] **RENAME-04**: Config default value changed from "live" to "dictate" where appropriate
 
 ### Async Infrastructure
 
@@ -39,10 +39,10 @@
 
 ### Live Mode Session
 
-- [ ] **LIVE-01**: New "live" dictation mode activates OpenAI Realtime voice session
-- [ ] **LIVE-02**: Hold PTT to speak, release to send — AI responds through speakers
-- [ ] **LIVE-03**: Session memory — conversation persists across PTT presses within a session
-- [ ] **LIVE-04**: Session start/stop cleanly initializes and tears down task registry
+- [x] **LIVE-01**: New "live" dictation mode activates OpenAI Realtime voice session
+- [x] **LIVE-02**: Hold PTT to speak, release to send — AI responds through speakers
+- [x] **LIVE-03**: Session memory — conversation persists across PTT presses within a session
+- [x] **LIVE-04**: Session start/stop cleanly initializes and tears down task registry
 
 ## v2 Requirements
 
@@ -79,10 +79,10 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| RENAME-01 | Phase 1 | Pending |
-| RENAME-02 | Phase 1 | Pending |
-| RENAME-03 | Phase 1 | Pending |
-| RENAME-04 | Phase 1 | Pending |
+| RENAME-01 | Phase 1 | Complete |
+| RENAME-02 | Phase 1 | Complete |
+| RENAME-03 | Phase 1 | Complete |
+| RENAME-04 | Phase 1 | Complete |
 | INFRA-01 | Phase 2 | Pending |
 | INFRA-02 | Phase 2 | Pending |
 | INFRA-03 | Phase 2 | Pending |
@@ -99,10 +99,10 @@
 | CTX-01 | Phase 3 | Pending |
 | CTX-02 | Phase 3 | Pending |
 | CTX-03 | Phase 3 | Pending |
-| LIVE-01 | Phase 1 | Pending |
-| LIVE-02 | Phase 1 | Pending |
-| LIVE-03 | Phase 1 | Pending |
-| LIVE-04 | Phase 1 | Pending |
+| LIVE-01 | Phase 1 | Complete |
+| LIVE-02 | Phase 1 | Complete |
+| LIVE-03 | Phase 1 | Complete |
+| LIVE-04 | Phase 1 | Complete |
 
 **Coverage:**
 - v1 requirements: 24 total
@@ -111,4 +111,4 @@
 
 ---
 *Requirements defined: 2026-02-13*
-*Last updated: 2026-02-13 after roadmap creation*
+*Last updated: 2026-02-13 after Phase 1 completion*
