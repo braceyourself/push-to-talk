@@ -314,6 +314,7 @@ class SettingsWindow(Gtk.Window):
 
         self.ai_mode_combo = Gtk.ComboBoxText()
         self.ai_mode_combo.append("claude", "Claude + Whisper")
+        self.ai_mode_combo.append("live", "Live (Voice Conversation)")
         self.ai_mode_combo.append("conversation", "Conversation (Claude + Tools)")
         self.ai_mode_combo.append("realtime", "OpenAI Realtime (GPT-4o)")
         self.ai_mode_combo.append("interview", "Interview Mode")
@@ -384,7 +385,7 @@ class SettingsWindow(Gtk.Window):
 
         ai_section.pack_start(self.conversation_box, False, False, 0)
 
-        ai_info = Gtk.Label(label="Claude: local Whisper + Claude CLI.\nConversation: Claude with full tool access.\nRealtime: OpenAI voice-to-voice.\nInterview: AI podcast interviewer.")
+        ai_info = Gtk.Label(label="Claude: local Whisper + Claude CLI.\nLive: real-time voice conversation.\nConversation: Claude with full tool access.\nRealtime: OpenAI voice-to-voice + tools.\nInterview: AI podcast interviewer.")
         ai_info.set_xalign(0)
         ai_info.get_style_context().add_class('info-text')
         ai_section.pack_start(ai_info, False, False, 0)
@@ -1035,7 +1036,7 @@ class StatusPopup(Gtk.Window):
         tts = config.get('tts_backend', 'piper')
         voice = config.get('openai_voice', 'nova')
 
-        ai_displays = {'realtime': 'Realtime (GPT-4o)', 'interview': 'Interview Mode', 'conversation': 'Conversation (Tools)', 'claude': 'Claude + Whisper'}
+        ai_displays = {'live': 'Live (Voice)', 'realtime': 'Realtime (GPT-4o)', 'interview': 'Interview Mode', 'conversation': 'Conversation (Tools)', 'claude': 'Claude + Whisper'}
         ai_display = ai_displays.get(ai_mode, "Claude + Whisper")
         self.ai_mode_label.set_text(f"AI: {ai_display}")
 
@@ -1645,6 +1646,214 @@ class TrayIndicator:
         return False
 
 
+class LiveOverlayWidget(Gtk.Window):
+    """Floating overlay showing live session status with colored dot and text."""
+
+    OVERLAY_WIDTH = 180
+    OVERLAY_HEIGHT = 44
+    DOT_RADIUS = 6
+    CORNER_RADIUS = 10
+
+    # Status dot colors (r, g, b)
+    DOT_COLORS = {
+        'listening':    (0.29, 0.85, 0.50),   # #4ade80 green
+        'speaking':     (0.38, 0.65, 0.98),   # #60a5fa blue
+        'processing':   (1.0,  0.8,  0.0),    # yellow
+        'idle':         (0.42, 0.45, 0.50),   # #6b7280 gray
+        'disconnected': (0.42, 0.45, 0.50),   # #6b7280 gray
+        'error':        (1.0,  0.2,  0.2),    # red
+    }
+
+    STATUS_LABELS = {
+        'listening':    'Listening',
+        'speaking':     'Speaking',
+        'processing':   'Processing',
+        'idle':         'Idle',
+        'disconnected': 'Disconnected',
+        'error':        'Error',
+        'recording':    'Listening',
+        'success':      'Ready',
+    }
+
+    def __init__(self):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_accept_focus(False)
+        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        self.set_app_paintable(True)
+        self.set_default_size(self.OVERLAY_WIDTH, self.OVERLAY_HEIGHT)
+        self.set_resizable(False)
+
+        # Enable transparency
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+
+        # Status state
+        self.status = 'idle'
+
+        # Drag state
+        self.dragging = False
+        self.drag_start_x = 0
+        self.drag_start_y = 0
+        self.drag_threshold = 5
+
+        # Enable events
+        self.set_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK |
+            Gdk.EventMask.BUTTON_RELEASE_MASK |
+            Gdk.EventMask.POINTER_MOTION_MASK
+        )
+
+        self.connect('draw', self.on_draw)
+        self.connect('button-press-event', self.on_button_press)
+        self.connect('button-release-event', self.on_button_release)
+        self.connect('motion-notify-event', self.on_motion)
+
+        # Load position from config or default to bottom-right
+        config = load_config()
+        saved_x = config.get('live_overlay_x')
+        saved_y = config.get('live_overlay_y')
+
+        if saved_x is not None and saved_y is not None:
+            self.pos_x = int(saved_x)
+            self.pos_y = int(saved_y)
+        else:
+            display = Gdk.Display.get_default()
+            monitor = display.get_primary_monitor()
+            if monitor:
+                geometry = monitor.get_geometry()
+                self.pos_x = geometry.x + geometry.width - self.OVERLAY_WIDTH - 20
+                self.pos_y = geometry.y + geometry.height - self.OVERLAY_HEIGHT - 20
+            else:
+                self.pos_x = 1800
+                self.pos_y = 1050
+
+        self.move(self.pos_x, self.pos_y)
+
+    def on_draw(self, widget, cr):
+        """Draw the overlay: rounded dark background, colored dot, status text."""
+        width = self.OVERLAY_WIDTH
+        height = self.OVERLAY_HEIGHT
+        r = self.CORNER_RADIUS
+
+        # Clear to transparent
+        cr.set_operator(1)  # CAIRO_OPERATOR_SOURCE
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+
+        # Draw rounded rectangle background
+        cr.set_operator(0)  # CAIRO_OPERATOR_CLEAR first
+        cr.paint()
+        cr.set_operator(2)  # CAIRO_OPERATOR_OVER
+
+        # Rounded rectangle path
+        cr.new_sub_path()
+        cr.arc(width - r, r, r, -3.14159 / 2, 0)
+        cr.arc(width - r, height - r, r, 0, 3.14159 / 2)
+        cr.arc(r, height - r, r, 3.14159 / 2, 3.14159)
+        cr.arc(r, r, r, 3.14159, 3 * 3.14159 / 2)
+        cr.close_path()
+
+        # Semi-transparent dark background
+        cr.set_source_rgba(0.118, 0.118, 0.118, 0.85)  # rgba(30, 30, 30, 0.85)
+        cr.fill_preserve()
+
+        # Subtle border
+        cr.set_source_rgba(0.3, 0.3, 0.3, 0.5)
+        cr.set_line_width(1)
+        cr.stroke()
+
+        # Draw status dot
+        dot_x = 22
+        dot_y = height / 2
+        dot_color = self.DOT_COLORS.get(self.status, self.DOT_COLORS['idle'])
+        cr.set_source_rgba(dot_color[0], dot_color[1], dot_color[2], 1.0)
+        cr.arc(dot_x, dot_y, self.DOT_RADIUS, 0, 2 * 3.14159)
+        cr.fill()
+
+        # Draw status text
+        label = self.STATUS_LABELS.get(self.status, self.status.title())
+        cr.set_source_rgba(0.9, 0.9, 0.9, 1.0)
+        cr.select_font_face("Sans", 0, 0)  # CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL
+        cr.set_font_size(13)
+        cr.move_to(38, height / 2 + 5)
+        cr.show_text(label)
+
+        return False
+
+    def update_status(self, status):
+        """Update the displayed status. Call from any thread via GLib.idle_add."""
+        self.status = status
+        self.queue_draw()
+
+    def on_button_press(self, widget, event):
+        """Start drag tracking."""
+        if event.button == 1:
+            self.drag_start_x = event.x_root
+            self.drag_start_y = event.y_root
+            self.dragging = False
+        return True
+
+    def on_button_release(self, widget, event):
+        """End drag and save position."""
+        if event.button == 1 and self.dragging:
+            self.dragging = False
+            config = load_config()
+            config['live_overlay_x'] = self.pos_x
+            config['live_overlay_y'] = self.pos_y
+            save_config(config)
+        return True
+
+    def on_motion(self, widget, event):
+        """Handle drag motion."""
+        if event.state & Gdk.ModifierType.BUTTON1_MASK:
+            dx = event.x_root - self.drag_start_x
+            dy = event.y_root - self.drag_start_y
+
+            if not self.dragging:
+                if abs(dx) > self.drag_threshold or abs(dy) > self.drag_threshold:
+                    self.dragging = True
+
+            if self.dragging:
+                self.pos_x = int(self.pos_x + dx)
+                self.pos_y = int(self.pos_y + dy)
+                self.move(self.pos_x, self.pos_y)
+                self.drag_start_x = event.x_root
+                self.drag_start_y = event.y_root
+        return True
+
+
+# Global overlay instance for live mode
+_live_overlay = None
+
+
+def show_live_overlay():
+    """Show the live overlay widget."""
+    global _live_overlay
+    if _live_overlay is None:
+        _live_overlay = LiveOverlayWidget()
+    _live_overlay.show_all()
+
+
+def hide_live_overlay():
+    """Hide the live overlay widget."""
+    global _live_overlay
+    if _live_overlay is not None:
+        _live_overlay.hide()
+
+
+def update_live_overlay(status):
+    """Update the live overlay status."""
+    global _live_overlay
+    if _live_overlay is not None and _live_overlay.get_visible():
+        _live_overlay.update_status(status)
+
+
 def main():
     config = load_config()
     style = config.get('indicator_style', 'floating')
@@ -1657,6 +1866,31 @@ def main():
             print("AppIndicator3 not available, falling back to floating dot", flush=True)
         print("Starting floating indicator", flush=True)
         indicator = StatusIndicator()
+
+    # Create live overlay (hidden by default)
+    global _live_overlay
+    _live_overlay = LiveOverlayWidget()
+
+    # Poll for live mode status to show/hide overlay
+    def check_live_mode():
+        try:
+            cfg = load_config()
+            is_live = cfg.get('ai_mode', 'claude') == 'live'
+            if is_live:
+                if not _live_overlay.get_visible():
+                    _live_overlay.show_all()
+                # Route status updates to overlay
+                if STATUS_FILE.exists():
+                    status = STATUS_FILE.read_text().strip()
+                    _live_overlay.update_status(status)
+            else:
+                if _live_overlay.get_visible():
+                    _live_overlay.hide()
+        except Exception:
+            pass
+        return True
+
+    GLib.timeout_add(500, check_live_mode)
 
     Gtk.main()
 

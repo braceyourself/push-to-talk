@@ -102,6 +102,13 @@ except ImportError:
     REALTIME_AVAILABLE = False
     realtime_available = lambda: False
 
+# Import Live Session (optional)
+try:
+    from live_session import LiveSession
+    LIVE_SESSION_AVAILABLE = True
+except ImportError:
+    LIVE_SESSION_AVAILABLE = False
+
 def get_openai_api_key():
     """Get OpenAI API key from environment or file."""
     key = os.environ.get("OPENAI_API_KEY")
@@ -685,6 +692,12 @@ class PushToTalk:
         # Conversation mode
         self.conversation_session = None
 
+        # Live voice session
+        self.live_session = None
+        self.live_thread = None
+        self.config_watcher_running = True
+        self._last_config_mtime = 0
+
         # Stream mode state
         self.stream_active = False
         self.stream_stop_event = threading.Event()
@@ -739,6 +752,34 @@ class PushToTalk:
 
         # Set idle status
         set_status('idle')
+
+        # Start config watcher for live mode auto-start
+        self.config_watcher_thread = threading.Thread(target=self._watch_config, daemon=True)
+        self.config_watcher_thread.start()
+
+    def _watch_config(self):
+        """Watch config.json for ai_mode changes to auto-start/stop live session."""
+        config_path = str(CONFIG_FILE)
+        while self.config_watcher_running:
+            try:
+                mtime = os.path.getmtime(config_path)
+                if mtime != self._last_config_mtime:
+                    self._last_config_mtime = mtime
+                    new_config = load_config()
+                    old_ai_mode = self.config.get('ai_mode', 'claude')
+                    new_ai_mode = new_config.get('ai_mode', 'claude')
+                    self.config = new_config
+                    if new_ai_mode == 'live' and old_ai_mode != 'live':
+                        if not self.live_session:
+                            print("Config watcher: Live mode selected, auto-starting session", flush=True)
+                            self.start_live_session()
+                    elif old_ai_mode == 'live' and new_ai_mode != 'live':
+                        if self.live_session:
+                            print("Config watcher: Left live mode, stopping session", flush=True)
+                            self.stop_live_session()
+            except Exception:
+                pass  # Don't crash the watcher
+            time.sleep(0.5)
 
     def toggle_tts_backend(self):
         """Toggle between Piper and OpenAI TTS."""
@@ -814,6 +855,52 @@ class PushToTalk:
             self.realtime_thread.join(timeout=2)
             self.realtime_thread = None
         # Always unmute mic when stopping realtime
+        subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
+                       capture_output=True)
+        set_status('idle')
+
+    def start_live_session(self):
+        """Start a live voice conversation session."""
+        if not LIVE_SESSION_AVAILABLE:
+            print("ERROR: live_session module not available", flush=True)
+            set_status('error')
+            return False
+
+        api_key = get_openai_api_key()
+        if not api_key:
+            print("No OpenAI API key found for live session", flush=True)
+            prompt_api_key()
+            return False
+
+        voice = self.config.get('openai_voice', 'ash')
+        self.live_session = LiveSession(
+            api_key=api_key,
+            voice=voice,
+            on_status=set_status
+        )
+
+        def run_session():
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self.live_session.run())
+            finally:
+                loop.close()
+                self.live_session = None
+
+        self.live_thread = threading.Thread(target=run_session, daemon=True)
+        self.live_thread.start()
+        return True
+
+    def stop_live_session(self):
+        """Stop the live voice session cleanly."""
+        if self.live_session:
+            self.live_session.stop()
+            self.live_session = None
+        if self.live_thread:
+            self.live_thread.join(timeout=2)
+            self.live_thread = None
         subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
                        capture_output=True)
         set_status('idle')
@@ -1032,6 +1119,14 @@ class PushToTalk:
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     set_status('success')
                     return
+                if text_lower in ['live mode', 'go live', 'going live']:
+                    print(f"Voice command: switching to live AI mode", flush=True)
+                    self.config['ai_mode'] = 'live'
+                    save_config(self.config)
+                    subprocess.Popen(['notify-send', '-t', '2000', 'Push-to-Talk', 'Live mode activated'],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    set_status('success')
+                    return
                 if text_lower in ['save audio', 'start saving']:
                     print(f"Voice command: enabling audio save", flush=True)
                     self.config['save_audio'] = True
@@ -1233,6 +1328,14 @@ class PushToTalk:
                     save_config(self.config)
                     self.stop_stream_mode()
                     subprocess.Popen(['notify-send', '-t', '2000', 'Push-to-Talk', 'Prompt mode activated'],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return
+                if text_lower in ['live mode', 'go live', 'going live']:
+                    print(f"Stream: switching to live AI mode", flush=True)
+                    self.config['ai_mode'] = 'live'
+                    save_config(self.config)
+                    self.stop_stream_mode()
+                    subprocess.Popen(['notify-send', '-t', '2000', 'Push-to-Talk', 'Live mode activated'],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     return
 
@@ -2076,10 +2179,14 @@ class PushToTalk:
         set_status('idle')
 
     def on_press(self, key):
-        # Interrupt key stops realtime AI
+        # Interrupt key stops realtime AI or live session
         if key == self.interrupt_key and self.realtime_session:
             print("Interrupt key pressed - interrupting AI", flush=True)
             self.realtime_session.request_interrupt()
+            return
+        if key == self.interrupt_key and self.live_session:
+            print("Interrupt key pressed - interrupting live session", flush=True)
+            self.live_session.request_interrupt()
             return
 
         # Track modifier keys
@@ -2121,6 +2228,12 @@ class PushToTalk:
                 else:
                     # Subsequent triggers: record a follow-up
                     self.start_recording(force=True)
+            elif ai_mode == 'live':
+                if not self.live_session:
+                    # Session not running (timed out or first start) — reconnect
+                    self.start_live_session()
+                # Live session handles audio via its own record_and_send loop
+                # PTT press in live mode is a no-op for recording since session auto-listens
             elif ai_mode == 'realtime':
                 # Check why Realtime might not work and report errors
                 if not REALTIME_AVAILABLE:
