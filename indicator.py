@@ -1895,10 +1895,11 @@ def main():
             if is_live:
                 if not _live_overlay.get_visible():
                     _live_overlay.show_all()
-                # Route status updates to overlay
-                if STATUS_FILE.exists():
+                # Route status updates to overlay, but don't override muted
+                if _live_overlay.status != 'muted' and STATUS_FILE.exists():
                     status = STATUS_FILE.read_text().strip()
-                    _live_overlay.update_status(status)
+                    if status != 'muted':
+                        _live_overlay.update_status(status)
             else:
                 if _live_overlay.get_visible():
                     _live_overlay.hide()
