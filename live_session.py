@@ -373,12 +373,24 @@ class LiveSession:
                 # Check for mute toggle signal from overlay
                 if mute_signal.exists():
                     try:
+                        command = mute_signal.read_text().strip()
                         mute_signal.unlink()
-                        self.muted = not self.muted
-                        status = "muted" if self.muted else "listening"
-                        self._set_status(status)
-                        self._reset_idle_timer()  # Reset idle timer on any interaction
-                        print(f"Live session: {'Muted' if self.muted else 'Unmuted'} by user", flush=True)
+                        if command == "stop":
+                            print("Live session: Stop requested by user", flush=True)
+                            self.running = False
+                            break
+                        elif command == "mute":
+                            self.muted = True
+                            self._set_status("muted")
+                            self._reset_idle_timer()
+                            print("Live session: Muted by user", flush=True)
+                        else:
+                            # Legacy toggle
+                            self.muted = not self.muted
+                            status = "muted" if self.muted else "listening"
+                            self._set_status(status)
+                            self._reset_idle_timer()
+                            print(f"Live session: {'Muted' if self.muted else 'Unmuted'} by user", flush=True)
                     except Exception:
                         pass
 

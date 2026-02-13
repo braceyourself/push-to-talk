@@ -1811,24 +1811,26 @@ class LiveOverlayWidget(Gtk.Window):
                 config['live_overlay_y'] = self.pos_y
                 save_config(config)
             else:
-                # Click (not drag) — toggle mute
-                self._toggle_mute()
+                # Click (not drag) — cycle mode
+                self._cycle_mode()
         return True
 
-    def _toggle_mute(self):
-        """Toggle live session mute via signal file."""
+    def _cycle_mode(self):
+        """Cycle: Listening → Muted → Idle (disconnect) → Listening (reconnect)."""
         signal_file = Path(__file__).parent / "live_mute_toggle"
-        if self.status in ('idle', 'disconnected', 'error'):
-            # Session is dead — request restart via status file
-            status_file = Path(__file__).parent / "status"
+        status_file = Path(__file__).parent / "status"
+        if self.status in ('listening',):
+            # Listening → Muted
+            signal_file.write_text("mute")
+            self.update_status('muted')
+        elif self.status == 'muted':
+            # Muted → Idle (stop session)
+            signal_file.write_text("stop")
+            self.update_status('idle')
+        elif self.status in ('idle', 'disconnected', 'error'):
+            # Idle → Listening (restart session)
             status_file.write_text("restart_live")
             self.update_status('listening')
-        elif self.status == 'muted':
-            signal_file.write_text("toggle")
-            self.update_status('listening')
-        elif self.status in ('listening',):
-            signal_file.write_text("toggle")
-            self.update_status('muted')
 
     def on_motion(self, widget, event):
         """Handle drag motion."""
