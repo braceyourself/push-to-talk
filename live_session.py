@@ -29,7 +29,8 @@ REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2
 
 # Context management thresholds
 SUMMARY_TRIGGER = 20000  # tokens before triggering summarization
-KEEP_LAST_TURNS = 3      # turns to preserve when summarizing
+KEEP_LAST_TURNS = 3
+REALTIME_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"}      # turns to preserve when summarizing
 
 
 class ConversationState:
@@ -47,7 +48,7 @@ class LiveSession:
 
     def __init__(self, api_key, voice="ash", on_status=None):
         self.api_key = api_key
-        self.voice = voice
+        self.voice = voice if voice in REALTIME_VOICES else "ash"
         self.on_status = on_status or (lambda s: None)
         self.ws = None
         self.running = False
@@ -59,6 +60,7 @@ class LiveSession:
         self.personality_prompt = self._build_personality()
         self._idle_timer = None
         self._idle_timeout = 120  # 2 minutes
+        self._ducked_inputs = {}  # sink_input_index -> original_volume
 
     def _build_personality(self):
         """Load personality from multiple .md files in personality/ directory."""
@@ -136,9 +138,10 @@ class LiveSession:
                 pass
             self.audio_player = None
 
-        # Always unmute mic on disconnect
+        # Always unmute mic and restore audio on disconnect
         subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
                        capture_output=True)
+        self._unduck_other_audio()
         print("Live session: Disconnected", flush=True)
 
     def start_audio_player(self):
@@ -149,6 +152,51 @@ class LiveSession:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
+
+    def _duck_other_audio(self):
+        """Lower volume of all other audio streams (music, etc.) while AI speaks."""
+        try:
+            our_pid = str(self.audio_player.pid) if self.audio_player else ""
+            result = subprocess.run(['pactl', 'list', 'sink-inputs'],
+                                    capture_output=True, text=True, timeout=2)
+            # Parse all sink inputs first, then filter
+            inputs = []
+            current = {}
+            for line in result.stdout.split('\n'):
+                stripped = line.strip()
+                if stripped.startswith('Sink Input #'):
+                    if current.get('index'):
+                        inputs.append(current)
+                    current = {'index': stripped.split('#')[1], 'pid': None, 'volume': 100}
+                elif 'application.process.id' in stripped and '"' in stripped:
+                    current['pid'] = stripped.split('"')[1]
+                elif stripped.startswith('Volume:') and 'volume' in current:
+                    try:
+                        current['volume'] = int(stripped.split('/')[1].strip().rstrip('%').strip())
+                    except (IndexError, ValueError):
+                        pass
+            if current.get('index'):
+                inputs.append(current)
+
+            # Duck all inputs except our aplay
+            for inp in inputs:
+                if inp['pid'] == our_pid:
+                    continue
+                self._ducked_inputs[inp['index']] = inp['volume']
+                subprocess.run(['pactl', 'set-sink-input-volume', inp['index'], '15%'],
+                               capture_output=True, timeout=2)
+        except Exception as e:
+            print(f"Live session: Duck error: {e}", flush=True)
+
+    def _unduck_other_audio(self):
+        """Restore volume of ducked audio streams."""
+        for index, volume in self._ducked_inputs.items():
+            try:
+                subprocess.run(['pactl', 'set-sink-input-volume', index, f'{volume}%'],
+                               capture_output=True, timeout=2)
+            except Exception:
+                pass
+        self._ducked_inputs.clear()
 
     async def send_audio(self, audio_data):
         """Send audio data to the API as base64-encoded PCM16."""
@@ -185,6 +233,7 @@ class LiveSession:
                         self._set_status("speaking")
                         subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '1'],
                                        capture_output=True)
+                        self._duck_other_audio()
                     self._reset_idle_timer()
                     audio_data = base64.b64decode(data.get("delta", ""))
                     if audio_data and self.audio_player and self.audio_player.stdin:
@@ -211,6 +260,7 @@ class LiveSession:
                         self.playing_audio = False
                         subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
                                        capture_output=True)
+                        self._unduck_other_audio()
                         self._set_status("listening")
                         print("Live session: Mic unmuted", flush=True)
 
@@ -254,6 +304,7 @@ class LiveSession:
                                 self.playing_audio = False
                                 subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
                                                capture_output=True)
+                                self._unduck_other_audio()
                                 self._set_status("listening")
                                 print("Live session: Mic unmuted (fallback)", flush=True)
 
@@ -263,6 +314,7 @@ class LiveSession:
                     self.playing_audio = False
                     subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
                                    capture_output=True)
+                    self._unduck_other_audio()
                     self._set_status("listening")
                     self._reset_idle_timer()
                     print("\n[Listening...]", flush=True)

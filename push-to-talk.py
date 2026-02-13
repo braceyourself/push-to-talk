@@ -750,6 +750,10 @@ class PushToTalk:
         print(f"Whisper model '{WHISPER_MODEL}' loaded.", flush=True)
         print(f"Push-to-Talk ready. Hold {ptt_name} to dictate.", flush=True)
 
+        # Ensure mic is unmuted on startup (cleanup from interrupted sessions)
+        subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
+                       capture_output=True)
+
         # Set idle status
         set_status('idle')
 
