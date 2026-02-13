@@ -1,248 +1,250 @@
 # Codebase Concerns
 
-**Analysis Date:** 2026-02-03
+**Analysis Date:** 2026-02-13
 
 ## Tech Debt
 
-**Bare Exception Handlers:**
-- Issue: Multiple bare `except:` clauses throughout codebase silently swallow all exceptions, making debugging difficult
-- Files: `push-to-talk.py` (lines 231, 275, 281, 621, 630, 670, 698, 718, 799), `openai_realtime.py` (lines 144, 352), `indicator.py` (lines 71, 81, 576, 817, 830, 1045, 1166)
-- Impact: Critical bugs may fail silently. Error conditions are not properly logged or handled. Makes troubleshooting user issues nearly impossible
-- Fix approach: Replace with specific exception types (IOError, ValueError, etc.) and log all exceptions with context
+**Bare Exception Handlers Throughout Codebase:**
+- Issue: Multiple bare `except:` clauses that silently catch and ignore all exceptions without logging or understanding failure modes
+- Files: `push-to-talk.py` (lines 35, 59, 73, 425, 475, 591, 1110, 1275, 1311, 1342, 1362, 1444, 1744, 1808, 1956, 1983, 1999, 2047), `indicator.py` (lines 79, 89, 719, 1274, 1617), `openai_realtime.py` (lines 145, 353)
+- Impact: Makes debugging difficult. Failures in file I/O, subprocess execution, and config operations are silently swallowed. Production issues become harder to diagnose.
+- Fix approach: Replace with specific exception types and proper error logging. At minimum, add `print()` statements to log failures to journalctl.
 
-**Subprocess Shell Injection Risk:**
-- Issue: Piper TTS command uses `shell=True` with user-controlled input via `subprocess.list2cmdline()` and string interpolation
-- Files: `push-to-talk.py` lines 501 (Piper command) - uses shell=True with echo piped to piper
-- Impact: If TTS text contains shell metacharacters, could lead to unintended command execution
-- Fix approach: Convert to list-based subprocess call without shell=True, pass text via stdin instead of echo
+**Shell=True in Subprocess Calls:**
+- Issue: Two instances of `subprocess.Popen(..., shell=True)` in verbal_hooks execution
+- Files: `push-to-talk.py` (lines 353, 365) in `check_verbal_hooks()`
+- Impact: Potential security vulnerability. User voice input gets executed directly in shell without validation. If hooks contain untrusted input, could enable command injection.
+- Fix approach: Use `subprocess.run(..., shell=False)` with proper argument list parsing. Validate hook triggers and commands before execution.
 
-**Global Mutable State in Module:**
-- Issue: Global variables like `indicator_process`, TTS process tracking, and config state can lead to race conditions
-- Files: `push-to-talk.py` lines 224, 349 - global indicator_process and instance-level tts_process
-- Impact: With threading (recordings happen in background threads), state can be corrupted. Auto-listen and concurrent TTS operations may interfere
-- Fix approach: Wrap state management in thread-safe patterns (locks, queues) or use proper async/await throughout
+**Monolithic File Structure:**
+- Issue: Main `push-to-talk.py` is 2237 lines with multiple responsibilities: hotkey handling, recording, transcription, TTS, interview mode, conversation mode, stream mode, realtime API integration
+- Files: `push-to-talk.py`
+- Impact: Difficult to test individual components, high cognitive load for maintenance, hard to reuse interview/conversation logic
+- Fix approach: Extract into modules: `recorder.py`, `transcriber.py`, `ai_modes/interview.py`, `ai_modes/conversation.py`, `ai_modes/realtime.py`
 
-**Unchecked File Operations:**
-- Issue: Files are read/written without existence validation in several places, may fail silently
-- Files: `push-to-talk.py` lines 230-232 (set_status writes to STATUS_FILE without error handling), `indicator.py` lines 814-818 (VOCAB_FILE.read_text() called without existence check before parsing)
-- Impact: If status file write fails, indicator becomes out of sync. Vocab parsing could crash if file is malformed
-- Fix approach: Validate file operations and log failures; use try/except with specific error types
+**Indicator Process as Global State:**
+- Issue: `indicator_process` is global variable modified in `start_indicator()` and `stop_indicator()`
+- Files: `push-to-talk.py` (lines 417, 451, 464-470)
+- Impact: Difficult to track state transitions, makes testing hard, potential race conditions
+- Fix approach: Wrap indicator management in a class with proper lifecycle methods
 
-**Memory Leak in Vocabulary Manager:**
-- Issue: Words are stored in a set but never pruned; vocabulary file only grows
-- Files: `push-to-talk.py` lines 303-327 (VocabularyManager.add and save)
-- Impact: Over time, vocabulary.txt becomes large with potentially invalid/misspelled words. No deduplication on load
-- Fix approach: Implement word validation (length, character set), deduplicate on load, optionally implement LRU eviction
+**Hardcoded Paths and Constants:**
+- Issue: Mix of absolute paths, relative paths, environment-based paths scattered throughout without validation
+- Files: `push-to-talk.py` (lines 195-206, 554, 839-850), `indicator.py` (lines 27-30, 68)
+- Impact: Breaks if directory structure changes, requires manual updates for different systems
+- Fix approach: Centralize path configuration in a `paths.py` module with validation
 
 ## Known Bugs
 
-**Realtime API Mic Muting Race Condition:**
-- Symptoms: Microphone can become stuck muted or unmuted if rapid keystrokes or interrupts occur
-- Files: `openai_realtime.py` lines 340-346, 413-418, 423-427 - multiple places calling pactl set-source-mute
-- Trigger: Quickly pressing interrupt key, or user speaking while AI response is ending
-- Workaround: Press interrupt key or manually unmute with `pactl set-source-mute @DEFAULT_SOURCE@ 0`
-- Root cause: Concurrent mute/unmute calls from event handlers and delayed_unmute task without synchronization
+**Stale Key Flags in Hotkey Handler:**
+- Symptoms: Shift key stuck in pressed state after AI mode exits, affects PTT hotkey recognition
+- Files: `push-to-talk.py` (lines 2141-2147)
+- Trigger: Press PTT + AI key combo, release both, then press PTT alone. Sometimes shift_r_pressed flag remains True
+- Workaround: Code attempts to clear with "Clearing stale shift_r_pressed flag" but the condition is reactive only
+- Root cause: Key release events are unreliable; physical key release may not trigger on_release() callback
 
-**Recording Release Event Spurious Triggering:**
-- Symptoms: Recording stops immediately after starting when using AI mode with both keys held
-- Files: `push-to-talk.py` lines 928-936 (on_release logic with elapsed time check)
-- Trigger: Rapidly pressing both Right Ctrl and Right Shift in succession
-- Workaround: Hold both keys for at least 0.5 seconds before starting to speak
-- Root cause: pynput may generate spurious release events; the 0.5s threshold is arbitrary and may not work for fast typists
+**Stream Mode Deduplication Fragile:**
+- Symptoms: Stream mode may type duplicate words or skip words when chunks overlap
+- Files: `push-to-talk.py` (lines 1235-1266)
+- Cause: Overlap detection uses simple word-matching heuristic (checking if words match last 5 words). Doesn't account for contractions, punctuation variations, or word order changes in transcription
+- Trigger: Fast speech, technical terms, or transcription errors
+- Impact: User sees garbled output in stream mode
 
-**Audio Level Detection Unreliable:**
-- Symptoms: Auto-listen feature may not trigger reliably on silent/low-volume audio
-- Files: `push-to-talk.py` lines 661-672 (get_audio_level with SILENCE_THRESHOLD check)
-- Trigger: User speaking very softly or with poor microphone
-- Workaround: Set SILENCE_THRESHOLD lower or disable auto-listen
-- Root cause: sox amplitude detection can vary widely depending on audio equipment; threshold is hardcoded
+**Realtime API Echo Cancellation:**
+- Symptoms: Occasional feedback loops where AI voice is re-recorded and fed back
+- Files: `openai_realtime.py` (lines 340-410)
+- Cause: Mic muting via `pactl` is timing-dependent. There's a 2-second cooldown window but speaker audio may linger longer
+- Workaround: 1.5-second delayed unmute, but still vulnerable to slow speaker systems
+- Impact: Realtime mode intermittently produces feedback noise
 
-**Claude Session Directory Not Cleaned:**
-- Symptoms: `~/.local/share/push-to-talk/claude-session/` grows indefinitely with temp files
-- Files: `push-to-talk.py` lines 760, 808, 820 - CLAUDE_SESSION_DIR created but never cleaned
-- Trigger: Every Claude AI query creates session state
-- Workaround: Manually clean directory with `rm -rf ~/.local/share/push-to-talk/claude-session/*`
-- Root cause: No cleanup routine; claude-session meant to persist context but may accumulate cruft
+**Interview Post-Processing Assumption:**
+- Symptoms: Post-processing silently fails if ffmpeg is not installed or audio files are missing
+- Files: `push-to-talk.py` (lines 1661-1759)
+- Cause: No upfront validation of ffmpeg availability, audio file existence before starting post-processing
+- Impact: Interview completes successfully but stitched audio/MP3 never created with no error notification
 
 ## Security Considerations
 
-**API Key Storage in Text Files:**
-- Risk: OpenAI API key stored in plain text at `~/.config/openai/api_key`
-- Files: `push-to-talk.py` lines 41-52 (reads from multiple paths including ~/.config/openai/api_key), `openai_realtime.py` lines 511-522
-- Current mitigation: File is chmod 600 (read-only by owner); key not logged to stdout
+**API Key in Memory:**
+- Risk: OpenAI API keys loaded from file and stored in Python variables, then passed to subprocess
+- Files: `push-to-talk.py` (lines 105-116, 268, 262), `openai_realtime.py` (lines 511-522)
+- Current mitigation: Keys stored with 0o600 file permissions, not exposed in debug output
 - Recommendations:
-  - Consider using system keyring (python-keyring) for storage
-  - Never pass API key to subprocess command line (vulnerable to `ps` inspection)
-  - Current implementation passes to OpenAI client correctly (not on cmdline)
+  - Use environment variables exclusively instead of reading from files
+  - Mask key in any log output (show only last 4 chars)
+  - Consider using credential manager (systemd user-provided secrets)
 
-**Subprocess Command Execution from Voice Input:**
-- Risk: Realtime AI can execute arbitrary shell commands via `run_command` tool
-- Files: `openai_realtime.py` lines 162-171 (execute_tool run_command implementation)
-- Current mitigation: Limited to 30s timeout, output capped at 2000 chars
+**Voice Command Execution (`verbal_hooks`):**
+- Risk: User voice input can trigger arbitrary shell commands with `shell=True`
+- Files: `push-to-talk.py` (lines 329-374)
+- Current mitigation: Trigger matching is case-insensitive but otherwise unrestricted
 - Recommendations:
-  - Add whitelist of allowed commands or deny list of dangerous commands (rm, dd, rm -rf, etc.)
-  - Use subprocess with shell=False and argument list instead of shell=True
-  - Log all executed commands to audit trail
-  - Consider sandboxing or capability restrictions
+  - Remove `shell=True` and use explicit argument lists
+  - Whitelist allowed commands, not arbitrary user input
+  - Add confirmation prompt before executing commands that modify system state
+  - Log all executed hooks to journalctl for audit trail
 
-**File Write via Voice Input:**
-- Risk: Realtime AI can write arbitrary files via `write_file` tool
-- Files: `openai_realtime.py` lines 180-184 (write_file implementation)
-- Current mitigation: None - tool accepts any path
+**Claude CLI Invocation:**
+- Risk: Subprocess calls to Claude CLI with `--permission-mode bypassPermissions` grant full system access
+- Files: `push-to-talk.py` (lines 1406-1416, 1880-1889, 1878-1888), `openai_realtime.py` (lines 186-196)
+- Current mitigation: Runs in constrained working directory, user controls what questions are asked
 - Recommendations:
-  - Restrict file writing to specific directories (e.g., ~/Documents)
-  - Implement filename validation to prevent path traversal (../../etc/passwd)
-  - Require confirmation before writing to system directories or dotfiles
-  - Log all file operations
+  - Consider downgrading to `acceptEdits` mode for conversation mode
+  - Add option to disable full tool access for untrusted contexts
+  - Log all Claude operations with timestamps and input/output summaries
 
-**Plaintext Config with Sensitive Data:**
-- Risk: config.json may contain API keys or other sensitive configuration
-- Files: `push-to-talk.py` lines 148, 174-180 (CONFIG_FILE storage)
-- Current mitigation: Currently only stores hotkeys and UI preferences (not keys)
-- Recommendations: Keep current separation - never store API keys in config.json
+**Interview Context Directory Reading:**
+- Risk: User can provide arbitrary directory paths for context, which are read and sent to Claude
+- Files: `push-to-talk.py` (lines 585-591)
+- Impact: Could expose sensitive information in CLAUDE.md files to the LLM
+- Recommendations: Add warning dialog before reading context, sanitize paths, option to exclude sensitive files
 
 ## Performance Bottlenecks
 
-**Whisper Model Loaded Once, Shared Across Threads:**
-- Problem: `self.model` is shared between main thread and transcription threads with lock contention
-- Files: `push-to-talk.py` lines 393-395 (model loaded once), 578-584, 744-749, 685-690 (transcribe calls with model_lock)
-- Cause: Whisper model is large (~1.5GB for small model); can't load per-thread. Lock serializes all transcriptions
+**Whisper Model Loading on Every Run:**
+- Problem: Entire Whisper "small" model (~461MB) loaded at startup, blocks main thread
+- Files: `push-to-talk.py` (lines 730-732)
+- Cause: Model is CPU/memory intensive, no caching across sessions
 - Improvement path:
-  - If multiple simultaneous recordings needed, pre-load model into GPU memory (requires CUDA)
-  - Consider lighter models (tiny/base) for faster transcription with acceptable accuracy
-  - Profile actual lock contention - may not be significant in practice for single-user tool
+  - Cache model to disk after first load
+  - Load asynchronously in background thread during startup
+  - Consider switching to faster model for stream mode (tiny/base)
 
-**Vocabulary Prompt Generation Every Transcription:**
-- Problem: Vocabulary prompt is regenerated on every transcription (sorted words, string concat)
-- Files: `push-to-talk.py` lines 329-333 (get_prompt called on every transcription at lines 570)
-- Cause: Naive implementation regenerates prompt even if vocabulary unchanged
-- Improvement path: Cache prompt, only regenerate on vocabulary add. Pre-sort vocabulary at load time
+**Realtime API Connection Overhead:**
+- Problem: Each AI hotkey press establishes new WebSocket, fetches API key, initializes session
+- Files: `openai_realtime.py` (lines 239-284), `push-to-talk.py` (lines 768-801)
+- Cause: No connection pooling or persistent session
+- Improvement path: Keep realtime session alive across multiple uses (toggle behavior exists but connection drops)
 
-**TTS Blocking on Output:**
-- Problem: `self.tts_process.wait()` blocks entire event thread while audio plays
-- Files: `push-to-talk.py` line 846 (TTS blocking wait in handle_ai_response)
-- Cause: Synchronous subprocess wait prevents interrupt key handling during playback
-- Improvement path: Use non-blocking wait with threading.Event or select on stderr
+**Interview Post-Processing Synchronous ffmpeg Calls:**
+- Problem: ffmpeg normalization, stitching, and MP3 conversion happen sequentially (can take 30+ seconds for 1-hour interview)
+- Files: `push-to-talk.py` (lines 1676-1706)
+- Improvement path: Run ffmpeg operations in parallel, show progress indication
+
+**Transcription File Size Truncation:**
+- Problem: Smart transcription and file reading truncate output to 5000 chars max
+- Files: `openai_realtime.py` (lines 176), `push-to-talk.py` (line 944-950 context building)
+- Impact: Large config files or long interviews lose context for AI
+- Fix approach: Stream processing instead of truncation, or implement pagination
 
 ## Fragile Areas
 
-**Realtime Event Handling Complexity:**
-- Files: `openai_realtime.py` lines 318-433 (handle_events async function, 116 lines)
-- Why fragile: Complex state machine with mic mute/unmute, playing_audio flag, audio_done_time tracking. Multiple concurrent async tasks. Easy to introduce echo or stuck mute states
-- Safe modification: Add comprehensive logging before state changes. Use state machine pattern explicitly. Test with rapid interrupts
-- Test coverage: No unit tests for event handling. Manual testing required
+**Interview/Conversation Session State Management:**
+- Files: `push-to-talk.py` (lines 535-660, 1501-1809)
+- Why fragile: Sessions can be interrupted mid-operation (e.g., user force-closes indicator, network dropout). No recovery or resumption mechanism. Temp files may be orphaned.
+- Safe modification:
+  - Add session persistence to disk
+  - Implement recovery on startup
+  - Clean up orphaned files on session init
+- Test coverage: No unit tests for session state transitions
 
-**Key Release Detection Logic:**
-- Files: `push-to-talk.py` lines 916-940 (on_release method)
-- Why fragile: Complex conditions checking if PTT mode vs AI mode, elapsed time, stale releases. Spurious release events from pynput cause state corruption
-- Safe modification: Consider debouncing key events. Log state transitions. Test with hardware keyboard monitoring
-- Test coverage: No automated key event testing
+**Stream Mode Chunk Management:**
+- Files: `push-to-talk.py` (lines 1125-1275)
+- Why fragile: Overlapping chunks with deduplication heuristic is prone to race conditions if transcription completes out-of-order or if audio level detection fails
+- Safe modification: Add explicit sequence numbers, validate chunk ordering before dedup
+- Test coverage: No unit tests for dedup logic
 
-**Thread Safety of Recording State:**
-- Files: `push-to-talk.py` lines 522-545 (start_recording) and 942-964 (stop_recording_with_mode)
-- Why fragile: Recording state (self.recording, self.record_process, self.temp_file) accessed from main thread and keyboard listener without locks
-- Safe modification: Add Lock around all state changes. Use threading.Event for synchronization instead of flag variables
-- Test coverage: No concurrency testing
-
-**Indicator Status File Sync:**
-- Files: `push-to-talk.py` lines 227-232 (set_status), `indicator.py` lines 1039-1047 (check_status polling)
-- Why fragile: Status file is inter-process communication between main process and indicator process. Polling every 100ms. Race condition if status changes between polls
-- Safe modification: Use inotify or named pipes instead of polling files. Or use dbus for proper IPC
-- Test coverage: None - would need to test process synchronization
+**Multi-Mode Hotkey Logic:**
+- Files: `push-to-talk.py` (lines 2073-2212)
+- Why fragile: Complex state machine with PTT key, AI key, indicator status, interview/conversation status all interacting. Flag management is ad-hoc.
+- Safe modification: Refactor to explicit state machine (e.g., enum `OperationMode` with clear transitions)
+- Test coverage: No unit tests for hotkey sequences
 
 ## Scaling Limits
 
-**Single Whisper Model Instance:**
-- Current capacity: 1 concurrent transcription (serialized by model_lock)
-- Limit: If user tries to transcribe while auto-listen is running, second request blocks
-- Scaling path: Load model into GPU if available. Or use faster inference with quantization (ONNX)
+**Whisper Model Size:**
+- Current capacity: ~461MB for "small" model in RAM continuously
+- Limit: Can't run on systems with <1GB available RAM. Blocks startup for ~3-5 seconds on first launch
+- Scaling path:
+  - Lazy-load model only when first PTT press occurs
+  - Add option to switch to "tiny" model for lower-end systems
+  - Consider streaming transcription to cloud API instead
 
-**Realtime Audio Chunk Buffering:**
-- Current capacity: CHUNK_SIZE=4096 bytes at 24kHz = ~85ms of audio per read
-- Limit: If network latency spikes, audio buffer could underrun or WebSocket recv could block
-- Scaling path: Implement proper audio queue with overflow handling. Add jitter buffer
+**Interview Session Audio Memory:**
+- Current capacity: Stores all audio files (.wav) + transcript in memory until post-processing. 1-hour interview = ~500MB+ disk I/O
+- Limit: Very long interviews (2+ hours) may hit disk space limits on embedded systems
+- Scaling path: Stream audio to codec during recording instead of storing raw PCM
 
-**Indicator Polling Interval:**
-- Current capacity: Checks status file every 100ms
-- Limit: With many processes writing status simultaneously, could miss updates or have stale reads
-- Scaling path: Switch to event-based notification (inotify, dbus, or file descriptor notifications)
+**Realtime API Simultaneous Users:**
+- Current capacity: Single connection per instance
+- Limit: Can't handle multiple PTT devices in same session concurrently
+- Scaling path: Not applicable for single-user tool, but document this limitation
 
 ## Dependencies at Risk
 
-**Deprecated pynput Library:**
-- Risk: pynput has known issues with modern Linux DE event handling; project has limited maintenance
-- Impact: Key listener might stop working with next GNOME/KDE release; spurious release events documented in known bugs
-- Migration plan: Consider `python-xlib` with direct X11 event handling, or `evdev` for device-level input (requires root)
+**OpenAI Whisper Maintenance:**
+- Risk: Whisper is AI model package maintained by OpenAI but not actively developed (last update 2023)
+- Impact: No future optimizations, security fixes may lag
+- Migration plan: Evaluate faster alternatives (Faster-Whisper, AssemblyAI API, Google Speech-to-Text)
 
-**OpenAI Realtime API Beta:**
-- Risk: Using preview model `gpt-4o-realtime-preview-2024-12-17` - subject to breaking changes
-- Impact: API could change or be deprecated; prompt format may become incompatible
-- Migration plan: Monitor OpenAI API changelog. Plan for fallback to non-realtime API if needed
+**pynput Keyboard Listener:**
+- Risk: pynput global keyboard listener can conflict with some desktop environments (Wayland, some KDE setups)
+- Impact: Hotkey triggering fails silently on incompatible systems
+- Migration plan: Add fallback to xdotool-based key detection, or systemwide hotkey service
 
-**Whisper Model Download:**
-- Risk: Model is downloaded on first use from OpenAI's CDN (~1.5GB for small model)
-- Impact: First run requires internet and long download. Network failures leave broken installation
-- Migration plan: Document model caching. Consider pre-packaging model with installer
+**Piper TTS Local Model:**
+- Risk: Piper voice models are static (trained once). No updates for better pronunciation
+- Impact: Synthetic speech quality plateaus
+- Alternative: Embed OpenAI TTS as primary with Piper fallback
 
-**Piper TTS via Shell:**
-- Risk: piper-tts requires bash/shell subprocess for piping echo output
-- Impact: Shell metacharacters in TTS text could cause issues (see subprocess shell injection above)
-- Migration plan: Use piper Python API directly if available, or write text to temp file instead of echo
+**AppIndicator3 GTK3 Library:**
+- Risk: GTK3 is deprecated in favor of GTK4. AppIndicator3 support is declining
+- Impact: System tray indicator may break on next GNOME major release
+- Migration plan: Use org.freedesktop.systemtray D-Bus API directly, or switch to GTK4 port
 
 ## Missing Critical Features
 
-**No Persistent Session History:**
-- Problem: Claude conversation context is lost after auto-listen timeout
-- Blocks: Can't have multi-turn conversations without manually re-asking context
-- Workaround: Claude session dir attempts to persist, but no explicit context management
+**No Persistent Configuration Schema Validation:**
+- Problem: Config loaded from JSON with no schema validation. Adding new options or renaming old ones has no migration path
+- Blocks: Large-scale config changes, team collaboration on settings
+- Fix: Implement Pydantic config model with migration functions
 
-**No Voice Selection for Realtime API:**
-- Problem: Hardcoded to "alloy" voice in Realtime mode
-- Blocks: Users can't switch voices during session (OpenAI has voice.alloy, voice.echo, voice.fable, voice.onyx, voice.shimmer)
-- Workaround: Edit REALTIME_URL in `openai_realtime.py` line 27 to change voice
+**No Hotkey Conflict Detection:**
+- Problem: User can set PTT and AI keys to same value. System will malfunction silently
+- Blocks: User self-service setup. Requires Settings UI validation refactor
+- Fix: Add validation in config save path, prevent equal key pairs
 
-**No Error Recovery in TTS:**
-- Problem: If TTS fails silently, user gets no feedback
-- Blocks: Can't diagnose why AI response isn't spoken
-- Workaround: Check logs with journalctl
-
-**No Explicit Tool Permission Prompts:**
-- Problem: Realtime AI can execute any tool without confirmation
-- Blocks: User may not realize AI just ran a shell command
-- Workaround: None - trust the AI not to do bad things
+**No Rate Limiting on AI Calls:**
+- Problem: Rapid-fire questions to Claude CLI or Realtime API have no throttling
+- Risk: Accidental API quota exhaustion, runaway costs
+- Fix: Add cooldown timers and queue system
 
 ## Test Coverage Gaps
 
-**No Unit Tests:**
-- What's not tested: VocabularyManager, CORRECTION_PATTERNS parsing, audio level detection, config file I/O
-- Files: `push-to-talk.py` lines 285-333 (VocabularyManager), lines 507-520 (detect_correction), lines 235-253 (get_audio_level)
-- Risk: Vocabulary parsing could be broken silently. Correction detection may not work as expected. Config corruption undetected
-- Priority: High - these are core features
+**No Unit Tests for Core Logic:**
+- What's not tested:
+  - Hotkey state machine transitions
+  - Stream mode deduplication
+  - Interview session lifecycle
+  - Transcription prompt building
+- Files: `push-to-talk.py` (entire file)
+- Risk: Regressions in core logic undetected
+- Priority: High — hotkey logic has known flag issues
 
-**No Integration Tests:**
-- What's not tested: Recording → transcription → typing workflow end-to-end. AI conversation flow. Status indicator sync
-- Files: Full workflow involves multiple processes and async operations
-- Risk: A change that breaks the main feature could go unnoticed. Regressions in audio pipeline not caught
-- Priority: High - this is the main feature
+**No Integration Tests for Multi-Mode Flows:**
+- What's not tested:
+  - PTT → interview → stream follow-ups
+  - Conversation mode with network interruption
+  - Realtime session toggle stress
+- Risk: Complex user journeys fail in production but work in isolation
+- Priority: High
 
-**No Concurrency Tests:**
-- What's not tested: Rapid key presses, overlapping recordings, simultaneous transcription + auto-listen
-- Files: Threading model at `push-to-talk.py` lines 336-349 and subprocess spawning
-- Risk: Race conditions in production (stuck mutes, corrupted state) could occur intermittently
-- Priority: Medium - only affects edge cases but hard to debug
+**No Tests for Error Paths:**
+- What's not tested:
+  - Missing ffmpeg during post-processing
+  - Whisper model load failure
+  - Claude CLI timeout
+  - API key missing at runtime
+- Files: All files
+- Risk: Errors handled with bare `except:` blocks, actual behavior unknown
+- Priority: Medium
 
-**No Realtime API Integration Tests:**
-- What's not tested: WebSocket reconnection, function tool execution, voice quality, error handling
-- Files: `openai_realtime.py` entire module
-- Risk: Features may not work in production. Tool execution might be silent failures. Error recovery untested
-- Priority: Medium - complex subsystem that's hard to debug in field
-
-**No Indicator Popup Tests:**
-- What's not tested: GTK UI rendering, drag-and-drop, popup positioning, log display
-- Files: `indicator.py` lines 128-690 (SettingsWindow), 692-851 (StatusPopup), 854-1066 (StatusIndicator)
-- Risk: UI could be broken in different GTK versions or desktop environments
-- Priority: Low - UI issues are user-visible and reported quickly
+**No GUI Tests:**
+- What's not tested: Settings window, indicator popup, dialogs
+- Files: `indicator.py`
+- Risk: UI regressions undetected
+- Priority: Low (UI less critical than core functionality)
 
 ---
 
-*Concerns audit: 2026-02-03*
+*Concerns audit: 2026-02-13*

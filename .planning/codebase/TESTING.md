@@ -1,238 +1,173 @@
 # Testing Patterns
 
-**Analysis Date:** 2026-02-03
+**Analysis Date:** 2026-02-13
 
 ## Test Framework
 
 **Status:** No automated testing framework detected
 
-- No pytest, unittest, or vitest configuration
-- No test files in codebase (`*_test.py`, `*_spec.py` not found)
-- No test runner configuration files
-- Testing appears to be manual/integration based
+**Runner:**
+- Not configured. No pytest, unittest, or nose configuration found.
+- No test files (`test_*.py`, `*_test.py`, or `tests/` directory) present in codebase.
 
-## Manual Testing Approach
+**Assertion Library:**
+- Not applicable. No test code exists.
 
-**How this codebase is tested:**
+**Run Commands:**
+- No test commands available.
 
-The project relies on manual testing and systemd service integration testing:
-- Systemd user service runs as background daemon
-- Manual verification via `systemctl --user status push-to-talk`
-- Logs inspected with `journalctl --user -u push-to-talk -f`
-- GUI indicator provides real-time visual feedback (status dots)
-- Status popup shows recent transcriptions and allows manual service restart
+## Test Strategy (Current State)
 
-## Code Organization for Testability
+**Manual Testing Only:**
+- Functionality tested through direct interaction with running service
+- systemd service integration tested via `systemctl --user restart push-to-talk.service`
+- Settings verified through indicator GUI (`indicator.py`)
+- Audio/transcription tested live with actual recordings
 
-**Separation of Concerns:**
-- `push-to-talk.py` - Core dictation logic (recording, transcription, typing)
-- `indicator.py` - Separate UI process (status display)
-- `openai_realtime.py` - Isolated Realtime API implementation
-- Configuration is externalized to JSON file (`config.json`)
+**Integration Testing (Manual):**
+- Full workflow: Hold PTT key → record audio → transcribe → type output
+- Verify config persistence: Change settings in GUI → restart service → verify settings applied
+- Test hotkey binding changes: Modify keybindings → restart → verify new keys work
+- Audio save feature: Enable save audio → record → verify files in audio directory
+
+**E2E Testing (Manual):**
+- Interview mode: Start AI hotkey → receive question → press PTT → speak answer → verify response
+- Conversation mode: Start AI hotkey → ask question → Claude processes with tools → verify output
+- Realtime mode: Connect to OpenAI Realtime → speak → receive voice response
+
+## How Testing Is Currently Handled
+
+**Service Health:**
+- Check via `systemctl --user status push-to-talk`
+- View logs: `journalctl --user -u push-to-talk -f --no-pager`
+- Status file monitoring: `cat status` shows current service state
+
+**UI Testing:**
+- Manual interaction with `SettingsWindow` (GTK application in `indicator.py`)
+- Verify dropdown selections persist to `config.json`
+- Click buttons and verify dialogs appear/dismiss correctly
+
+**Configuration Testing:**
+- Load/save cycle: `load_config()` and `save_config()` work with `config.json` at project root
+- Default values apply when config missing: See `load_config()` in `indicator.py` lines 52-80
+- API key validation: Manual entry in settings, verify persistence to `~/.config/openai/api_key`
+
+## Code Patterns That Enable Testing (if tests existed)
 
 **Dependency Injection:**
-- Callback pattern for status updates: `on_status=set_status` parameter
-- Configuration loaded from file, not hardcoded
-- Optional dependencies feature-detected at import: `OPENAI_AVAILABLE`, `REALTIME_AVAILABLE`
+- Classes accept callbacks for status updates: `def __init__(self, on_status=None):` in `RealtimeSession` (line 226)
+- Allows mocking status handler: `session = RealtimeSession(api_key, on_status=mock_handler)`
 
-**Error Handling for Testing:**
-- Try/except blocks allow graceful degradation
-- Status file as IPC mechanism between service and indicator
-- Comprehensive logging to stdout (captured by journalctl)
+**File Path Abstraction:**
+- All paths use `pathlib.Path` for testability: `CONFIG_FILE = Path(__file__).parent / "config.json"`
+- Enables test fixtures to override paths via monkey-patching
 
-## Test Data & Fixtures
+**Separable Components:**
+- `VocabularyManager` (line 478): Isolated vocabulary operations
+- `InterviewSession` (line 535): Encapsulates interview state and flow
+- `ConversationSession` (line 628): Encapsulates conversation state
+- `RealtimeSession` (line 223 in `openai_realtime.py`): WebSocket session handling
 
-**Configuration Test Data:**
+**Configuration as Dict:**
+- `load_config()` returns plain dict, enabling easy fixture creation for tests
+- No singleton pattern; config can be passed to functions as needed
+
+## Testing Gaps
+
+**Missing Unit Tests:**
+- Config loading/saving (`load_config()`, `save_config()`)
+- Hotkey validation logic (`on_hotkey_changed()` in `indicator.py`)
+- API key handling (`get_openai_api_key()`, `save_openai_api_key()`)
+
+**Missing Integration Tests:**
+- Full audio pipeline: Record → transcribe → type
+- Config persistence through service restart
+- Multiple hotkey configurations
+- Vocabulary learning from corrections
+
+**Missing E2E Tests:**
+- Interview mode workflow end-to-end
+- Conversation mode with Claude tool execution
+- Realtime mode audio quality and responsiveness
+- Service autostart and cleanup on exit
+
+## If Tests Were to Be Added: Recommended Structure
+
+**Test Framework:** pytest (recommended over unittest for simplicity)
+
+**Test File Organization:** Parallel structure to source
+```
+tests/
+├── test_push_to_talk.py      # Main service logic
+├── test_indicator.py          # UI and settings
+├── test_openai_realtime.py   # Realtime integration
+├── test_vocabulary.py         # VocabularyManager
+├── test_config.py             # Config loading/saving
+└── fixtures/
+    ├── config_fixtures.py     # Test config dicts
+    └── audio_fixtures.py      # Test audio data
+```
+
+**Unit Test Pattern (if implemented):**
 ```python
-# From load_config() - lines 151-171
-default = {
-    "tts_backend": "piper",
-    "openai_voice": "nova",
-    "ai_mode": "claude",
-    "ptt_key": "ctrl_r",
-    "ai_key": "shift_r",
-    "interrupt_key": "escape",
-    "indicator_style": "floating",
-    "indicator_x": None,
-    "indicator_y": None,
-}
+# Example: test config loading
+import pytest
+from pathlib import Path
+from indicator import load_config
+
+def test_load_config_returns_defaults_when_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr("indicator.CONFIG_FILE", tmp_path / "nonexistent.json")
+    config = load_config()
+    assert config["tts_backend"] == "piper"
+    assert config["debug_mode"] == False
+
+def test_load_config_merges_with_defaults(tmp_path, monkeypatch):
+    config_file = tmp_path / "config.json"
+    config_file.write_text('{"debug_mode": true}')
+    monkeypatch.setattr("indicator.CONFIG_FILE", config_file)
+    config = load_config()
+    assert config["debug_mode"] == True
+    assert config["tts_backend"] == "piper"  # default
 ```
 
-**Test Vocabulary:**
+**Mocking Pattern (if implemented):**
 ```python
-# From indicator.py - line 33
-OPENAI_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+# Example: mock subprocess for safe testing
+from unittest.mock import patch, MagicMock
 
-# From push-to-talk.py - lines 114-127
-MODIFIER_KEY_OPTIONS = {
-    "ctrl_r": ("Right Ctrl", keyboard.Key.ctrl_r),
-    "ctrl_l": ("Left Ctrl", keyboard.Key.ctrl_l),
-    # ... etc
-}
+@patch('subprocess.run')
+def test_api_key_save_sets_permissions(mock_run):
+    save_openai_api_key("sk-test-key")
+    # Verify chmod 0o600 was called
+    assert mock_run.called  # Would verify actual chmod in real test
 ```
 
-**Status States for Testing:**
-```python
-# From indicator.py - lines 107-115
-COLORS = {
-    'idle': (0.5, 0.5, 0.5, 0.3),
-    'recording': (1.0, 0.2, 0.2, 0.9),
-    'processing': (1.0, 0.8, 0.0, 0.9),
-    'success': (0.2, 0.9, 0.2, 0.9),
-    'error': (1.0, 0.0, 0.0, 0.9),
-    'listening': (0.2, 0.6, 1.0, 0.9),
-    'speaking': (0.8, 0.4, 1.0, 0.9),
-}
-```
+## Manual Testing Checklist (Current Practice)
 
-## Integration Points for Testing
+**Core Functionality:**
+- [ ] PTT hotkey records and transcribes
+- [ ] Transcribed text types into focused application
+- [ ] Vocabulary file changes improve transcription
+- [ ] Smart transcription mode works (if enabled)
 
-**File-based IPC:**
-- Status file at `BASE_DIR / "status"` - checked every 100ms by indicator
-- Configuration file at `BASE_DIR / "config.json"` - persistent settings
-- Vocabulary file at `BASE_DIR / "vocabulary.txt"` - learned words
+**Configuration:**
+- [ ] Settings persist after service restart
+- [ ] Hotkey changes take effect on restart
+- [ ] Audio save location is created and files saved
+- [ ] Debug mode enables verbose logging
 
-**Process Management:**
-- Indicator subprocess spawned/managed: `subprocess.Popen(['python3', str(INDICATOR_SCRIPT)])`
-- PipeWire recording: `pw-record` subprocess
-- FFmpeg conversion: `subprocess.run(['ffmpeg', ...])`
-- Piper TTS: piped with shell command
+**Modes:**
+- [ ] Claude mode: PTT → transcribe → type
+- [ ] Conversation mode: AI hotkey → ask question → Claude responds
+- [ ] Interview mode: AI hotkey → interviewer asks → PTT to answer
+- [ ] Realtime mode (if enabled): Voice-to-voice with minimal latency
 
-**Mock-able Subprocess Calls:**
-```python
-# From push-to-talk.py - lines 536-542
-self.record_process = subprocess.Popen([
-    'pw-record',
-    '--format', 's16',
-    '--rate', '44100',
-    '--channels', '2',
-    self.temp_file.name
-], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-```
+**Error Handling:**
+- [ ] Missing DISPLAY handled gracefully at startup
+- [ ] Missing API key prompts user
+- [ ] Service restart without crashing
+- [ ] Invalid hotkey combinations show error message
 
-**External Tool Invocations (Testable):**
-- OpenAI Whisper: `self.model.transcribe(converted_file, ...)`
-- Claude CLI: `subprocess.run([str(CLAUDE_CLI), '-c', '-p', question, ...])`
-- xdotool typing: `subprocess.run(['xdotool', 'type', '--delay', '12', '--', text])`
-- notify-send: `subprocess.Popen(['notify-send', '-t', '3000', ...])`
+---
 
-## Manual Test Scenarios
-
-**Basic Dictation Flow (Manual):**
-1. Start service: `systemctl --user start push-to-talk.service`
-2. Open text editor
-3. Hold Right Ctrl key
-4. Speak text ("hello world")
-5. Release Right Ctrl
-6. Verify: "hello world " appears in editor
-7. Check logs: `journalctl --user -u push-to-talk -n 5`
-   - Should see: "Recording...", "Transcribed: hello world", "Success"
-
-**AI Assistant Mode (Manual):**
-1. Hold Right Ctrl + Right Shift simultaneously
-2. Ask a question ("what is the weather")
-3. Release keys
-4. Indicator turns yellow (processing)
-5. Claude responds verbally
-6. Indicator turns blue (auto-listening)
-7. Can ask follow-up or press Escape to stop
-
-**Configuration Changes (Manual):**
-1. Click indicator dot → Settings
-2. Change hotkey, TTS backend, AI mode
-3. Service automatically detects config changes via file watch
-4. Some changes require service restart (shown in UI)
-
-**Error Conditions (Manual):**
-1. Recording too short (< 5000 bytes) - status shows idle, no output
-2. No speech detected (silence) - logged and ignored
-3. OpenAI API unavailable - error notification shown, service continues
-4. Missing Realtime dependencies - falls back to Claude mode
-
-## Test Coverage Gaps
-
-**Untested Areas:**
-- Realtime WebSocket connection handling (`openai_realtime.py`)
-  - Files: `openai_realtime.py:239-284` (connect), `318-438` (handle_events)
-  - Risk: Network failures, API changes, protocol bugs
-  - Current coverage: Manual integration only via systemd service
-
-- GTK GUI event handling (`indicator.py`)
-  - Files: `indicator.py:949-1011` (mouse events, drag handling)
-  - Risk: Mouse tracking bugs, focus issues, coordinate miscalculations
-  - Current coverage: Manual UI interaction only
-
-- Concurrent Recording Edge Cases (`push-to-talk.py`)
-  - Files: `push-to-talk.py:855-965` (on_press, on_release, key state machine)
-  - Risk: Race conditions with spurious key events, overlapping recordings
-  - Current coverage: Ad-hoc testing with various key timing scenarios
-
-- Subprocess Error Handling
-  - Files: All subprocess.Popen/run calls
-  - Risk: Process failures, timeouts, I/O deadlocks
-  - Current coverage: Timeout handling only for Claude CLI (120s)
-
-**Why No Automated Testing:**
-- Heavy I/O dependencies: audio recording, TTS, speech recognition
-- System-level integration: keyboard listener, display server (X11/Wayland)
-- External service dependencies: OpenAI Whisper, Claude CLI, OpenAI Realtime API
-- GUI testing complexity: GTK windows, Cairo drawing, mouse events
-- Difficult to mock: keyboard events (pynput), audio streams (pw-record)
-
-## Debugging Practices
-
-**Logging for Diagnosis:**
-- All major operations have print statements with `flush=True`
-- Realtime API prefixes messages: `"Realtime API: Event handler started"`
-- Status changes logged: `"Switched to OpenAI TTS"`, `"Switched to Realtime AI mode"`
-
-**View Logs in Real-time:**
-```bash
-journalctl --user -u push-to-talk -f --no-pager
-```
-
-**Manual Status Checks:**
-```bash
-# Check if service is running
-systemctl --user status push-to-talk.service
-
-# Check last 20 log lines
-journalctl --user -u push-to-talk -n 20 --no-pager
-
-# Check configuration
-cat ~/.local/share/push-to-talk/config.json
-
-# Check vocabulary learned
-cat ~/.local/share/push-to-talk/vocabulary.txt
-```
-
-**Debug Mode:**
-- Settings UI has "Enable debug mode" toggle (stored in config)
-- Debug mode flag stored but not actively used in logging
-- Could be expanded to increase verbosity in future
-
-**Key Testing Artifacts:**
-- Status file polling: `indicator.py:1040-1047` checks status every 100ms
-- Config file persistence: Changes saved to `config.json` on every setting change
-- Vocabulary persistence: Added words saved to `vocabulary.txt`
-- Log file: All output captured by systemd journal
-
-## Test Reliability Considerations
-
-**Timing-Sensitive Code:**
-- Auto-listen duration: `AUTO_LISTEN_SECONDS = 4` (lines 144)
-- Success status timeout: `GLib.timeout_add(1500, self.return_to_idle)` (line 1058)
-- Status indicator hover delay: `GLib.timeout_add(300, self.show_popup)` (line 955)
-- Drag threshold: `self.drag_threshold = 5` pixels (line 867)
-
-**Audio Processing Timing:**
-- File size check: minimum 5000 bytes to process (lines 556, 730)
-- Audio level check: SILENCE_THRESHOLD = -35 dB (line 145)
-- Audio cooldown: 2 second wait after TTS finishes before accepting input (line 457)
-
-**Flaky Test Areas (if automated tests were added):**
-- Microphone input timing (device-dependent)
-- Whisper transcription accuracy (model variance)
-- Claude API response latency (network dependent)
-- GUI rendering (display server dependent)
-- Keyboard event ordering (OS-level timing)
+*Testing analysis: 2026-02-13*

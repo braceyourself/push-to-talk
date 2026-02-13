@@ -1,157 +1,246 @@
 # Architecture
 
-**Analysis Date:** 2026-02-03
+**Analysis Date:** 2026-02-13
 
 ## Pattern Overview
 
-**Overall:** Event-driven service with plugin-like mode switching (Push-to-Talk dictation, AI conversation, Realtime voice interaction)
+**Overall:** Event-driven, modular microservice architecture with multiple specialized modes
 
 **Key Characteristics:**
-- Keyboard-driven state machine (recording states triggered by hotkey combinations)
-- Dual-mode audio processing: transcribe-then-type vs transcribe-then-ask-ai
-- Pluggable TTS backend (local Piper or cloud OpenAI)
-- Separate indicator/UI process communicating via status file
-- Optional voice-to-voice AI using OpenAI Realtime API
+- Global hotkey listener triggers state machines for different AI/dictation modes
+- Thread-based background processing for transcription and response generation
+- Configuration-driven mode selection (Claude, Realtime, Interview, Conversation)
+- Subprocess orchestration for audio recording, transcription, and TTS
+- Session-based persistence for Interview and Conversation modes
 
 ## Layers
 
-**Input Layer (Keyboard & Audio):**
-- Purpose: Capture user input and system state changes
-- Location: `push-to-talk.py` lines 855-941 (on_press/on_release), `openai_realtime.py` lines 440-468 (audio recording)
-- Contains: Keyboard listener using pynput, audio recording via pw-record, WebSocket event handling
-- Depends on: pynput library, PipeWire audio system
-- Used by: State machine to trigger processing workflows
+**Input/Hotkey Layer:**
+- Purpose: Detect and respond to global keyboard events
+- Location: `push-to-talk.py` - `PushToTalk.on_press()` / `PushToTalk.on_release()`
+- Contains: Hotkey mapping, mode detection, state machine logic
+- Depends on: pynput library for keyboard monitoring
+- Used by: Application entry point; all other layers respond to key events
 
-**Processing Layer (Speech-to-Text & AI):**
-- Purpose: Convert audio to text, optionally delegate to AI, generate responses
-- Location: `push-to-talk.py` lines 548-853 (transcribe_and_type, transcribe_and_ask_ai, handle_ai_response, auto_listen_for_followup)
-- Contains: Whisper transcription (lines 578-584), Claude CLI invocation (lines 810-821), TTS response handling (lines 837-853)
-- Depends on: Whisper model, Claude CLI, Piper/OpenAI TTS, ffmpeg for audio conversion
-- Used by: State machine after recording completes
+**Audio Recording & Processing Layer:**
+- Purpose: Capture microphone input and convert to transcribable format
+- Location: `push-to-talk.py` - `PushToTalk.start_recording()`, `PushToTalk.stream_mode_*`
+- Contains: pw-record subprocess calls, audio format conversion via ffmpeg
+- Depends on: PipeWire audio system, ffmpeg
+- Used by: All transcription and AI modes
 
-**UI/Output Layer:**
-- Purpose: Visual feedback and user settings
-- Location: `indicator.py` (status indicator), `openai_realtime.py` (audio playback)
-- Contains: GTK3 floating dot or system tray status widget, settings window with tabs, status file polling
-- Depends on: GTK3, AppIndicator3 (optional), cairo for drawing
-- Used by: Main service communicates status via file; indicator runs in separate process
+**Transcription Layer:**
+- Purpose: Convert recorded audio to text using Whisper model
+- Location: `push-to-talk.py` - Whisper model instantiation and `transcribe()` calls
+- Contains: Model loading, vocabulary context building, language detection
+- Depends on: OpenAI Whisper (loaded once at startup)
+- Used by: Dictation mode, AI modes, Interview/Conversation modes
 
-**AI Mode Layer (Optional Realtime):**
-- Purpose: Low-latency voice-to-voice interaction using OpenAI Realtime API
-- Location: `openai_realtime.py` (entire module)
-- Contains: WebSocket connection to Realtime API, function calling for tool execution (run_command, read_file, write_file, ask_claude, remember, recall)
-- Depends on: websockets library, OpenAI API key
-- Used by: Main service when ai_mode='realtime' and keys are pressed
+**Dictation Layer:**
+- Purpose: Type transcribed text directly into focused application
+- Location: `push-to-talk.py` - `PushToTalk.transcribe_and_type()`
+- Contains: Voice command parsing, prompt dialog (zenity), xdotool typing
+- Depends on: xdotool (X11 automation), vocabulary learning
+- Used by: Direct user invocation via PTT key
 
-**Vocabulary & Learning Layer:**
-- Purpose: Improve transcription accuracy by learning domain-specific words
-- Location: `push-to-talk.py` lines 285-334 (VocabularyManager class)
-- Contains: Vocabulary file I/O, prompt generation for Whisper, correction pattern detection
-- Depends on: vocabulary.txt file
-- Used by: Transcription pipelines include vocab in initial_prompt
+**AI Assistant Layer:**
+- Purpose: Process voice questions and generate spoken responses
+- Locations:
+  - Claude mode: `push-to-talk.py` - `PushToTalk.transcribe_and_ask_ai()`
+  - Realtime mode: `openai_realtime.py` - `RealtimeSession` class
+  - Interview mode: `push-to-talk.py` - `PushToTalk._interview_*()` methods
+  - Conversation mode: `push-to-talk.py` - `PushToTalk._conversation_*()` methods
+- Contains: Claude CLI invocation, OpenAI Realtime API, session management
+- Depends on: Claude CLI, OpenAI APIs, subprocess orchestration
+- Used by: AI key presses, auto-listen for follow-ups
+
+**Text-to-Speech Layer:**
+- Purpose: Convert AI responses or system messages to audio playback
+- Location: `push-to-talk.py` - `PushToTalk.speak()`, `PushToTalk.speak_openai()`
+- Contains: Backend selection (Piper local vs OpenAI cloud), audio output via aplay
+- Depends on: Piper TTS models (local) or OpenAI API
+- Used by: AI assistant responses, system notifications
+
+**Session Management Layer:**
+- Purpose: Maintain state and output for Interview and Conversation modes
+- Locations: `push-to-talk.py` - `InterviewSession` and `ConversationSession` classes
+- Contains: Session directories, transcript logging, metadata tracking, post-processing
+- Depends on: Filesystem, Claude CLI, ffmpeg for audio stitching
+- Used by: Interview/Conversation modes for persistence and output generation
+
+**UI/Status Indicator Layer:**
+- Purpose: Visual feedback and configuration management
+- Location: `indicator.py` (separate process), `push-to-talk.py` - `set_status()`
+- Contains: GTK UI, status dot drawing, settings windows, tray/floating modes
+- Depends on: GTK 3, Cairo, AppIndicator3 (optional)
+- Used by: Status file communication, user interaction
 
 ## Data Flow
 
-**Basic Dictation Flow:**
-1. User holds PTT key (Right Ctrl) → `on_press()` triggers `start_recording()` (line 910-912)
-2. Audio captured to temp WAV file via `pw-record` (lines 536-542)
-3. User releases PTT key → `on_release()` stops recording (lines 924-938)
-4. Background thread calls `transcribe_and_type()` (line 964)
-   - Audio converted to 16kHz mono with ffmpeg (lines 563-567)
-   - Whisper transcribes with vocabulary prompt (lines 578-584)
-   - Correction patterns checked (lines 592-600)
-   - Text typed via xdotool (line 606)
+**Dictation Flow (Live Mode):**
 
-**AI Assistant Flow (Claude Mode):**
-1. User holds PTT key + AI key (Right Ctrl + Right Shift) → `on_press()` sets ai_mode=True, calls `start_recording()` (line 900)
-2. User releases keys → `on_release()` calls `stop_recording_with_mode()` which spawns `transcribe_and_ask_ai()` (line 962)
-3. Audio transcribed (same as above)
-4. Claude CLI invoked with question in persistent session (lines 810-821)
-5. Response captured and passed to `handle_ai_response()` (line 825)
-6. `speak()` plays response via TTS (Piper or OpenAI) (lines 491-505)
-7. `auto_listen_for_followup()` records for 4 seconds (lines 637-719)
-8. If audio detected, recursively calls `process_ai_question()` (line 707)
+1. User holds PTT key (Right Ctrl)
+2. `on_press()` → `start_recording()` starts `pw-record` subprocess
+3. Status indicator shows "recording" (red dot)
+4. User releases PTT key
+5. `on_release()` → `stop_recording_with_mode()` stops recording
+6. Audio file converted to 16kHz mono via ffmpeg
+7. Whisper transcribes with vocabulary prompt
+8. Text parsed for voice commands (clear, undo, paste, etc.)
+9. If command matched: execute and return
+10. If correction detected (add word/correction:): learn and return
+11. If prompt mode: show zenity dialog for editing
+12. xdotool types text into focused window
+13. Status shows "success" (green dot) for 1.5s, then idle
 
-**AI Assistant Flow (Realtime Mode):**
-1. User holds PTT key + AI key → `on_press()` detects both keys held (line 871)
-2. Calls `start_realtime_session()` which spawns async event loop in daemon thread (lines 431-464)
-3. `RealtimeSession.run()` establishes WebSocket, starts audio recording/sending (lines 469-490)
-4. Background tasks: `record_and_send()` streams mic audio, `handle_events()` processes API responses (lines 318-468)
-5. When API sends audio delta events, mic is muted to prevent echo (lines 344-346)
-6. When user stops speaking, function calls are executed (lines 373-399)
-7. User presses interrupt key → `request_interrupt()` sets flag, `handle_events()` cancels response (lines 506-508, 327-329)
-8. User holds both keys again → toggles off realtime session (lines 872-875)
+**AI Assistant Flow (Claude + Whisper):**
+
+1. User holds PTT + AI key (Right Ctrl + Right Shift)
+2. `on_press()` → `start_recording()` (same as dictation)
+3. User releases, `stop_recording_with_mode()` → `transcribe_and_ask_ai()`
+4. Whisper transcribes user question
+5. Claude CLI invoked with question in session directory
+6. Response captured from stdout
+7. TTS backend (Piper or OpenAI) speaks response
+8. `auto_listen_for_followup()` records for 4 seconds
+9. If audio detected and level > threshold: transcribe and recurse
+10. Else: return to idle
+
+**Interview Mode Flow:**
+
+1. User activates AI key → `start_interview()`
+2. Zenity prompt for topic (or use config)
+3. `InterviewSession` created with session_dir at `~/Audio/push-to-talk/sessions/<timestamp>/`
+4. Claude generates first question
+5. TTS speaks question, saves audio to `001_interviewer.wav`
+6. User presses PTT to record answer
+7. Whisper transcribes, saved to `002_user.wav`
+8. Detect wrap signal ("that's a wrap") or continue
+9. Claude generates follow-up question using conversation history
+10. On wrap: Claude generates closing statement
+11. Post-processing: ffmpeg stitches audio, generates transcript and show notes
+12. Output: `interview_<id>.wav`, `interview_<id>.mp3`, `transcript.md`, `show-notes.md`, `metadata.json`
+
+**Conversation Mode Flow:**
+
+1. User activates AI key → `start_conversation()`
+2. Zenity prompt for project directory
+3. `ConversationSession` created
+4. TTS speaks "Ready. What would you like to know?"
+5. Auto-listen for first question
+6. Claude CLI invoked with `--permission-mode bypassPermissions` in project directory
+7. Full tool access available (file read/write, command execution)
+8. TTS speaks response (stripped of thinking blocks)
+9. Auto-listen loop continues until user says "goodbye"
+10. End notification shows turn count
+
+**Realtime Mode Flow (OpenAI GPT-4o):**
+
+1. User activates AI key → `start_realtime_session()`
+2. `RealtimeSession.run()` establishes WebSocket to OpenAI API
+3. Audio continuously streamed via `pw-record` (24kHz mono)
+4. Mic muted during AI response to prevent echo
+5. WebSocket receives audio_delta events (streaming TTS)
+6. aplay subprocess plays audio in real-time
+7. Tool calls (function_call events) detected and executed
+8. Results sent back to API
+9. Interrupt key (Esc) can stop current response
+10. Toggle hotkey again to stop session, unmute mic
 
 **State Management:**
-- Recording state tracked in instance vars: `self.recording`, `self.ai_mode`, `self.ctrl_r_pressed`, `self.shift_r_pressed` (lines 337-349)
-- Status communicated to indicator via `status` file: 'idle', 'recording', 'processing', 'success', 'error', 'listening', 'speaking' (lines 227-232, set_status)
-- Indicator polls status file every 100ms (indicator.py line 925)
-- Config persisted to JSON: `config.json` (lines 151-180)
+
+- **Status File:** `push-to-talk/status` - read by indicator every 100ms
+- **Config:** `push-to-talk/config.json` - loaded at startup, can be hot-reloaded
+- **Vocabulary:** `push-to-talk/vocabulary.txt` - appended on corrections
+- **Session Dirs:** `~/Audio/push-to-talk/sessions/<id>/` - persistent across sessions
+- **Claude Session:** `push-to-talk/claude-session/` - persists for multi-turn conversations
 
 ## Key Abstractions
 
-**PushToTalk Class:**
-- Purpose: Main orchestrator for dictation and AI modes
-- Examples: `push-to-talk.py` lines 336-969
-- Pattern: Singleton service managing keyboard listener, Whisper model, config, threading
-
 **VocabularyManager:**
-- Purpose: Load/save custom words, generate Whisper prompt hints
-- Examples: `push-to-talk.py` lines 285-334
-- Pattern: Simple file-backed in-memory set with persistence
+- Purpose: Learn custom words to improve Whisper transcription accuracy
+- Examples: `push-to-talk.py` line 478
+- Pattern: Load from file, add via voice command, generate initial_prompt for Whisper
+
+**InterviewSession:**
+- Purpose: Manage podcast interviewer mode with persistent output
+- Examples: `push-to-talk.py` line 535
+- Pattern: State machine (starting→idle→recording→processing), transcript accumulation, post-processing pipeline
+
+**ConversationSession:**
+- Purpose: Manage voice conversation with Claude + full tool access
+- Examples: `push-to-talk.py` line 628
+- Pattern: Turn counting, end signal detection, system prompt generation
 
 **RealtimeSession:**
-- Purpose: Manage OpenAI Realtime API connection and event loop
-- Examples: `openai_realtime.py` lines 223-527
-- Pattern: Async context manager for WebSocket connection, thread-safe state (interrupt flag)
+- Purpose: WebSocket-based low-latency voice conversation with OpenAI
+- Examples: `openai_realtime.py` line 223
+- Pattern: Async event loop, dual audio I/O (record + play), tool execution, mic control
 
-**StatusIndicator / TrayIndicator:**
-- Purpose: Visual status display and settings UI
-- Examples: `indicator.py` lines 854-1210 (floating), 1068-1190 (tray)
-- Pattern: Gtk.Window with cairo drawing, polling for status changes, modal SettingsWindow
+**PushToTalk:**
+- Purpose: Main orchestrator — handles all hotkey input and mode routing
+- Examples: `push-to-talk.py` line 662
+- Pattern: Global state machine, thread spawning for background tasks, process management
 
 ## Entry Points
 
-**Main Service:**
-- Location: `push-to-talk.py` lines 971-989 (main function)
-- Triggers: Systemd user service `push-to-talk.service`
-- Responsibilities: Initialize indicator, start keyboard listener, run event loop indefinitely
+**`push-to-talk.py` (main service):**
+- Location: `/home/ethan/code/push-to-talk/push-to-talk.py`
+- Triggers: Systemd user service auto-start
+- Responsibilities: Hotkey monitoring, mode orchestration, background processing
 
-**Status Indicator Process:**
-- Location: `indicator.py` lines 1193-1210 (main function)
-- Triggers: Spawned by push-to-talk.py as subprocess (line 260)
-- Responsibilities: Display status dot, handle clicks/drags, show settings window, poll status file
+**`indicator.py` (status UI):**
+- Location: `/home/ethan/code/push-to-talk/indicator.py`
+- Triggers: Started by `push-to-talk.py`
+- Responsibilities: Visual status indicator, settings GUI, configuration UI
 
-**OpenAI Realtime Session:**
-- Location: `openai_realtime.py` lines 469-490 (RealtimeSession.run)
-- Triggers: Called from PushToTalk.on_press when both modifier keys pressed (line 897)
-- Responsibilities: Connect to API, stream audio bidirectionally, handle function calls, manage mic mute
+**Systemd Service:**
+- Location: `~/.config/systemd/user/push-to-talk.service`
+- Triggers: User login (enabled with `--user-name`)
+- Responsibilities: Daemonization, restart on crash
 
 ## Error Handling
 
-**Strategy:** Defensive with fallback modes
+**Strategy:** Local try-except with status fallback, desktop notifications for user-facing errors
 
 **Patterns:**
-- Missing dependencies: Try/except on imports (lines 27-39, 15-19 in openai_realtime.py), fallback to simpler modes
-- API key missing: Prompt user in terminal (lines 55-111 in push-to-talk.py)
-- Recording too short: Check file size before transcribing (lines 554-559)
-- Whisper model lock: Use threading.Lock to prevent concurrent access (line 342)
-- TTS failure: Log error, continue (lines 213-215 in push-to-talk.py)
-- Status file I/O: Bare except blocks (lines 231-232, 279-282)
-- WebSocket connection errors: Catch ConnectionClosed, log and exit gracefully (openai_realtime.py line 435)
+
+- Transcription failures: Log error, set status to 'error', brief notification, return to idle
+- API timeouts (Claude/OpenAI): 120s timeout for Claude CLI, 30s for tool execution
+- Audio level detection: Default to silence on sox error (assume silence rather than crash)
+- Missing dependencies: Check at startup, fall back to alternative mode (e.g., Piper if OpenAI fails)
+- File I/O: Suppress exceptions in cleanup paths, check file existence before processing
+
+Example at `push-to-talk.py` line 1436:
+```python
+except Exception as e:
+    print(f"Error during AI transcription: {e}", flush=True)
+    set_status('error')
+finally:
+    for f in [temp_file.name, temp_file.name.replace('.wav', '_16k.wav')]:
+        try:
+            os.unlink(f)
+        except:
+            pass
+```
 
 ## Cross-Cutting Concerns
 
-**Logging:** Print statements to stdout (captured by journalctl via systemd)
+**Logging:** All operations logged to systemd journal via `print(..., flush=True)`
+- View: `journalctl --user -u push-to-talk -f`
 
-**Validation:** Config type checking (validate ptt_key != ai_key, lines 362-366); hotkey validation in indicator UI (lines 535-539)
+**Validation:** Hotkey conflict detection (PTT and AI keys must differ)
+- Implemented at `push-to-talk.py` line 700-703
 
-**Authentication:** OpenAI API key loaded from env or files (lines 41-52, openai_realtime.py lines 511-523); saved locally with restricted permissions (indicator.py line 99)
+**Authentication:** OpenAI API key sourced from environment or `~/.config/openai/api_key`
+- Never passed as CLI argument; uses subprocess env inheritance
 
-**Audio Management:** PipeWire (pw-record), aplay for playback; mic muting during TTS/Realtime AI speaking (lines 344-346, 407, 424)
+**Audio Safety:** Mic physically muted during Realtime AI speech to prevent echo
+- Controlled via pactl: `pactl set-source-mute @DEFAULT_SOURCE@ {0|1}`
 
-**Configuration:** JSON file at `~/.local/share/push-to-talk/config.json` with defaults, hot-reload on indicator settings changes
+**Thread Safety:** Model lock guards Whisper model access (single instance, concurrent requests possible)
+- `self.model_lock = threading.Lock()` used in transcription methods
 
 ---
 
-*Architecture analysis: 2026-02-03*
+*Architecture analysis: 2026-02-13*

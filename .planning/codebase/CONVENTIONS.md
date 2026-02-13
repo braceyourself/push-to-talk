@@ -1,229 +1,137 @@
 # Coding Conventions
 
-**Analysis Date:** 2026-02-03
+**Analysis Date:** 2026-02-13
 
 ## Naming Patterns
 
 **Files:**
-- Lowercase with hyphens for executables: `push-to-talk.py`, `openai_realtime.py`, `indicator.py`
-- Underscore separator for modules: `openai_realtime.py`
+- Lowercase with hyphens: `push-to-talk.py`, `openai_realtime.py`, `indicator.py`
+- Executable scripts have `#!/usr/bin/env python3` shebang
 
 **Functions:**
-- Snake case: `get_openai_api_key()`, `start_recording()`, `transcribe_and_type()`
-- Descriptive action verbs for operations: `load_config()`, `save_config()`, `execute_tool()`
-- Getter/setter pattern: `get_*()`, `set_*()` for configuration and status
-
-**Classes:**
-- PascalCase: `PushToTalk`, `VocabularyManager`, `RealtimeSession`, `SettingsWindow`, `StatusIndicator`
-- Descriptive purpose-based names
+- snake_case for all functions: `get_openai_api_key()`, `load_config()`, `check_verbal_hooks()`
+- Private/internal functions prefixed with underscore: `_detect_display()`, `_wait_for_display()`, `_interview_generate_question()`
+- Descriptive names indicating operation: `get_`, `set_`, `load_`, `save_`, `check_`, `start_`, `stop_`
 
 **Variables:**
-- Snake case throughout: `record_process`, `temp_file`, `api_key`, `audio_level`
-- Private attributes prefixed with underscore: `_interrupt_requested`, `_set_status()`
-- Boolean flags clearly named: `recording`, `dragging`, `playing_audio`
-- Configuration dictionaries: `config`, `COLORS`, `STATUS_TEXT`, `TOOLS`
+- snake_case for all variables: `api_key`, `audio_dir`, `current_mode`, `interview_topic`
+- Constants in UPPERCASE: `STATUS_FILE`, `SAMPLE_RATE`, `CHUNK_SIZE`, `COLORS`, `REALTIME_URL`
+- Dictionary/module-level constants: `COLORS = {...}`, `STATUS_TEXT = {...}`, `TOOLS = [...]`
+- Boolean flags use clear names: `OPENAI_AVAILABLE`, `REALTIME_AVAILABLE`, `save_audio`, `debug_mode`
 
-**Constants:**
-- UPPER_CASE: `WHISPER_MODEL`, `BASE_DIR`, `HISTORY_SIZE`, `SILENCE_THRESHOLD`
-- Configuration dictionaries as constants: `MODIFIER_KEY_OPTIONS`, `INTERRUPT_KEY_OPTIONS`, `CORRECTION_PATTERNS`
+**Classes:**
+- PascalCase: `VocabularyManager`, `InterviewSession`, `ConversationSession`, `PushToTalk`, `StatusIndicator`, `SettingsWindow`
+- Descriptive, noun-based names indicating purpose or responsibility
+
+**Type Hints:**
+- Not used. Code is un-typed Python 3.
 
 ## Code Style
 
 **Formatting:**
-- No explicit formatter configured (no eslintrc, prettier, black config found)
-- Consistent 4-space indentation observed throughout
-- Module docstrings at file top describing purpose: `"""Push-to-Talk Dictation Service..."""`
-- Type hints not used (pure Python 3 without annotations)
+- No explicit formatter configured (no `.prettierrc`, `black` config, or `autopep8`)
+- Spaces for indentation (4 spaces standard Python)
+- Line length appears reasonable (~100-120 chars typical)
+- String quotes: Mix of single and double quotes (no strict convention)
 
 **Linting:**
-- No lint configuration detected
-- Code follows PEP 8 style informally
-- Long lines acceptable (some exceed 100 chars, e.g., subprocess commands with complex arguments)
+- No linting configuration found (no `.eslintrc`, `pylintrc`, or `flake8` config)
+- Code is not linted during development
+
+**Docstrings:**
+- Used for module documentation: `"""Push-to-Talk Dictation Service\n\nHold Right Ctrl to record..."""`
+- Used for function documentation: `"""Detect the active X display if DISPLAY is not set..."""`
+- Style: Triple-quoted docstrings at function/class start
+- Format: Single-line or multi-line descriptive text (no type annotations in docstrings)
 
 ## Import Organization
 
-**Order:** Standard library → Third-party → Local
-1. Standard library (os, sys, json, asyncio, etc.)
-2. Third-party packages (whisper, pynput, openai, gtk, cairo, websockets)
-3. Path-based utilities from pathlib
+**Order:**
+1. Standard library: `os`, `sys`, `re`, `time`, `math`, `json`, `wave`, `shutil`, `tempfile`, `subprocess`, `threading`, `signal`, `atexit`
+2. Collections: `from collections import deque`
+3. Pathlib: `from pathlib import Path`
+4. Third-party: `import whisper`, `from pynput import keyboard`, `from openai import OpenAI`
+5. GTK/GUI libraries: `import gi`, `gi.require_version(...)`, `from gi.repository import ...`
+6. Local modules: `from openai_realtime import RealtimeSession, get_api_key as get_realtime_api_key`
 
-**Examples from codebase:**
-```python
-# push-to-talk.py
-import os
-import sys
-import re
-import time
-import math
-import json
-import shutil
-import tempfile
-import subprocess
-import threading
-import signal
-import atexit
-from collections import deque
-from pathlib import Path
-import whisper
-from pynput import keyboard
-```
-
-**Path Aliases:**
-- Uses `Path` from pathlib extensively for cross-platform file operations
-- No import aliases (`as`) used except as required by libraries
-- No relative imports; all imports are absolute
+**Path Handling:**
+- Consistent use of `pathlib.Path` instead of string paths: `Path(__file__).parent`, `Path.home()`, `path.exists()`, `path.read_text()`
+- Expanduser for config: `os.path.expanduser(config.get('audio_dir', '~/Audio/push-to-talk'))`
 
 ## Error Handling
 
 **Patterns:**
-- Try/except blocks used extensively for robustness
-- Graceful degradation: missing optional dependencies handled with boolean flags
-  - `OPENAI_AVAILABLE`, `REALTIME_AVAILABLE`, `APPINDICATOR_AVAILABLE`
-- Bare `except:` used for non-critical operations (file operations, status updates)
-- Specific exception handling for critical operations:
-  - `subprocess.TimeoutExpired` - for long-running commands
-  - `websockets.exceptions.ConnectionClosed` - for network operations
-  - `ImportError` - for optional dependencies
-- Error context preserved: exceptions logged with descriptive print statements
-- GUI errors shown to user via notifications: `subprocess.Popen(['notify-send', ...])`
+- Broad `except` clauses for non-critical operations: `except: pass` (silent failure acceptable for UI updates, status checks)
+- Specific exception handling for subprocess operations: `except (subprocess.TimeoutExpired, FileNotFoundError):`
+- Try-catch for optional imports: `try: from openai import OpenAI; OPENAI_AVAILABLE = True; except ImportError: OPENAI_AVAILABLE = False`
+- Print to stderr for fatal errors: `print("ERROR: Could not connect to X display", file=sys.stderr)`
+- Status file updates indicate error state: `set_status("error")` for user-visible failures
 
-**Example pattern from `push-to-talk.py` (lines 164-171):**
-```python
-try:
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE) as f:
-            config = json.load(f)
-            return {**default, **config}
-except Exception as e:
-    print(f"Error loading config: {e}", flush=True)
-return default
-```
+**No Exceptions Raised:**
+- Code gracefully degrades rather than raising. Example: missing config file returns defaults, missing API key triggers prompt dialog
+- Subprocess timeout handled: `subprocess.run(..., timeout=30)` to prevent hanging
 
 ## Logging
 
-**Framework:** Console logging with `print()` statements
-- No logging module used; direct to stdout
-- All print statements use `flush=True` for systemd journal compatibility
-- Status prefixed in realtime module: `"Realtime API: ..."` for debugging
+**Framework:** `print()` function with `flush=True` for immediate output
 
 **Patterns:**
-- Informational: `print(f"Loaded {len(self.words)} vocabulary words", flush=True)`
-- Progress: `print("Recording...", flush=True)`
-- Errors: `print(f"Error during transcription: {e}", flush=True)`
-- Status changes: `print(f"Switched to {mode}", flush=True)`
-- Debug in async code: `print(f"Realtime API event: {event_type}", flush=True)`
+- Debug logging via `print()`: `print("Realtime API: Connected with tools", flush=True)`
+- Error logging: `print(f"Failed to open API key prompt: {e}", flush=True)`
+- Status messages: `print("[Listening...]", flush=True)`
+- Verbose event logging available but controlled by debug mode flag
+- systemd journal integration: Services log to journalctl, viewed via `journalctl --user -u push-to-talk`
 
 **When to Log:**
-- Service startup/shutdown
-- Mode changes (TTS backend, AI mode, indicator style)
-- Operation start/end (recording, processing, speaking)
-- Configuration changes
-- Errors and warnings
-- System integration points (tool execution, file access)
+- State transitions: `print("Realtime API: Mic muted", flush=True)`
+- Tool execution: `print(f"Executing tool: {name}({arguments})", flush=True)`
+- Events from long-running processes: `print(f"Realtime API: Sent {chunks_sent} audio chunks", flush=True)`
+- Errors and exceptions: `print(f"Realtime API Error: {error}", flush=True)`
 
 ## Comments
 
 **When to Comment:**
-- Complex algorithms: regex patterns (CORRECTION_PATTERNS), audio level detection logic
-- Business logic branches: when recording should be blocked, when to auto-listen
-- State machine transitions: recording → processing → success/error
-- Non-obvious workarounds: spurious release event handling (line 932), cooldown timing for echo avoidance
-- Code intent for critical sections: Realtime API tool calling flow
+- Explaining non-obvious setup code: `# --- Auto-detect DISPLAY for systemd service startup ---`
+- Inline clarifications for complex logic: `# Check threshold before starting drag`, `# Wait for motion threshold`
+- Disabling code temporarily: Comments preserve intent
 
-**JSDoc/TSDoc:**
-- Not used; pure docstrings with triple quotes
-- Module-level docstrings only (file purpose)
-- Function docstrings are brief one-liners:
-  ```python
-  def load_config():
-      """Load configuration from file."""
-  ```
-- Class docstrings describe purpose:
-  ```python
-  class VocabularyManager:
-      """Manages custom vocabulary for Whisper."""
-  ```
+**Inline Comments:**
+- Short clarifications on same line or line above: `return  # Current DISPLAY works fine`
+- Limited use; code is generally self-documenting through clear naming
 
 ## Function Design
 
-**Size:** Functions are moderate length
-- Recording/transcription: 50-150 lines (handles multiple steps with clear sequencing)
-- Event handlers: 10-40 lines (on_press, on_release, callbacks)
-- Configuration: 5-20 lines (load/save/toggle operations)
-- Window creation: 100-300 lines (UI building with many widget setup statements)
+**Size:** Functions range from 10-50 lines typically. Larger methods (100+ lines) exist in classes managing state (`handle_events()`, `create_general_tab()`).
 
 **Parameters:**
-- Positional for required, keyword defaults for optional
-- Config dictionaries merged with spread operator: `{**default, **config}`
-- File paths passed as Path objects or strings (both acceptable)
-- Callbacks passed as lambda or function reference: `on_press=self.on_press`
+- Positional parameters for required values: `def load_config()`, `def save_config(config)`
+- Keyword arguments for optional settings: `def speak_openai(text, voice="nova", save_path=None)`
+- Default values used extensively: `def _wait_for_display(max_wait=30):`
+- Callback functions as parameters: `def __init__(self, on_status=None):` then `self.on_status = on_status or (lambda s: None)`
 
 **Return Values:**
-- Simple returns: status bools, values, None
-- Complex returns use dictionaries from json parsing
-- Thread-safe operations return immediately; actual work in daemon threads
-
-**Example (lines 548-623):**
-```python
-def transcribe_and_type(self, temp_file):
-    if not temp_file or not os.path.exists(temp_file.name):
-        set_status('idle')
-        return
-
-    try:
-        # Validation
-        file_size = os.path.getsize(temp_file.name)
-        if file_size < 5000:
-            set_status('idle')
-            print("Recording too short, skipping.", flush=True)
-            return
-        # Processing
-        # ...
-    except Exception as e:
-        print(f"Error during transcription: {e}", flush=True)
-        set_status('error')
-    finally:
-        # Cleanup
-        for f in [...]:
-            try:
-                os.unlink(f)
-            except:
-                pass
-```
+- Boolean returns for success/failure: functions return `True`/`False` or status values
+- Dictionary returns for structured data: `load_config()` returns config dict
+- None for side-effect only operations: file writes, status updates
+- Tuple returns for multiple values: Rare; structured dicts preferred
 
 ## Module Design
 
 **Exports:**
-- No explicit `__all__` declarations
-- Functions and classes available at module scope
-- Private helpers prefixed with underscore: `_set_status()`, `_interrupt_requested`
+- No explicit `__all__` defined
+- Public functions at module level: `load_config()`, `save_config()`, `get_openai_api_key()`
+- Classes defined at module level used directly: `from openai_realtime import RealtimeSession`
+- Internal functions prefixed with underscore not exported
 
 **Barrel Files:**
-- Not used in this codebase (no index.py or __init__.py files)
-- Single-responsibility modules: one main class per file typically
+- Not used. Each file is self-contained:
+  - `push-to-talk.py`: Main service with core `PushToTalk` class and helper functions
+  - `indicator.py`: UI indicator and settings window
+  - `openai_realtime.py`: OpenAI Realtime integration
 
-**File-level initialization:**
-- Constants defined at module top (COLORS, TOOLS, MODIFIER_KEY_OPTIONS)
-- Global variables for processes: `indicator_process`, `APPINDICATOR_AVAILABLE`
-- Try/except for optional feature detection at import time
+**Circular Dependencies:**
+- Avoided through separation: indicator communicates via status files, not direct imports
 
-## String Formatting
+---
 
-**Style:** F-strings used consistently
-- `f"Loading {len(self.words)} vocabulary words"`
-- `f"Error loading config: {e}"`
-- Formatting within JSON dumps: `json.dumps(config, indent=2)`
-- HTML/markup in GTK: `set_markup("<span foreground='#4ade80'>Valid key found</span>")`
-
-## Threading and Async
-
-**Threading:**
-- Background operations spawn daemon threads: `threading.Thread(target=..., daemon=True).start()`
-- Locks for shared resources: `self.model_lock` protects Whisper model access
-- Thread-safe request pattern for async signaling: `_interrupt_requested` flag
-
-**Async:**
-- OpenAI Realtime uses `asyncio` for WebSocket handling
-- `async def` for I/O operations (connect, send_audio, handle_events)
-- `await` for all async operations
-- Background tasks: `asyncio.create_task(delayed_unmute())`
+*Convention analysis: 2026-02-13*

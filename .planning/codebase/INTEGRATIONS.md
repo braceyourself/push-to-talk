@@ -1,185 +1,195 @@
 # External Integrations
 
-**Analysis Date:** 2026-02-03
+**Analysis Date:** 2026-02-13
 
 ## APIs & External Services
 
-**OpenAI Services:**
-- OpenAI Text-to-Speech (TTS) API
-  - What it's used for: Cloud-based voice synthesis alternative to local Piper
-  - SDK/Client: `openai` package (OpenAI 1.0+ SDK)
-  - Auth: `OPENAI_API_KEY` environment variable or `~/.config/openai/api_key`
-  - Endpoint: `https://api.openai.com/v1/audio/speech`
-  - Voice options: alloy, echo, fable, onyx, nova, shimmer
-  - Implementation: `push-to-talk.py` lines 183-215 (`speak_openai()` function)
-  - Conditional: Optional - only available if API key is configured
+**OpenAI (Primary AI Provider):**
+- Realtime API (`wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17`)
+  - SDK/Client: `openai` Python package
+  - Auth: Environment var `OPENAI_API_KEY` OR file `~/.config/openai/api_key`
+  - Usage: Voice-to-voice conversations with function calling (`openai_realtime.py` lines 223-460)
+  - Features: Server-side voice activity detection (VAD), audio transcription, tool execution
 
-- OpenAI Realtime API (GPT-4o)
-  - What it's used for: Low-latency voice-to-voice conversations with AI
-  - SDK/Client: `openai` package + `websockets` library
-  - Auth: `OPENAI_API_KEY` (required for websocket connection)
-  - Endpoint: `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17`
-  - Implementation: `openai_realtime.py` (entire module)
-  - Feature: Function calling for system interaction (run_command, read_file, write_file, ask_claude, remember, recall)
-  - Echo suppression: Active mic muting via PulseAudio during AI response
-  - Conditional: Optional - requires websockets package and API key
+- TTS (Text-to-Speech)
+  - Model: `tts-1`
+  - Voices: `alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`
+  - Usage: Convert response text to speech (`push-to-talk.py` lines 260-306)
+  - Audio format: PCM 24kHz mono, streamed to `aplay`
 
-**Anthropic Claude:**
-- Claude CLI
-  - What it's used for: AI reasoning and responses in Claude mode (non-realtime)
-  - Implementation: Subprocess calls in `push-to-talk.py` lines 757-787, 810-835
-  - Location: `~/.local/bin/claude`
-  - Session persistence: `~/.local/share/push-to-talk/claude-session/`
-  - Launch pattern: `claude -c -p <question> --permission-mode acceptEdits --add-dir ~/.claude`
-  - Auto-listen integration: Follow-up questions trigger auto-listen for up to 4 seconds
+- Chat Completions (Smart Transcription)
+  - Model: `gpt-4o-mini`
+  - Usage: Fix transcription errors from Whisper (`push-to-talk.py` lines 377-407)
+  - Flow: Whisper output → OpenAI correction → final text
+
+**Claude AI (via Claude CLI):**
+- Claude Code CLI at `~/.local/bin/claude`
+- Mode: Headless subprocess invocation
+- Invocations:
+  - Interview mode: Generate interviewer questions (`push-to-talk.py` lines 1543-1600)
+  - Conversation mode: Full tool access to project directory (`push-to-talk.py` lines 1861-1918)
+- Permission modes:
+  - Interview: `--permission-mode acceptEdits` (read-only access)
+  - Conversation: `--permission-mode bypassPermissions` (full access for hands-free operation)
+- Session directories:
+  - Interview: `.claude-session/` per session
+  - Conversation: Runs in project directory with session state
+
+## Speech Recognition
+
+**OpenAI Whisper:**
+- Model: `small` (default, configurable: tiny, base, small, medium, large)
+- Scope: Local processing (no API calls)
+- Input: WAV files from recording
+- Output: Text transcription
+- Usage: `push-to-talk.py` lines 922-1000 (transcribe_and_type method)
+
+## Audio System
+
+**PipeWire (Recording):**
+- Command: `pw-record --format s16 --rate 24000 --channels 1 -` (for Realtime API)
+- Command: `pw-record --format s16 --rate 44100 --channels 2 [file]` (for conversation auto-listen)
+
+**PulseAudio (Microphone Control):**
+- Mute: `pactl set-source-mute @DEFAULT_SOURCE@ 1`
+- Unmute: `pactl set-source-mute @DEFAULT_SOURCE@ 0`
+- Usage: Echo prevention during Realtime API conversations (`openai_realtime.py` lines 296-297, 344-346)
+
+**ALSA (Playback):**
+- Command: `aplay -r 24000 -f S16_LE -t raw -q`
+- Usage: Stream TTS output and Realtime API audio to speakers
+
+**SoX (Audio Analysis):**
+- Command: `sox [audio_file] -n stat`
+- Usage: Get maximum amplitude for silence detection (`push-to-talk.py` lines 428-446)
+
+## System Integrations
+
+**X11 & xdotool:**
+- xdotool for typing transcribed text into focused input
+- X11 DISPLAY detection and connection (`push-to-talk.py` lines 26-85)
+- XAUTHORITY auto-detection from GDM or /run/user
+
+**Keyboard Input (pynput):**
+- Listener for modifier keys: Ctrl, Shift, Alt
+- Listener for special keys: Escape, Space, Pause, Scroll Lock
+- Custom hotkey mapping for PTT and AI mode (`push-to-talk.py` lines 177-191)
+
+**Desktop Notifications:**
+- Command: `notify-send`
+- Usage: Session start/end, verbal hook triggers, status updates
+
+**systemd:**
+- User service: `~/.config/systemd/user/push-to-talk.service`
+- Auto-start at login
+- Service logging via `journalctl --user -u push-to-talk`
+
+**GTK 3 & Wayland (UI):**
+- `gi.repository.Gtk` - Settings window, dialogs, configuration UI
+- `gi.repository.Gdk` - Window events, positioning
+- `cairo` - Custom rendering for status indicator dot
+- `AppIndicator3` (optional) - System tray integration (`indicator.py` lines 19-25)
+- Zenity for dialogs:
+  - `zenity --entry` - Topic/question input
+  - `zenity --file-selection --directory` - Directory picker for conversation mode
 
 ## Data Storage
 
-**Databases:**
-- None - application uses only local files
-
-**File Storage:**
-- Local filesystem only (no cloud storage)
-  - Configuration: `~/.local/share/push-to-talk/config.json`
-  - Vocabulary: `~/.local/share/push-to-talk/vocabulary.txt`
-  - Status: `~/.local/share/push-to-talk/status` (transient, for IPC between main service and indicator)
-  - Claude session memory: `~/.local/share/push-to-talk/claude-session/memory.json`
-  - API keys: `~/.config/openai/api_key` (mode 0600, read-only by user)
+**Local Files Only:**
+- Config: `config.json` (user-editable settings)
+- Vocabulary: `vocabulary.txt` (custom words for Whisper)
+- Session recordings: `~/Audio/push-to-talk/sessions/{timestamp}/` (optional, `save_audio` setting)
+  - Numbered WAV files (user and interviewer sides)
+  - `transcript.md` (interview transcript)
+  - `show-notes.md` (AI-generated summary)
+  - `metadata.json` (session metadata)
 
 **Caching:**
-- Whisper model cache: `~/.cache/whisper/` (auto-managed by openai-whisper)
-- Piper TTS model: `~/.local/share/push-to-talk/piper-voices/`
+- No persistent caching layer detected
+- Whisper model cached by openai-whisper (default: `~/.cache/huggingface/hub/`)
 
 ## Authentication & Identity
 
 **Auth Provider:**
-- Custom file-based (OpenAI API key)
-- Implementation: `push-to-talk.py` lines 41-52 (`get_openai_api_key()`)
-- Fallback chain:
-  1. `OPENAI_API_KEY` environment variable
-  2. `~/.config/openai/api_key` file
-  3. `~/.openai/api_key` file
-- Interactive setup: Terminal prompt if no key found (`push-to-talk.py` lines 55-111)
+- OpenAI API Key (user-provided, no OAuth flow)
+  - Stored locally: `~/.config/openai/api_key` (600 permissions, user-read-only)
+  - Loaded at runtime from env var or file
+  - Used for all OpenAI API calls (TTS, Realtime, smart transcription)
+  - Fallback: Prompt user to enter key if not found (`push-to-talk.py` lines 119-175)
 
-**Secrets Management:**
-- API keys stored with restricted permissions (0600)
-- Environment variable support for sensitive values
-- No secrets stored in config.json (only settings)
+- Claude CLI auth (delegated)
+  - No separate auth in push-to-talk
+  - Claude CLI handles authentication at `~/.local/bin/claude`
 
 ## Monitoring & Observability
 
 **Error Tracking:**
-- None (no third-party error tracking)
-- Local logging via systemd journalctl
+- Not detected (no Sentry, DataDog, etc.)
 
 **Logs:**
-- systemd user journal
-- Access: `journalctl --user -u push-to-talk`
-- Last 5 lines pulled by indicator UI for display
-- Status indicators: idle, recording, processing, success, error, listening (realtime), speaking (realtime)
+- Console output: `print(..., flush=True)` throughout
+- systemd journal: `journalctl --user -u push-to-talk -f`
+- Log UI in indicator: Shows last 5 lines from journal (`indicator.py` line 109)
+- Debug mode available in config: `debug_mode` setting
 
-**Status Communication:**
-- IPC via status file: `~/.local/share/push-to-talk/status`
-- Read by indicator process to update UI colors
-- Transient - written during operations, reset to 'idle' on completion
+**Status Tracking:**
+- Status file: `status` (plain text, updated by `set_status()`)
+- Status values: `idle`, `recording`, `processing`, `success`, `error`, `listening`, `speaking`
+- Consumed by: `indicator.py` for UI color updates
 
 ## CI/CD & Deployment
 
 **Hosting:**
-- None (desktop application)
-- Runs on user's Linux system as systemd user service
+- Not applicable (desktop application)
 
 **CI Pipeline:**
-- None detected
+- Not detected (no GitHub Actions, etc.)
 
-**Auto-update:**
-- Git-based installation/update flow (from git clone or git pull)
-- Manual service restart required: `systemctl --user restart push-to-talk`
+**Deployment:**
+- Manual installation: `install.sh` script
+- Installed to: `~/.local/share/push-to-talk/` (service files, vocab, session data)
+- Service auto-start via systemd user service
 
 ## Environment Configuration
 
-**Required env vars (if not using defaults):**
-- `OPENAI_API_KEY` - For OpenAI Realtime API and TTS
+**Required env vars:**
+- `OPENAI_API_KEY` - OpenAI API key (or read from `~/.config/openai/api_key`)
+- `DISPLAY` - X11 display (auto-detected if not set, `push-to-talk.py` lines 26-85)
+- `XAUTHORITY` - X11 authority file (auto-detected if not set)
 
 **Optional env vars:**
-- `DISPLAY` - X11 display (for desktop integration)
-
-**Settings in config.json:**
-- `tts_backend` - "piper" or "openai"
-- `openai_voice` - Voice choice when using OpenAI TTS
-- `ai_mode` - "claude" or "realtime"
-- `ptt_key` - Hotkey for push-to-talk (default: "ctrl_r")
-- `ai_key` - Hotkey modifier for AI mode (default: "shift_r")
-- `interrupt_key` - Key to interrupt AI responses (default: "escape")
-- `indicator_style` - "floating" or "tray"
-- `debug_mode` - Boolean for debug logging
+- `CLAUDE_CLI` - Path to Claude CLI (default: `~/.local/bin/claude`)
 
 **Secrets location:**
-- `~/.config/openai/api_key` (created on first setup)
-- Readable only by user
+- OpenAI API key: `~/.config/openai/api_key` (permissions 600, plaintext)
+- No other secrets stored locally
 
 ## Webhooks & Callbacks
 
 **Incoming:**
-- None
+- Not applicable
 
 **Outgoing:**
-- None (unidirectional API calls only)
+- No external webhooks
+- Audio saved to disk when `save_audio: true` (local filesystem only)
 
-## Integration Patterns
+## Verbal Hooks (Custom Commands)
 
-**Realtime API Tool Calling:**
-The Realtime integration includes function calling for system interaction. Tools available:
-- `run_command` - Execute shell commands
-- `read_file` - Read file contents
-- `write_file` - Write to files
-- `ask_claude` - Delegate tasks to Claude CLI
-- `remember` - Save to memory.json
-- `recall` - Retrieve saved memories
+**Framework:**
+- User-defined voice commands in config
+- Commands matched via text patterns (exact or wildcard with `*`)
+- Execution: `subprocess.Popen(command, shell=True)`
 
-Implementation: `openai_realtime.py` lines 34-133 (tool definitions), lines 155-220 (execution)
+**Example Hook:**
+```json
+{
+  "trigger": "search for *",
+  "command": "xdg-open 'https://google.com/search?q={}'"
+}
+```
 
-**Cross-Service Communication:**
-- Main service (`push-to-talk.py`) ↔ Indicator (`indicator.py`): Via status file
-- Main service → Claude CLI: Subprocess with working directory for session persistence
-- Audio flow: PipeWire recording → FFmpeg conversion → Whisper transcription → OpenAI/Claude processing → Piper/OpenAI TTS → aplay playback
-
-## Conditional Features
-
-**OpenAI Realtime:**
-- Requires: `websockets` package + `OPENAI_API_KEY`
-- Fallback behavior: Shows error if unavailable, suggests API key setup
-- Detection: `openai_realtime.py` lines 525-527 (`is_available()`)
-
-**OpenAI TTS:**
-- Requires: `OPENAI_API_KEY`
-- Fallback: Defaults to Piper if unavailable
-- Toggle: Can switch backends via settings UI
-
-**System Tray Indicator:**
-- Requires: `gir1.2-appindicator3-0.1` (AppIndicator3 library)
-- Fallback: Falls back to floating dot indicator
-- Detection: `indicator.py` lines 20-25
-
-## Security Considerations
-
-**API Key Protection:**
-- File-based keys stored with 0600 permissions
-- Env var support for sensitive environments
-- Settings UI hides key by default, shows "Show/Hide" toggle
-- Key validation: Checks for "sk-" prefix in settings
-
-**Function Calling Permissions:**
-- Realtime API has unrestricted command execution capability
-- No sandboxing - can run any shell command
-- Relies on OpenAI's model safety, not system-level restrictions
-- `subprocess.run()` used with shell=True in tool execution
-
-**Audio Security:**
-- Microphone muted when AI is speaking (prevents echo/feedback)
-- Auto-unmute on disconnect
-- No audio streams to third parties except to configured OpenAI/Claude services
+**Implementation:** `push-to-talk.py` lines 329-374
 
 ---
 
-*Integration audit: 2026-02-03*
+*Integration audit: 2026-02-13*
