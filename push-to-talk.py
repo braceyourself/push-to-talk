@@ -762,10 +762,21 @@ class PushToTalk:
         self.config_watcher_thread.start()
 
     def _watch_config(self):
-        """Watch config.json for ai_mode changes to auto-start/stop live session."""
+        """Watch config.json for ai_mode changes and live restart signals."""
         config_path = str(CONFIG_FILE)
+        restart_signal = BASE_DIR / "status"
         while self.config_watcher_running:
             try:
+                # Check for restart_live signal from overlay
+                if restart_signal.exists():
+                    try:
+                        content = restart_signal.read_text().strip()
+                        if content == "restart_live" and not self.live_session:
+                            print("Config watcher: Restart live session requested", flush=True)
+                            self.start_live_session()
+                    except Exception:
+                        pass
+
                 mtime = os.path.getmtime(config_path)
                 if mtime != self._last_config_mtime:
                     self._last_config_mtime = mtime

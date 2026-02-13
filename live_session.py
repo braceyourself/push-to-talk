@@ -377,6 +377,7 @@ class LiveSession:
                         self.muted = not self.muted
                         status = "muted" if self.muted else "listening"
                         self._set_status(status)
+                        self._reset_idle_timer()  # Reset idle timer on any interaction
                         print(f"Live session: {'Muted' if self.muted else 'Unmuted'} by user", flush=True)
                     except Exception:
                         pass

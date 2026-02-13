@@ -1818,11 +1818,16 @@ class LiveOverlayWidget(Gtk.Window):
     def _toggle_mute(self):
         """Toggle live session mute via signal file."""
         signal_file = Path(__file__).parent / "live_mute_toggle"
-        signal_file.write_text("toggle")
-        # Optimistically update display
-        if self.status == 'muted':
+        if self.status in ('idle', 'disconnected', 'error'):
+            # Session is dead — request restart via status file
+            status_file = Path(__file__).parent / "status"
+            status_file.write_text("restart_live")
             self.update_status('listening')
-        elif self.status in ('listening', 'idle'):
+        elif self.status == 'muted':
+            signal_file.write_text("toggle")
+            self.update_status('listening')
+        elif self.status in ('listening',):
+            signal_file.write_text("toggle")
             self.update_status('muted')
 
     def on_motion(self, widget, event):
