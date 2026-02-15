@@ -59,11 +59,11 @@ Plans:
   3. User can ask "what are my tasks doing?" and hear a status summary of all active and completed tasks
   4. User can cancel a running task by referring to it by name
   5. User can ask for a specific task's results and hear a spoken summary of its output
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 03-01: Realtime API tool definitions and LiveSession tool handler routing
-- [ ] 03-02: Task notifications, context naming, and ambient awareness integration
+- [ ] 03-01-PLAN.md -- Realtime API tool definitions, function call handler, and task orchestrator personality
+- [ ] 03-02-PLAN.md -- Task completion/failure notifications, queue-based delivery, and ambient task awareness
 
 ## Progress
 
