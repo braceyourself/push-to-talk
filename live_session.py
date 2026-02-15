@@ -169,14 +169,44 @@ class LiveSession:
         self.task_manager.on('on_task_failed', self._on_task_failed)
 
     def _build_personality(self):
-        """Load personality from multiple .md files in personality/ directory."""
+        """Load personality from .md files, memories, and CLAUDE.md context."""
         parts = []
         personality_dir = Path(__file__).parent / "personality"
+
+        # 1. Core personality files (personality/*.md)
         if personality_dir.exists():
             for md_file in sorted(personality_dir.glob("*.md")):
                 content = md_file.read_text().strip()
                 if content:
                     parts.append(content)
+
+        # 2. Persistent memories (personality/memories/*.md)
+        memories_dir = personality_dir / "memories"
+        if memories_dir.exists():
+            memory_files = sorted(memories_dir.glob("*.md"))
+            if memory_files:
+                memory_parts = []
+                for md_file in memory_files:
+                    content = md_file.read_text().strip()
+                    if content:
+                        memory_parts.append(content)
+                if memory_parts:
+                    parts.append("# Memories\n\n" + "\n\n".join(memory_parts))
+
+        # 3. User global context (~/.claude/CLAUDE.md)
+        global_claude = Path.home() / ".claude" / "CLAUDE.md"
+        if global_claude.exists():
+            content = global_claude.read_text().strip()
+            if content:
+                parts.append(f"# User Context\n\n{content}")
+
+        # 4. Project context (./CLAUDE.md relative to this script)
+        project_claude = Path(__file__).parent / "CLAUDE.md"
+        if project_claude.exists():
+            content = project_claude.read_text().strip()
+            if content:
+                parts.append(f"# Project Context\n\n{content}")
+
         return "\n\n".join(parts)
 
     def _resolve_task(self, identifier: str) -> ClaudeTask | None:
