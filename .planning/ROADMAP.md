@@ -44,10 +44,10 @@ Plans:
   3. Each task runs in its own isolated working directory with no shared session state
   4. Completed and failed tasks are cleaned up (process reaped, strong references released)
   5. No zombie Claude CLI processes accumulate during normal operation or after failures
-**Plans**: TBD
+**Plans**: 1 plan
 
 Plans:
-- [ ] 02-01: TaskManager and ClaudeTask classes with async subprocess lifecycle
+- [ ] 02-01-PLAN.md -- TaskManager singleton and ClaudeTask with full async subprocess lifecycle and integration tests
 
 ### Phase 3: Voice-Controlled Task Orchestration
 **Goal**: User can manage Claude CLI tasks entirely by voice during a live session -- spawning work, checking status, retrieving results, and cancelling tasks through natural conversation
