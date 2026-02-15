@@ -160,6 +160,7 @@ class LiveSession:
         self._idle_timer = None
         self._idle_timeout = 120  # 2 minutes
         self._ducked_inputs = {}  # sink_input_index -> original_volume
+        self._unmute_task = None  # Track pending delayed_unmute to cancel on new audio
         self.muted = False  # User-toggled mute via overlay click
         self.task_manager = TaskManager()
         self._notification_queue = []  # Task completion/failure notifications
@@ -511,7 +512,9 @@ class LiveSession:
             for inp in inputs:
                 if inp['pid'] == our_pid:
                     continue
-                self._ducked_inputs[inp['index']] = inp['volume']
+                # Don't overwrite stored original volume if already ducked
+                if inp['index'] not in self._ducked_inputs:
+                    self._ducked_inputs[inp['index']] = inp['volume']
                 subprocess.run(['pactl', 'set-sink-input-volume', inp['index'], '15%'],
                                capture_output=True, timeout=2)
         except Exception as e:
@@ -556,6 +559,10 @@ class LiveSession:
                     print(f"Live session event: {event_type}", flush=True)
 
                 if event_type == "response.audio.delta":
+                    # Cancel any pending delayed_unmute -- new audio is starting
+                    if self._unmute_task and not self._unmute_task.done():
+                        self._unmute_task.cancel()
+                        self._unmute_task = None
                     # Play audio chunk and mute mic to prevent echo
                     if not self.playing_audio:
                         self.playing_audio = True
@@ -586,6 +593,9 @@ class LiveSession:
 
                     async def delayed_unmute():
                         await asyncio.sleep(0.5)
+                        # Bail if new audio started while we waited
+                        if self._unmute_task and self._unmute_task.cancelled():
+                            return
                         self.playing_audio = False
                         subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
                                        capture_output=True)
@@ -593,7 +603,7 @@ class LiveSession:
                         self._set_status("listening")
                         print("Live session: Mic unmuted", flush=True)
 
-                    asyncio.create_task(delayed_unmute())
+                    self._unmute_task = asyncio.create_task(delayed_unmute())
 
                 elif event_type == "response.done":
                     # Track conversation turn and token usage
@@ -672,7 +682,7 @@ class LiveSession:
                                     self._set_status("listening")
                                     print("Live session: Mic unmuted (fallback)", flush=True)
 
-                            asyncio.create_task(fallback_unmute())
+                            self._unmute_task = asyncio.create_task(fallback_unmute())
 
                         # Flush pending task notifications after response completes
                         if self._notification_queue:
