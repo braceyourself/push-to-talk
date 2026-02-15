@@ -13,6 +13,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from task_manager import TaskManager, ClaudeTask, TaskStatus
+
 try:
     import websockets
     WEBSOCKETS_AVAILABLE = True
@@ -31,6 +33,103 @@ REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2
 SUMMARY_TRIGGER = 20000  # tokens before triggering summarization
 KEEP_LAST_TURNS = 3
 REALTIME_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"}      # turns to preserve when summarizing
+
+# Task management tools for OpenAI Realtime API function calling
+TASK_TOOLS = [
+    {
+        "type": "function",
+        "name": "spawn_task",
+        "description": (
+            "Start a Claude CLI task in the background. Use when the user asks you to do "
+            "real work -- coding, refactoring, debugging, analysis. Return immediately with "
+            "a brief acknowledgment. Keep acknowledgments short, every word takes time to speak."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Short descriptive name, 2-4 words"
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Detailed prompt for Claude CLI to execute"
+                },
+                "project_dir": {
+                    "type": "string",
+                    "description": "Absolute path to the project directory where Claude should work"
+                }
+            },
+            "required": ["name", "prompt", "project_dir"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "list_tasks",
+        "description": (
+            "List all tasks with their current status. Use when the user asks what tasks "
+            "are running or wants a status update. Summarize concisely -- every word costs "
+            "time to speak aloud."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "type": "function",
+        "name": "get_task_status",
+        "description": "Get status of a specific task by name or number.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "identifier": {
+                    "type": "string",
+                    "description": "Task name, partial name, or ID number"
+                }
+            },
+            "required": ["identifier"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "get_task_result",
+        "description": (
+            "Read a task's output. For completed tasks, summarizes what was accomplished. "
+            "For running tasks, shows recent progress. Keep spoken summaries brief."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "identifier": {
+                    "type": "string",
+                    "description": "Task name, partial name, or ID number"
+                },
+                "tail_lines": {
+                    "type": "integer",
+                    "description": "Number of output lines to return from the end -- use fewer for quick summaries, more for detailed results"
+                }
+            },
+            "required": ["identifier"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "cancel_task",
+        "description": "Cancel a running task. No confirmation needed -- just do it.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "identifier": {
+                    "type": "string",
+                    "description": "Task name, partial name, or ID number"
+                }
+            },
+            "required": ["identifier"]
+        }
+    },
+]
 
 
 class ConversationState:
@@ -62,6 +161,8 @@ class LiveSession:
         self._idle_timeout = 120  # 2 minutes
         self._ducked_inputs = {}  # sink_input_index -> original_volume
         self.muted = False  # User-toggled mute via overlay click
+        self.task_manager = TaskManager()
+        self._notification_queue = []  # For Plan 02 task completion notifications
 
     def _build_personality(self):
         """Load personality from multiple .md files in personality/ directory."""
@@ -73,6 +174,104 @@ class LiveSession:
                 if content:
                     parts.append(content)
         return "\n\n".join(parts)
+
+    def _resolve_task(self, identifier: str) -> ClaudeTask | None:
+        """Resolve a task identifier (name or ID) to a ClaudeTask."""
+        # Try as integer ID first
+        try:
+            task_id = int(identifier)
+            return self.task_manager.get_task(task_id)
+        except ValueError:
+            pass
+        # Try name match
+        return self.task_manager.find_task_by_name(identifier)
+
+    async def _execute_tool(self, name: str, args: dict) -> str:
+        """Execute a task management tool and return JSON result."""
+        if name == "spawn_task":
+            task_name = args.get("name", "unnamed task")
+            prompt = args.get("prompt", "")
+            project_dir = args.get("project_dir", "")
+            try:
+                task = await self.task_manager.spawn_task(
+                    task_name, prompt, Path(project_dir)
+                )
+                return json.dumps({
+                    "id": task.id,
+                    "name": task.name,
+                    "status": task.status.value
+                })
+            except ValueError as e:
+                return json.dumps({"error": str(e)})
+
+        elif name == "list_tasks":
+            tasks = self.task_manager.get_all_tasks()
+            result = []
+            now = time.time()
+            for t in tasks:
+                info = {"id": t.id, "name": t.name, "status": t.status.value}
+                if t.status == TaskStatus.COMPLETED and t.completed_at and t.started_at:
+                    duration = t.completed_at - t.started_at
+                    info["duration"] = f"completed in {duration:.1f}s"
+                elif t.status == TaskStatus.RUNNING and t.started_at:
+                    duration = now - t.started_at
+                    info["duration"] = f"running for {duration:.1f}s"
+                elif t.status == TaskStatus.PENDING:
+                    info["duration"] = "pending"
+                result.append(info)
+            return json.dumps(result)
+
+        elif name == "get_task_status":
+            identifier = args.get("identifier", "")
+            task = self._resolve_task(identifier)
+            if not task:
+                return json.dumps({"error": f"No task found matching '{identifier}'"})
+            now = time.time()
+            info = {
+                "id": task.id,
+                "name": task.name,
+                "status": task.status.value,
+                "project_dir": str(task.project_dir),
+            }
+            if task.status == TaskStatus.COMPLETED and task.completed_at and task.started_at:
+                info["duration"] = f"completed in {task.completed_at - task.started_at:.1f}s"
+            elif task.status == TaskStatus.RUNNING and task.started_at:
+                info["duration"] = f"running for {now - task.started_at:.1f}s"
+            # Last 5 lines of output as recent_output
+            output_lines = list(task.output_lines)
+            info["recent_output"] = output_lines[-5:] if output_lines else []
+            return json.dumps(info)
+
+        elif name == "get_task_result":
+            identifier = args.get("identifier", "")
+            tail_lines = args.get("tail_lines", 50)
+            task = self._resolve_task(identifier)
+            if not task:
+                return json.dumps({"error": f"No task found matching '{identifier}'"})
+            output = self.task_manager.get_task_output(task.id)
+            lines = output.split('\n') if output else []
+            tail = lines[-tail_lines:] if len(lines) > tail_lines else lines
+            return json.dumps({
+                "id": task.id,
+                "name": task.name,
+                "status": task.status.value,
+                "output": '\n'.join(tail),
+                "total_lines": len(lines)
+            })
+
+        elif name == "cancel_task":
+            identifier = args.get("identifier", "")
+            task = self._resolve_task(identifier)
+            if not task:
+                return json.dumps({"error": f"No task found matching '{identifier}'"})
+            success = await self.task_manager.cancel_task(task.id)
+            if success:
+                return json.dumps({"success": True, "message": f"Task '{task.name}' cancelled"})
+            else:
+                return json.dumps({"success": False, "message": f"Task '{task.name}' is not running"})
+
+        else:
+            return json.dumps({"error": f"Unknown tool: {name}"})
 
     def _set_status(self, status):
         """Update status via callback."""
@@ -107,8 +306,8 @@ class LiveSession:
                     "eagerness": "medium",
                     "interrupt_response": True
                 },
-                "tools": [],
-                "tool_choice": "none"
+                "tools": TASK_TOOLS,
+                "tool_choice": "auto"
             }
         }))
 
@@ -276,6 +475,7 @@ class LiveSession:
 
                     # Extract assistant transcript from output items
                     output_items = response.get("output", [])
+                    has_function_call = False
                     for item in output_items:
                         if item.get("type") == "message" and item.get("role") == "assistant":
                             item_id = item.get("id", "")
@@ -292,24 +492,58 @@ class LiveSession:
                                 "text": text
                             })
 
+                    # Handle function calls from tool use
+                    for item in output_items:
+                        if item.get("type") == "function_call":
+                            has_function_call = True
+                            call_id = item.get("call_id")
+                            fn_name = item.get("name")
+                            arguments = item.get("arguments", "{}")
+                            print(f"Live session: Tool call - {fn_name}({arguments})", flush=True)
+
+                            # Execute tool asynchronously
+                            try:
+                                fn_args = json.loads(arguments)
+                                result = await self._execute_tool(fn_name, fn_args)
+                            except Exception as e:
+                                result = json.dumps({"error": str(e)})
+
+                            # Send result back to conversation
+                            await self.ws.send(json.dumps({
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "function_call_output",
+                                    "call_id": call_id,
+                                    "output": result
+                                }
+                            }))
+
+                            # Trigger AI to respond with the result
+                            await self.ws.send(json.dumps({
+                                "type": "response.create"
+                            }))
+
                     self._reset_idle_timer()
 
-                    # Trigger summarization if needed
-                    await self.maybe_summarize()
+                    # Skip summarize and fallback unmute during tool call cycles --
+                    # those will fire on the final response.done (after tool results)
+                    if not has_function_call:
+                        # Trigger summarization if needed
+                        await self.maybe_summarize()
 
-                    # If audio.done hasn't fired yet, do delayed unmute
-                    if self.playing_audio:
-                        async def fallback_unmute():
-                            await asyncio.sleep(1.0)
-                            if self.playing_audio:
-                                self.playing_audio = False
-                                subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
-                                               capture_output=True)
-                                self._unduck_other_audio()
-                                self._set_status("listening")
-                                print("Live session: Mic unmuted (fallback)", flush=True)
+                        # If audio.done hasn't fired yet, do delayed unmute
+                        if self.playing_audio:
+                            async def fallback_unmute():
+                                await asyncio.sleep(1.0)
+                                if self.playing_audio:
+                                    self.playing_audio = False
+                                    subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
+                                                   capture_output=True)
+                                    self._unduck_other_audio()
+                                    self._set_status("listening")
+                                    print("Live session: Mic unmuted (fallback)", flush=True)
 
-                        asyncio.create_task(fallback_unmute())
+                            asyncio.create_task(fallback_unmute())
 
                 elif event_type == "input_audio_buffer.speech_started":
                     self.playing_audio = False
