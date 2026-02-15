@@ -896,6 +896,10 @@ class PushToTalk:
             on_status=set_status
         )
 
+        # Ensure TaskManager singleton is initialized for this session
+        from task_manager import TaskManager
+        TaskManager()  # Initialize singleton if not already
+
         def run_session():
             import asyncio
             loop = asyncio.new_event_loop()
