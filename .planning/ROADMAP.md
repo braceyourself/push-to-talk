@@ -13,7 +13,7 @@ This roadmap delivers a voice-controlled async task orchestrator in three phases
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Mode Rename and Live Voice Session** - Rename "live" to "dictate" and create a new live mode with real-time voice conversation via OpenAI Realtime API
-- [ ] **Phase 2: Async Task Infrastructure** - Build TaskManager and ClaudeTask classes for non-blocking Claude CLI subprocess management
+- [x] **Phase 2: Async Task Infrastructure** - Build TaskManager and ClaudeTask classes for non-blocking Claude CLI subprocess management
 - [ ] **Phase 3: Voice-Controlled Task Orchestration** - Wire task management into the live session so users can spawn, query, cancel, and receive results from Claude CLI tasks by voice
 
 ## Phase Details
@@ -47,7 +47,7 @@ Plans:
 **Plans**: 1 plan
 
 Plans:
-- [ ] 02-01-PLAN.md -- TaskManager singleton and ClaudeTask with full async subprocess lifecycle and integration tests
+- [x] 02-01-PLAN.md -- TaskManager singleton and ClaudeTask with full async subprocess lifecycle and integration tests
 
 ### Phase 3: Voice-Controlled Task Orchestration
 **Goal**: User can manage Claude CLI tasks entirely by voice during a live session -- spawning work, checking status, retrieving results, and cancelling tasks through natural conversation
@@ -73,5 +73,5 @@ Phases execute in numeric order: 1 -> 2 -> 3
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Mode Rename and Live Voice Session | 2/2 | Complete | 2026-02-13 |
-| 2. Async Task Infrastructure | 0/1 | Not started | - |
+| 2. Async Task Infrastructure | 1/1 | Complete | 2026-02-15 |
 | 3. Voice-Controlled Task Orchestration | 0/2 | Not started | - |
