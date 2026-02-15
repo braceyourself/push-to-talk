@@ -14,12 +14,12 @@
 
 ### Async Infrastructure
 
-- [ ] **INFRA-01**: RealtimeSession tool execution is async — `execute_tool()` uses `asyncio.create_subprocess_exec()` instead of `subprocess.run()`
-- [ ] **INFRA-02**: TaskManager class tracks spawned tasks in-memory (id, name, process, status, start_time, stdout, stderr)
-- [ ] **INFRA-03**: Each Claude CLI task runs in its own working directory (`~/.local/share/push-to-talk/tasks/{task_id}/`)
-- [ ] **INFRA-04**: Claude CLI invoked with `-p` (no `-c`), `--no-session-persistence` for full context isolation
-- [ ] **INFRA-05**: Strong references maintained for asyncio tasks to prevent garbage collection
-- [ ] **INFRA-06**: Process cleanup on task completion/failure (PID tracking, directory cleanup)
+- [x] **INFRA-01**: RealtimeSession tool execution is async — `execute_tool()` uses `asyncio.create_subprocess_exec()` instead of `subprocess.run()`
+- [x] **INFRA-02**: TaskManager class tracks spawned tasks in-memory (id, name, process, status, start_time, stdout, stderr)
+- [x] **INFRA-03**: Each Claude CLI task runs in its own working directory (`~/.local/share/push-to-talk/tasks/{task_id}/`)
+- [x] **INFRA-04**: Claude CLI invoked with `-p` (no `-c`), `--no-session-persistence` for full context isolation
+- [x] **INFRA-05**: Strong references maintained for asyncio tasks to prevent garbage collection
+- [x] **INFRA-06**: Process cleanup on task completion/failure (PID tracking, directory cleanup)
 
 ### Task Lifecycle
 
@@ -83,12 +83,12 @@
 | RENAME-02 | Phase 1 | Complete |
 | RENAME-03 | Phase 1 | Complete |
 | RENAME-04 | Phase 1 | Complete |
-| INFRA-01 | Phase 2 | Pending |
-| INFRA-02 | Phase 2 | Pending |
-| INFRA-03 | Phase 2 | Pending |
-| INFRA-04 | Phase 2 | Pending |
-| INFRA-05 | Phase 2 | Pending |
-| INFRA-06 | Phase 2 | Pending |
+| INFRA-01 | Phase 2 | Complete |
+| INFRA-02 | Phase 2 | Complete |
+| INFRA-03 | Phase 2 | Complete |
+| INFRA-04 | Phase 2 | Complete |
+| INFRA-05 | Phase 2 | Complete |
+| INFRA-06 | Phase 2 | Complete |
 | TASK-01 | Phase 3 | Pending |
 | TASK-02 | Phase 3 | Pending |
 | TASK-03 | Phase 3 | Pending |
@@ -111,4 +111,4 @@
 
 ---
 *Requirements defined: 2026-02-13*
-*Last updated: 2026-02-13 after Phase 1 completion*
+*Last updated: 2026-02-15 after Phase 2 completion*
