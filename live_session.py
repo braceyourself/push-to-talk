@@ -162,7 +162,11 @@ class LiveSession:
         self._ducked_inputs = {}  # sink_input_index -> original_volume
         self.muted = False  # User-toggled mute via overlay click
         self.task_manager = TaskManager()
-        self._notification_queue = []  # For Plan 02 task completion notifications
+        self._notification_queue = []  # Task completion/failure notifications
+
+        # Register task lifecycle callbacks
+        self.task_manager.on('on_task_complete', self._on_task_complete)
+        self.task_manager.on('on_task_failed', self._on_task_failed)
 
     def _build_personality(self):
         """Load personality from multiple .md files in personality/ directory."""
@@ -272,6 +276,131 @@ class LiveSession:
 
         else:
             return json.dumps({"error": f"Unknown tool: {name}"})
+
+    async def _on_task_complete(self, task):
+        """Handle task completion -- queue notification for delivery."""
+        if not self.running or not self.ws:
+            return
+        duration = (task.completed_at or time.time()) - (task.started_at or task.created_at)
+        # Get last few lines of output for summary context
+        output_tail = '\n'.join(list(task.output_lines)[-20:])
+        notification = {
+            "type": "task_complete",
+            "task_id": task.id,
+            "task_name": task.name,
+            "duration": f"{duration:.1f}s",
+            "output_summary": output_tail[:1500],
+            "project_dir": str(task.project_dir)
+        }
+        self._notification_queue.append(notification)
+        print(f"Live session: Queued completion notification for task {task.id} '{task.name}'", flush=True)
+
+        # If not currently speaking, flush immediately
+        if not self.playing_audio:
+            await self._flush_notifications()
+
+    async def _on_task_failed(self, task):
+        """Handle task failure -- queue notification for delivery."""
+        if not self.running or not self.ws:
+            return
+        duration = (task.completed_at or time.time()) - (task.started_at or task.created_at)
+        output_tail = '\n'.join(list(task.output_lines)[-20:])
+        notification = {
+            "type": "task_failed",
+            "task_id": task.id,
+            "task_name": task.name,
+            "duration": f"{duration:.1f}s",
+            "exit_code": task.return_code,
+            "error_output": output_tail[:1500],
+            "project_dir": str(task.project_dir)
+        }
+        self._notification_queue.append(notification)
+        print(f"Live session: Queued failure notification for task {task.id} '{task.name}'", flush=True)
+
+        if not self.playing_audio:
+            await self._flush_notifications()
+
+    async def _flush_notifications(self):
+        """Deliver any queued task notifications to the conversation."""
+        if not self._notification_queue or not self.ws or not self.running:
+            return
+
+        # Drain the queue
+        notifications = self._notification_queue[:]
+        self._notification_queue.clear()
+
+        for notification in notifications:
+            notif_type = notification["type"]
+            task_name = notification["task_name"]
+
+            if notif_type == "task_complete":
+                message = (
+                    f"[Task notification] Task '{task_name}' (ID {notification['task_id']}) "
+                    f"completed successfully in {notification['duration']}. "
+                    f"Project: {notification['project_dir']}. "
+                    f"Output summary:\n{notification['output_summary']}\n\n"
+                    f"Inform the user briefly that this task finished. One or two sentences max."
+                )
+            elif notif_type == "task_failed":
+                message = (
+                    f"[Task notification] Task '{task_name}' (ID {notification['task_id']}) "
+                    f"failed after {notification['duration']} with exit code {notification['exit_code']}. "
+                    f"Project: {notification['project_dir']}. "
+                    f"Error output:\n{notification['error_output']}\n\n"
+                    f"Inform the user briefly that this task failed and what went wrong. Keep it short."
+                )
+            else:
+                continue
+
+            print(f"Live session: Delivering notification for task '{task_name}'", flush=True)
+
+            # Inject as system message so AI can speak about it
+            await self.ws.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": message}]
+                }
+            }))
+
+            # Trigger AI to speak the notification
+            await self.ws.send(json.dumps({
+                "type": "response.create"
+            }))
+
+    async def _inject_task_context(self):
+        """Inject current task status into conversation for ambient awareness."""
+        if not self.ws or not self.running:
+            return
+        running = self.task_manager.get_running_tasks()
+        recent_completed = [
+            t for t in self.task_manager.get_all_tasks()
+            if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+            and t.completed_at and (time.time() - t.completed_at) < 300  # last 5 min
+        ]
+
+        if not running and not recent_completed:
+            return
+
+        parts = []
+        if running:
+            task_strs = [f"'{t.name}' (running {time.time() - (t.started_at or t.created_at):.0f}s)" for t in running]
+            parts.append(f"Running tasks: {', '.join(task_strs)}")
+        if recent_completed:
+            task_strs = [f"'{t.name}' ({t.status.value})" for t in recent_completed[:3]]
+            parts.append(f"Recently finished: {', '.join(task_strs)}")
+
+        context = "[Background task status] " + ". ".join(parts)
+
+        await self.ws.send(json.dumps({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": context}]
+            }
+        }))
 
     def _set_status(self, status):
         """Update status via callback."""
@@ -545,6 +674,14 @@ class LiveSession:
 
                             asyncio.create_task(fallback_unmute())
 
+                        # Flush pending task notifications after response completes
+                        if self._notification_queue:
+                            async def delayed_flush():
+                                await asyncio.sleep(1.5)
+                                if not self.playing_audio:
+                                    await self._flush_notifications()
+                            asyncio.create_task(delayed_flush())
+
                 elif event_type == "input_audio_buffer.speech_started":
                     self.playing_audio = False
                     subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
@@ -561,6 +698,9 @@ class LiveSession:
                     self._set_status("speaking")
                     self._reset_idle_timer()
                     print("[Processing...]", flush=True)
+
+                    # Inject ambient task awareness before AI responds
+                    await self._inject_task_context()
 
                 elif event_type == "conversation.item.input_audio_transcription.completed":
                     # Track user turn in conversation history
