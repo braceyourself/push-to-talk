@@ -1325,7 +1325,7 @@ class LiveSession:
         SILENCE_THRESHOLD = 18   # RMS below this = silence (ambient ~10)
         SILENCE_DURATION = 0.8   # seconds of silence to trigger transcription
         SPEECH_ENERGY_MIN = 25   # Per-chunk RMS to flag speech (just above ambient)
-        SPEECH_CHUNKS_MIN = 8    # Need ~680ms of speech-level audio
+        SPEECH_CHUNKS_MIN = 5    # Need ~425ms of speech-level audio
         MIN_BUFFER_SECONDS = 0.5 # Minimum buffer length to transcribe
         # Whisper hallucinates these on silence/noise — reject them
         HALLUCINATION_PHRASES = {
