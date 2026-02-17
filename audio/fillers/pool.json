@@ -1,0 +1,182 @@
+[
+  {
+    "filename": "mmhmm_001.wav",
+    "created_at": 1771364288.074513,
+    "params": {
+      "prompt": "Mmhmm",
+      "length_scale": 0.83,
+      "noise_w_scale": 0.61,
+      "noise_scale": 0.6
+    },
+    "scores": {
+      "duration": 0.917,
+      "rms": 7204.7,
+      "peak": 32767,
+      "clipping_ratio": 0.0001,
+      "silence_ratio": 0.302,
+      "pass": true
+    }
+  },
+  {
+    "filename": "uhh_001.wav",
+    "created_at": 1771364288.7706752,
+    "params": {
+      "prompt": "Uhh",
+      "length_scale": 0.71,
+      "noise_w_scale": 1.37,
+      "noise_scale": 0.6
+    },
+    "scores": {
+      "duration": 0.313,
+      "rms": 9902.3,
+      "peak": 32767,
+      "clipping_ratio": 0.0012,
+      "silence_ratio": 0.305,
+      "pass": true
+    }
+  },
+  {
+    "filename": "mmm_001.wav",
+    "created_at": 1771364289.5114424,
+    "params": {
+      "prompt": "Mmm",
+      "length_scale": 1.15,
+      "noise_w_scale": 0.8,
+      "noise_scale": 0.58
+    },
+    "scores": {
+      "duration": 0.789,
+      "rms": 7939.2,
+      "peak": 32767,
+      "clipping_ratio": 0.0005,
+      "silence_ratio": 0.316,
+      "pass": true
+    }
+  },
+  {
+    "filename": "hmmm_001.wav",
+    "created_at": 1771364290.208365,
+    "params": {
+      "prompt": "Hmmm",
+      "length_scale": 1.78,
+      "noise_w_scale": 0.83,
+      "noise_scale": 0.54
+    },
+    "scores": {
+      "duration": 1.335,
+      "rms": 9612.9,
+      "peak": 32767,
+      "clipping_ratio": 0.0003,
+      "silence_ratio": 0.226,
+      "pass": true
+    }
+  },
+  {
+    "filename": "mmm_002.wav",
+    "created_at": 1771364290.9192698,
+    "params": {
+      "prompt": "Mmm",
+      "length_scale": 1.22,
+      "noise_w_scale": 0.89,
+      "noise_scale": 0.79
+    },
+    "scores": {
+      "duration": 0.871,
+      "rms": 6454.6,
+      "peak": 32767,
+      "clipping_ratio": 0.0002,
+      "silence_ratio": 0.409,
+      "pass": true
+    }
+  },
+  {
+    "filename": "hm_001.wav",
+    "created_at": 1771364291.5839942,
+    "params": {
+      "prompt": "Hm",
+      "length_scale": 0.83,
+      "noise_w_scale": 1.16,
+      "noise_scale": 0.48
+    },
+    "scores": {
+      "duration": 0.708,
+      "rms": 6082.7,
+      "peak": 32767,
+      "clipping_ratio": 0.0001,
+      "silence_ratio": 0.447,
+      "pass": true
+    }
+  },
+  {
+    "filename": "ahh_001.wav",
+    "created_at": 1771364292.2469435,
+    "params": {
+      "prompt": "Ahh",
+      "length_scale": 1.4,
+      "noise_w_scale": 1.34,
+      "noise_scale": 0.5
+    },
+    "scores": {
+      "duration": 0.546,
+      "rms": 5788.5,
+      "peak": 32767,
+      "clipping_ratio": 0.0012,
+      "silence_ratio": 0.566,
+      "pass": true
+    }
+  },
+  {
+    "filename": "hm_002.wav",
+    "created_at": 1771364292.9314082,
+    "params": {
+      "prompt": "Hm",
+      "length_scale": 1.19,
+      "noise_w_scale": 0.36,
+      "noise_scale": 0.84
+    },
+    "scores": {
+      "duration": 0.894,
+      "rms": 6141.5,
+      "peak": 32767,
+      "clipping_ratio": 0.0006,
+      "silence_ratio": 0.455,
+      "pass": true
+    }
+  },
+  {
+    "filename": "hmmm_002.wav",
+    "created_at": 1771364293.6174495,
+    "params": {
+      "prompt": "Hmmm",
+      "length_scale": 1.09,
+      "noise_w_scale": 1.04,
+      "noise_scale": 0.4
+    },
+    "scores": {
+      "duration": 0.592,
+      "rms": 8663.5,
+      "peak": 32767,
+      "clipping_ratio": 0.0008,
+      "silence_ratio": 0.388,
+      "pass": true
+    }
+  },
+  {
+    "filename": "uhh_002.wav",
+    "created_at": 1771364294.2651563,
+    "params": {
+      "prompt": "Uhh",
+      "length_scale": 1.45,
+      "noise_w_scale": 1.17,
+      "noise_scale": 0.93
+    },
+    "scores": {
+      "duration": 0.755,
+      "rms": 9240.9,
+      "peak": 32767,
+      "clipping_ratio": 0.0009,
+      "silence_ratio": 0.533,
+      "pass": true
+    }
+  }
+]
