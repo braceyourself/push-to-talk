@@ -1685,6 +1685,71 @@ class LiveSession:
             self._unmute_mic()
             self._set_status("listening")
 
+    async def _trigger_barge_in(self):
+        """Barge-in detected: fade out playback, play trailing filler, reset state."""
+        import numpy as np
+
+        print("Barge-in: Triggering interruption", flush=True)
+
+        # 1. Cancel pending delayed_unmute task
+        if self._unmute_task and not self._unmute_task.done():
+            self._unmute_task.cancel()
+
+        # 2. Increment generation_id to discard all queued frames
+        self.generation_id += 1
+
+        # 3. Drain audio_out and llm_out queues (stale frames)
+        for q in (self._audio_out_q, self._llm_out_q):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+        # 4. Cancel filler if running
+        if self._filler_cancel and not self._filler_cancel.is_set():
+            self._filler_cancel.set()
+
+        # 5. Set cooldown (1.5s)
+        self._barge_in_cooldown_until = time.time() + 1.5
+
+        # 6. Reset VAD speech counter and state
+        self._vad_speech_count = 0
+        self._reset_vad_state()
+
+        # 7. Transition state — ungating triggers _was_stt_gated reset in STT stage
+        self.playing_audio = False
+        self._stt_gated = False
+
+        # 8. Unmute mic (undo the _llm_stage mute from thinking phase)
+        self._unmute_mic()
+
+        # 9. Play a trailing non-verbal filler clip for naturalness
+        if self.fillers_enabled:
+            clip = self._pick_filler("nonverbal")
+            if clip:
+                gen_id = self.generation_id
+                # Only queue the first ~150ms worth of clip for a brief trail
+                trail_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * 0.15)
+                trail = clip[:trail_bytes] if len(clip) > trail_bytes else clip
+                # Apply fade-out to the trail
+                samples = np.frombuffer(trail, dtype=np.int16).copy()
+                if len(samples) > 0:
+                    fade = np.linspace(0.8, 0.0, len(samples))
+                    samples = (samples.astype(np.float64) * fade).astype(np.int16)
+                    await self._audio_out_q.put(PipelineFrame(
+                        type=FrameType.FILLER,
+                        generation_id=gen_id,
+                        data=samples.tobytes()
+                    ))
+
+        # 10. Set status to listening
+        self._set_status("listening")
+
+        # Log it
+        self._log_event("barge_in")
+        print("Barge-in: Interruption complete, listening for user", flush=True)
+
     # ── Main loop ──────────────────────────────────────────────────
 
     async def run(self):
