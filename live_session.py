@@ -94,6 +94,13 @@ class LiveSession:
         self._interrupt_requested = False
         self.muted = False
 
+        # STT gating: mic stays live during playback, but STT ignores audio
+        self._stt_gated = False
+        self._was_stt_gated = False  # Tracks previous state for transition detection
+        # VAD state for barge-in detection
+        self._vad_speech_count = 0
+        self._barge_in_cooldown_until = 0
+
         # Generation ID for interrupt coherence — all frames carry this.
         # On interrupt, ID increments; stages discard stale frames.
         self.generation_id = 0
@@ -1235,10 +1242,9 @@ class LiveSession:
                     await asyncio.sleep(0.01)
                     continue
 
-                # Always send audio to Deepgram to keep the connection alive.
-                # During playback the physical mic is muted (pactl), so Deepgram
-                # gets silence but doesn't timeout. The STT stage ignores
-                # transcripts that arrive during playback.
+                # Always send audio to the STT stage. During playback, the mic
+                # stays live (for VAD barge-in detection) but STT is gated —
+                # audio is consumed for VAD but not accumulated for transcription.
                 await self._audio_in_q.put(PipelineFrame(
                     type=FrameType.AUDIO_RAW,
                     generation_id=self.generation_id,
@@ -1565,6 +1571,7 @@ class LiveSession:
                         await asyncio.sleep(0.5)
                         if self.playing_audio:
                             self.playing_audio = False
+                            self._stt_gated = False
                             self._unmute_mic()
                             if not self.muted:
                                 self._set_status("listening")
@@ -1589,11 +1596,12 @@ class LiveSession:
                     if self._unmute_task and not self._unmute_task.done():
                         self._unmute_task.cancel()
 
-                    # First audio chunk — mute mic and set status
+                    # First audio chunk — gate STT and set status
+                    # Mic stays physically live so VAD can detect barge-in speech
                     if not self.playing_audio:
                         self.playing_audio = True
                         self._set_status("speaking")
-                        self._mute_mic()
+                        self._stt_gated = True
 
                     self._reset_idle_timer()
 
