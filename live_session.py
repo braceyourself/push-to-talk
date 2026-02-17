@@ -824,10 +824,8 @@ class LiveSession:
 
             os.unlink(tmp_path)
 
-            # Reject very short transcripts (likely noise, not real speech)
-            if text and len(text.split()) < 2:
-                print(f"STT: Rejected too short: \"{text}\"", flush=True)
-                return None
+            # Note: single-word transcripts are kept — the no_speech_prob
+            # filter above is sufficient to catch non-speech sounds.
 
             return text if text else None
 
