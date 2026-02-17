@@ -19,7 +19,7 @@ This roadmap covers all milestones. v1.0 delivered the core live voice session w
 
 ### v1.1: Voice UX Polish
 
-- [ ] **Phase 4: Filler System Overhaul** - Replace smart fillers with non-verbal clips and a clip factory subprocess
+- [x] **Phase 4: Filler System Overhaul** - Replace smart fillers with non-verbal clips and a clip factory subprocess
 - [ ] **Phase 5: Barge-in** - User can interrupt AI mid-speech via voice activity detection
 - [ ] **Phase 6: Polish & Verification** - Verify and tune all pre-work features end-to-end
 
@@ -51,10 +51,11 @@ Plans:
 - [x] 03-01-PLAN.md -- Realtime API tool definitions, function call handler, and task orchestrator personality
 - [x] 03-02-PLAN.md -- Task completion/failure notifications, queue-based delivery, and ambient task awareness
 
-### Phase 4: Filler System Overhaul (v1.1)
+### Phase 4: Filler System Overhaul (v1.1) ✓
 **Goal**: Replace Ollama smart filler generation with non-verbal audio clips managed by a clip factory subprocess that generates, evaluates, and rotates a capped pool of natural-sounding clips
 **Depends on**: Nothing (independent of other v1.1 phases)
 **Requirements**: FILL-01, FILL-02, FILL-03, FILL-04, FILL-05
+**Status**: Complete (2026-02-17)
 **Success Criteria** (what must be TRUE):
   1. No Ollama/LLM-generated filler text is spoken during live sessions
   2. Fillers are exclusively non-verbal audio clips (breaths, hums, etc.)
@@ -65,7 +66,7 @@ Plans:
 
 Plans:
 - [x] 04-01-PLAN.md -- Create clip factory daemon with generation, evaluation, and pool rotation
-- [ ] 04-02-PLAN.md -- Remove smart filler code, simplify filler system, wire clip factory, clean up
+- [x] 04-02-PLAN.md -- Remove smart filler code, simplify filler system, wire clip factory, clean up
 
 ### Phase 5: Barge-in (v1.1)
 **Goal**: User can interrupt AI mid-speech by speaking, which cancels current TTS playback and queued audio, allowing the conversation to continue naturally
@@ -102,6 +103,6 @@ v1.1: 4 & 5 (parallel) → 6
 | 1. Mode Rename and Live Voice Session | 2/2 | Complete | 2026-02-13 |
 | 2. Async Task Infrastructure | 1/1 | Complete | 2026-02-15 |
 | 3. Voice-Controlled Task Orchestration | 2/2 | Complete | 2026-02-17 |
-| 4. Filler System Overhaul | 1/2 | In progress | - |
+| 4. Filler System Overhaul | 2/2 | Complete | 2026-02-17 |
 | 5. Barge-in | 0/? | Not started | - |
 | 6. Polish & Verification | 0/? | Not started | - |

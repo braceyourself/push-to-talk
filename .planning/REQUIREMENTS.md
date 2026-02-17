@@ -48,11 +48,11 @@
 
 ### Filler System
 
-- [ ] **FILL-01**: Remove Ollama smart filler generation entirely — no LLM-generated filler text
-- [ ] **FILL-02**: Live session uses only non-verbal canned audio clips as fillers (breaths, hums, etc.)
-- [ ] **FILL-03**: Clip factory subprocess generates new non-verbal clips via Piper TTS
-- [ ] **FILL-04**: Clip pool has a configurable size cap with rotation (phase out old, generate new)
-- [ ] **FILL-05**: Clip factory evaluates naturalness of generated clips before adding to pool
+- [x] **FILL-01**: Remove Ollama smart filler generation entirely — no LLM-generated filler text
+- [x] **FILL-02**: Live session uses only non-verbal canned audio clips as fillers (breaths, hums, etc.)
+- [x] **FILL-03**: Clip factory subprocess generates new non-verbal clips via Piper TTS
+- [x] **FILL-04**: Clip pool has a configurable size cap with rotation (phase out old, generate new)
+- [x] **FILL-05**: Clip factory evaluates naturalness of generated clips before adding to pool
 
 ### STT Reliability
 
@@ -136,11 +136,11 @@
 | LIVE-03 | Phase 1 | Complete |
 | LIVE-04 | Phase 1 | Complete |
 
-| FILL-01 | Phase 4 | Pending |
-| FILL-02 | Phase 4 | Pending |
-| FILL-03 | Phase 4 | Pending |
-| FILL-04 | Phase 4 | Pending |
-| FILL-05 | Phase 4 | Pending |
+| FILL-01 | Phase 4 | Complete |
+| FILL-02 | Phase 4 | Complete |
+| FILL-03 | Phase 4 | Complete |
+| FILL-04 | Phase 4 | Complete |
+| FILL-05 | Phase 4 | Complete |
 | STT-01 | Phase 6 | Complete (pre-work) |
 | STT-02 | Phase 6 | Pending |
 | FLOW-01 | Phase 6 | Complete (pre-work) |
