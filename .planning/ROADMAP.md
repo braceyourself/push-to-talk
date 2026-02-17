@@ -61,7 +61,11 @@ Plans:
   3. A background subprocess generates new clips via Piper TTS
   4. The clip pool has a configurable size cap and rotates old clips out
   5. Generated clips are evaluated for naturalness before being added to the pool
-**Plans**: TBD
+**Plans:** 2 plans
+
+Plans:
+- [ ] 04-01-PLAN.md -- Create clip factory daemon with generation, evaluation, and pool rotation
+- [ ] 04-02-PLAN.md -- Remove smart filler code, simplify filler system, wire clip factory, clean up
 
 ### Phase 5: Barge-in (v1.1)
 **Goal**: User can interrupt AI mid-speech by speaking, which cancels current TTS playback and queued audio, allowing the conversation to continue naturally
@@ -98,6 +102,6 @@ v1.1: 4 & 5 (parallel) → 6
 | 1. Mode Rename and Live Voice Session | 2/2 | Complete | 2026-02-13 |
 | 2. Async Task Infrastructure | 1/1 | Complete | 2026-02-15 |
 | 3. Voice-Controlled Task Orchestration | 2/2 | Complete | 2026-02-17 |
-| 4. Filler System Overhaul | 0/? | Not started | - |
+| 4. Filler System Overhaul | 0/2 | Not started | - |
 | 5. Barge-in | 0/? | Not started | - |
 | 6. Polish & Verification | 0/? | Not started | - |
