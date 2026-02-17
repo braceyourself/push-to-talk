@@ -141,6 +141,14 @@ class LiveSession:
         self._vad_model = None
         self._vad_state = None
 
+        # Barge-in: sentence tracking and interruption annotation
+        self._spoken_sentences = []         # Sentences sent to TTS in current turn
+        self._played_sentence_count = 0     # How many sentences had audio fully played
+        self._full_response_text = ""       # Full LLM response for current turn
+        self._was_interrupted = False        # Set by _trigger_barge_in, cleared at new turn
+        self._barge_in_annotation = None    # Annotation prepended to next user message
+        self._post_barge_in = False         # Shortened silence after barge-in
+
         # Circuit breakers for service fallback
         self._stt_breaker = CircuitBreaker("STT/Deepgram")
         self._tts_breaker = CircuitBreaker("TTS/OpenAI")
@@ -1012,6 +1020,12 @@ class LiveSession:
         full_response = ""
         first_text_time = None
         saw_tool_use = False  # Track if model is making tool calls
+
+        # Reset sentence tracking for this turn
+        self._spoken_sentences = []
+        self._played_sentence_count = 0
+        self._full_response_text = ""
+        self._was_interrupted = False
         # After tool use, hold all text until turn ends so we only speak
         # the final coherent response — not intermediate narration.
         post_tool_buffer = ""
@@ -1131,6 +1145,7 @@ class LiveSession:
                                                 generation_id=gen_id,
                                                 data=clean
                                             ))
+                                            self._spoken_sentences.append(clean)
 
                 elif event_type == "result":
                     # CLI finished processing this message (including any tool use rounds)
@@ -1153,6 +1168,7 @@ class LiveSession:
                     generation_id=gen_id,
                     data=clean
                 ))
+                self._spoken_sentences.append(clean)
 
         # Flush remaining text (non-tool-use path)
         if not saw_tool_use and sentence_buffer.strip() and self.generation_id == gen_id:
@@ -1163,6 +1179,7 @@ class LiveSession:
                     generation_id=gen_id,
                     data=clean
                 ))
+                self._spoken_sentences.append(clean)
 
         # Signal end of turn
         if self.generation_id == gen_id:
@@ -1458,6 +1475,11 @@ class LiveSession:
                 task_context = self._build_task_context()
                 user_content = f"{task_context}\n\n{transcript}" if task_context else transcript
 
+                # Prepend barge-in annotation if the AI was interrupted
+                if self._barge_in_annotation:
+                    user_content = f"{self._barge_in_annotation}\n\n{user_content}"
+                    self._barge_in_annotation = None
+
                 # Send to CLI and read response
                 await self._send_to_cli(user_content)
                 t_sent = time.time()
@@ -1555,6 +1577,14 @@ class LiveSession:
                     ))
 
                 await process.wait()
+
+                # Mark sentence boundary for playback stage to count
+                if self.generation_id == gen_id:
+                    await self._audio_out_q.put(PipelineFrame(
+                        type=FrameType.CONTROL,
+                        generation_id=gen_id,
+                        data="sentence_done"
+                    ))
             except Exception as e:
                 print(f"Piper TTS error: {e}", flush=True)
 
@@ -1583,6 +1613,11 @@ class LiveSession:
                     continue
 
                 if frame.generation_id != self.generation_id:
+                    continue
+
+                # Count completed sentences via sentinel from TTS stage
+                if frame.type == FrameType.CONTROL and frame.data == "sentence_done":
+                    self._played_sentence_count += 1
                     continue
 
                 if frame.type == FrameType.END_OF_TURN:
@@ -1743,11 +1778,33 @@ class LiveSession:
                         data=samples.tobytes()
                     ))
 
-        # 10. Set status to listening
+        # 10. Build interruption annotation for next turn
+        self._was_interrupted = True
+        spoken = self._spoken_sentences[:self._played_sentence_count]
+        unspoken = self._spoken_sentences[self._played_sentence_count:]
+        spoken_text = " ".join(spoken) if spoken else "(nothing)"
+        unspoken_text = " ".join(unspoken) if unspoken else "(nothing)"
+
+        self._barge_in_annotation = (
+            f"[The user interrupted you. "
+            f"They heard up to: \"{spoken_text}\". "
+            f"Your unspoken response was: \"{unspoken_text}\". "
+            f"Adjust based on what the user says next.]"
+        )
+        print(f"Barge-in: Annotation ({self._played_sentence_count}/{len(self._spoken_sentences)} sentences spoken)", flush=True)
+
+        # 11. Set shortened post-barge-in silence threshold
+        self._post_barge_in = True
+
+        # 12. Set status to listening
         self._set_status("listening")
 
         # Log it
-        self._log_event("barge_in")
+        self._log_event("barge_in",
+            spoken_sentences=self._played_sentence_count,
+            total_sentences=len(self._spoken_sentences),
+            cooldown_until=self._barge_in_cooldown_until
+        )
         print("Barge-in: Interruption complete, listening for user", flush=True)
 
     # ── Main loop ──────────────────────────────────────────────────
