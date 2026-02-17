@@ -804,10 +804,31 @@ class LiveSession:
                     wf.setframerate(SAMPLE_RATE)
                     wf.writeframes(pcm_data)
 
-            result = self.whisper_model.transcribe(tmp_path, language="en")
-            text = result.get("text", "").strip()
+            result = self.whisper_model.transcribe(
+                tmp_path, language="en",
+                condition_on_previous_text=False,  # Prevent hallucination loops
+            )
+
+            # Filter out segments where Whisper thinks there's no speech
+            # (catches throat clearing, coughs, background noise)
+            segments = result.get("segments", [])
+            if segments:
+                kept = [s["text"] for s in segments if s.get("no_speech_prob", 0) < 0.6]
+                text = "".join(kept).strip()
+                if not kept and segments:
+                    rejected_text = "".join(s["text"] for s in segments).strip()
+                    probs = [f'{s.get("no_speech_prob", 0):.2f}' for s in segments]
+                    print(f"STT: Rejected non-speech (probs={probs}): \"{rejected_text}\"", flush=True)
+            else:
+                text = result.get("text", "").strip()
 
             os.unlink(tmp_path)
+
+            # Reject very short transcripts (likely noise, not real speech)
+            if text and len(text.split()) < 2:
+                print(f"STT: Rejected too short: \"{text}\"", flush=True)
+                return None
+
             return text if text else None
 
         except Exception as e:
@@ -1050,6 +1071,9 @@ class LiveSession:
         full_response = ""
         first_text_time = None
         saw_tool_use = False  # Track if model is making tool calls
+        # After tool use, hold all text until turn ends so we only speak
+        # the final coherent response — not intermediate narration.
+        post_tool_buffer = ""
 
         try:
             while self.running:
@@ -1093,11 +1117,39 @@ class LiveSession:
                     if inner_type == "content_block_start":
                         content_block = event.get("content_block", {})
                         if content_block.get("type") == "tool_use":
-                            # Model is making a tool call — discard any pre-tool narration
+                            if not saw_tool_use:
+                                saw_tool_use = True
+                                # First tool call — drain any text already
+                                # sent to TTS so we don't speak pre-tool narration
+                                drained = 0
+                                for q in (self._llm_out_q, self._audio_out_q):
+                                    while not q.empty():
+                                        try:
+                                            f = q.get_nowait()
+                                            if f.type == FrameType.END_OF_TURN:
+                                                await q.put(f)
+                                                break
+                                            drained += 1
+                                        except asyncio.QueueEmpty:
+                                            break
+                                if drained:
+                                    print(f"  [tool] Drained {drained} pre-tool frames", flush=True)
+                                # Play a tool_use filler clip
+                                if self.fillers_enabled:
+                                    clip = self._pick_filler("tool_use")
+                                    if clip:
+                                        asyncio.create_task(
+                                            self._play_filler_audio(clip, asyncio.Event())
+                                        )
+
+                            # Discard any accumulated text (pre-tool or inter-tool narration)
                             if sentence_buffer.strip():
-                                print(f" [suppressed pre-tool text: \"{sentence_buffer.strip()[:60]}\"]", flush=True)
+                                print(f"  [tool] Suppressed text: \"{sentence_buffer.strip()[:60]}\"", flush=True)
                                 sentence_buffer = ""
-                            saw_tool_use = True
+                            # Also discard inter-tool post_tool_buffer
+                            if post_tool_buffer.strip():
+                                print(f"  [tool] Suppressed inter-tool text: \"{post_tool_buffer.strip()[:60]}\"", flush=True)
+                                post_tool_buffer = ""
                             self._set_status("tool_use")
 
                     elif inner_type == "content_block_delta":
@@ -1107,41 +1159,45 @@ class LiveSession:
                             if first_text_time is None:
                                 first_text_time = time.time()
                                 print(f"\n  [timing] first token: {first_text_time - (self._last_send_time or first_text_time):.2f}s", flush=True)
-                            sentence_buffer += text
                             full_response += text
                             print(text, end="", flush=True)
 
-                            # Cancel filler on first text from LLM
-                            # Don't drain queued filler frames — let them finish
-                            # playing so the transition isn't jarring
-                            if self._filler_cancel and not self._filler_cancel.is_set():
-                                self._filler_cancel.set()
+                            if saw_tool_use:
+                                # After tool use: hold text, don't send to TTS yet
+                                post_tool_buffer += text
+                            else:
+                                # Normal path: stream text to TTS
+                                sentence_buffer += text
 
-                            # Flush complete sentences to TTS
-                            while True:
-                                match = SENTENCE_END_RE.search(sentence_buffer)
-                                if not match:
-                                    break
-                                end_pos = match.end()
-                                sentence = sentence_buffer[:end_pos].strip()
-                                sentence_buffer = sentence_buffer[end_pos:]
-                                if sentence:
-                                    # Skip first sentence if it duplicates the filler
-                                    if self._spoken_filler:
-                                        filler_lower = self._spoken_filler.lower().rstrip('.!').strip()
-                                        sent_lower = sentence.lower().rstrip('.!').strip()
-                                        self._spoken_filler = None  # Only check first sentence
-                                        if filler_lower in sent_lower or sent_lower in filler_lower:
-                                            print(f"  [filler] Skipped duplicate: \"{sentence}\"", flush=True)
-                                            continue
-                                    # Strip markdown for TTS
-                                    clean = self._strip_markdown(sentence)
-                                    if clean:
-                                        await self._llm_out_q.put(PipelineFrame(
-                                            type=FrameType.TEXT_DELTA,
-                                            generation_id=gen_id,
-                                            data=clean
-                                        ))
+                                # Cancel filler on first text from LLM
+                                if self._filler_cancel and not self._filler_cancel.is_set():
+                                    self._filler_cancel.set()
+
+                                # Flush complete sentences to TTS
+                                while True:
+                                    match = SENTENCE_END_RE.search(sentence_buffer)
+                                    if not match:
+                                        break
+                                    end_pos = match.end()
+                                    sentence = sentence_buffer[:end_pos].strip()
+                                    sentence_buffer = sentence_buffer[end_pos:]
+                                    if sentence:
+                                        # Skip first sentence if it duplicates the filler
+                                        if self._spoken_filler:
+                                            filler_lower = self._spoken_filler.lower().rstrip('.!').strip()
+                                            sent_lower = sentence.lower().rstrip('.!').strip()
+                                            self._spoken_filler = None  # Only check first sentence
+                                            if filler_lower in sent_lower or sent_lower in filler_lower:
+                                                print(f"  [filler] Skipped duplicate: \"{sentence}\"", flush=True)
+                                                continue
+                                        # Strip markdown for TTS
+                                        clean = self._strip_markdown(sentence)
+                                        if clean:
+                                            await self._llm_out_q.put(PipelineFrame(
+                                                type=FrameType.TEXT_DELTA,
+                                                generation_id=gen_id,
+                                                data=clean
+                                            ))
 
                 elif event_type == "result":
                     # CLI finished processing this message (including any tool use rounds)
@@ -1155,8 +1211,18 @@ class LiveSession:
         if full_response.strip() and self.generation_id == gen_id:
             self._log_event("assistant", text=full_response.strip())
 
-        # Flush remaining text
-        if sentence_buffer.strip() and self.generation_id == gen_id:
+        # Flush post-tool text now that the turn is complete
+        if saw_tool_use and post_tool_buffer.strip() and self.generation_id == gen_id:
+            clean = self._strip_markdown(post_tool_buffer)
+            if clean:
+                await self._llm_out_q.put(PipelineFrame(
+                    type=FrameType.TEXT_DELTA,
+                    generation_id=gen_id,
+                    data=clean
+                ))
+
+        # Flush remaining text (non-tool-use path)
+        if not saw_tool_use and sentence_buffer.strip() and self.generation_id == gen_id:
             clean = self._strip_markdown(sentence_buffer)
             if clean:
                 await self._llm_out_q.put(PipelineFrame(
@@ -1259,7 +1325,7 @@ class LiveSession:
         SILENCE_THRESHOLD = 18   # RMS below this = silence (ambient ~10)
         SILENCE_DURATION = 0.8   # seconds of silence to trigger transcription
         SPEECH_ENERGY_MIN = 25   # Per-chunk RMS to flag speech (just above ambient)
-        SPEECH_CHUNKS_MIN = 5    # Need ~425ms of speech-level audio
+        SPEECH_CHUNKS_MIN = 8    # Need ~680ms of speech-level audio
         MIN_BUFFER_SECONDS = 0.5 # Minimum buffer length to transcribe
         # Whisper hallucinates these on silence/noise — reject them
         HALLUCINATION_PHRASES = {
