@@ -1,77 +1,103 @@
-# Roadmap: Push-to-Talk Live Mode
+# Roadmap: Push-to-Talk
 
 ## Overview
 
-This roadmap delivers a voice-controlled async task orchestrator in three phases. First, rename the existing "live" dictation mode to "dictate" and stand up a new live mode with basic real-time voice conversation. Second, build the async Claude CLI task management layer (TaskManager, ClaudeTask, process lifecycle). Third, wire task orchestration into the live voice session so users can spawn, monitor, and control Claude CLI tasks by voice.
+This roadmap covers all milestones. v1.0 delivered the core live voice session with async task orchestration. v1.1 polishes the voice UX — overhauling the filler system, enabling barge-in interruption, and verifying STT/speech-flow pre-work.
 
 ## Phases
 
 **Phase Numbering:**
-- Integer phases (1, 2, 3): Planned milestone work
-- Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
+- Integer phases (1, 2, 3): v1.0 milestone (complete)
+- Phases 4-6: v1.1 Voice UX Polish
+- Decimal phases (e.g., 4.1): Urgent insertions (marked with INSERTED)
 
-Decimal phases appear between their surrounding integers in numeric order.
+### v1.0: Live Mode (Complete)
 
-- [x] **Phase 1: Mode Rename and Live Voice Session** - Rename "live" to "dictate" and create a new live mode with real-time voice conversation via OpenAI Realtime API
+- [x] **Phase 1: Mode Rename and Live Voice Session** - Rename "live" to "dictate" and create a new live mode with real-time voice conversation
 - [x] **Phase 2: Async Task Infrastructure** - Build TaskManager and ClaudeTask classes for non-blocking Claude CLI subprocess management
-- [ ] **Phase 3: Voice-Controlled Task Orchestration** - Wire task management into the live session so users can spawn, query, cancel, and receive results from Claude CLI tasks by voice
+- [x] **Phase 3: Voice-Controlled Task Orchestration** - Wire task management into the live session via MCP tools and notification system
+
+### v1.1: Voice UX Polish
+
+- [ ] **Phase 4: Filler System Overhaul** - Replace smart fillers with non-verbal clips and a clip factory subprocess
+- [ ] **Phase 5: Barge-in** - User can interrupt AI mid-speech via voice activity detection
+- [ ] **Phase 6: Polish & Verification** - Verify and tune all pre-work features end-to-end
 
 ## Phase Details
 
-### Phase 1: Mode Rename and Live Voice Session
+### Phase 1: Mode Rename and Live Voice Session (v1.0) ✓
 **Goal**: User can select the new "live" dictation mode and have a real-time voice conversation with AI, with the old live mode cleanly renamed to "dictate"
-**Depends on**: Nothing (first phase)
-**Requirements**: RENAME-01, RENAME-02, RENAME-03, RENAME-04, LIVE-01, LIVE-02, LIVE-03, LIVE-04
-**Success Criteria** (what must be TRUE):
-  1. User can select "Dictate" in the Settings combo box and it behaves exactly like the old "Live" mode did
-  2. User can select "Live" in the Settings combo box and it opens an OpenAI Realtime voice session
-  3. User can hold PTT to speak, release to send, and hear AI respond through speakers in live mode
-  4. Conversation context persists across multiple PTT presses within a single live session
-  5. Starting and stopping a live session cleanly initializes and tears down without errors
-**Plans**: 2 plans
+**Requirements**: RENAME-01..04, LIVE-01..04
+**Status**: Complete (2026-02-13)
 
 Plans:
 - [x] 01-01-PLAN.md -- Rename "live" dictation mode to "dictate" across codebase, config, and UI
 - [x] 01-02-PLAN.md -- Implement new live mode with LiveSession, personality system, and overlay widget
 
-### Phase 2: Async Task Infrastructure
+### Phase 2: Async Task Infrastructure (v1.0) ✓
 **Goal**: A TaskManager can spawn, track, query, and cancel isolated Claude CLI subprocesses without blocking the asyncio event loop
-**Depends on**: Phase 1
-**Requirements**: INFRA-01, INFRA-02, INFRA-03, INFRA-04, INFRA-05, INFRA-06
-**Success Criteria** (what must be TRUE):
-  1. Claude CLI tasks spawn asynchronously via `asyncio.create_subprocess_exec()` and do not block the event loop
-  2. TaskManager tracks each task's id, name, status, process handle, and captured output
-  3. Each task runs in its own isolated working directory with no shared session state
-  4. Completed and failed tasks are cleaned up (process reaped, strong references released)
-  5. No zombie Claude CLI processes accumulate during normal operation or after failures
-**Plans**: 1 plan
+**Requirements**: INFRA-01..06
+**Status**: Complete (2026-02-15)
 
 Plans:
 - [x] 02-01-PLAN.md -- TaskManager singleton and ClaudeTask with full async subprocess lifecycle and integration tests
 
-### Phase 3: Voice-Controlled Task Orchestration
-**Goal**: User can manage Claude CLI tasks entirely by voice during a live session -- spawning work, checking status, retrieving results, and cancelling tasks through natural conversation
-**Depends on**: Phase 1, Phase 2
-**Requirements**: TASK-01, TASK-02, TASK-03, TASK-04, TASK-05, TASK-06, TASK-07, CTX-01, CTX-02, CTX-03
-**Success Criteria** (what must be TRUE):
-  1. User can say something like "ask Claude to refactor the auth module" and a task spawns in the background while conversation continues uninterrupted
-  2. When a task completes or fails, the user hears a notification and a spoken summary of the outcome
-  3. User can ask "what are my tasks doing?" and hear a status summary of all active and completed tasks
-  4. User can cancel a running task by referring to it by name
-  5. User can ask for a specific task's results and hear a spoken summary of its output
-**Plans**: 2 plans
+### Phase 3: Voice-Controlled Task Orchestration (v1.0) ✓
+**Goal**: User can manage Claude CLI tasks entirely by voice during a live session
+**Requirements**: TASK-01..07, CTX-01..03
+**Status**: Complete (2026-02-17)
 
 Plans:
-- [ ] 03-01-PLAN.md -- Realtime API tool definitions, function call handler, and task orchestrator personality
-- [ ] 03-02-PLAN.md -- Task completion/failure notifications, queue-based delivery, and ambient task awareness
+- [x] 03-01-PLAN.md -- Realtime API tool definitions, function call handler, and task orchestrator personality
+- [x] 03-02-PLAN.md -- Task completion/failure notifications, queue-based delivery, and ambient task awareness
+
+### Phase 4: Filler System Overhaul (v1.1)
+**Goal**: Replace Ollama smart filler generation with non-verbal audio clips managed by a clip factory subprocess that generates, evaluates, and rotates a capped pool of natural-sounding clips
+**Depends on**: Nothing (independent of other v1.1 phases)
+**Requirements**: FILL-01, FILL-02, FILL-03, FILL-04, FILL-05
+**Success Criteria** (what must be TRUE):
+  1. No Ollama/LLM-generated filler text is spoken during live sessions
+  2. Fillers are exclusively non-verbal audio clips (breaths, hums, etc.)
+  3. A background subprocess generates new clips via Piper TTS
+  4. The clip pool has a configurable size cap and rotates old clips out
+  5. Generated clips are evaluated for naturalness before being added to the pool
+**Plans**: TBD
+
+### Phase 5: Barge-in (v1.1)
+**Goal**: User can interrupt AI mid-speech by speaking, which cancels current TTS playback and queued audio, allowing the conversation to continue naturally
+**Depends on**: Nothing (independent of other v1.1 phases)
+**Requirements**: BARGE-01, BARGE-02, BARGE-03, BARGE-04
+**Success Criteria** (what must be TRUE):
+  1. User can speak while AI is talking and be heard (mic not muted during playback)
+  2. VAD detects user speech during AI playback
+  3. Detection cancels current TTS playback and all queued audio frames
+  4. Interrupted (unspoken) text is either excluded from context or marked as interrupted
+  5. Conversation continues naturally after interruption
+**Plans**: TBD
+
+### Phase 6: Polish & Verification (v1.1)
+**Goal**: Verify and tune all pre-work features (STT filtering, tool-use speech suppression, overlay states) end-to-end to ensure they work correctly in real usage
+**Depends on**: Phase 4, Phase 5 (run after new features are stable)
+**Requirements**: STT-01, STT-02, FLOW-01, FLOW-02, OVL-01, OVL-02
+**Success Criteria** (what must be TRUE):
+  1. Whisper no_speech_prob filtering correctly rejects throat clearing, coughs, ambient noise
+  2. STT false trigger rate is acceptably low in real usage
+  3. Only the final post-tool response is spoken; inter-tool narration is discarded
+  4. All overlay status states (listening, thinking, tool_use, speaking, idle, muted) render correctly
+  5. Status history panel shows transitions with timestamps
+**Plans**: TBD
 
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 -> 2 -> 3
+v1.0: 1 → 2 → 3 (complete)
+v1.1: 4 & 5 (parallel) → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Mode Rename and Live Voice Session | 2/2 | Complete | 2026-02-13 |
 | 2. Async Task Infrastructure | 1/1 | Complete | 2026-02-15 |
-| 3. Voice-Controlled Task Orchestration | 0/2 | Not started | - |
+| 3. Voice-Controlled Task Orchestration | 2/2 | Complete | 2026-02-17 |
+| 4. Filler System Overhaul | 0/? | Not started | - |
+| 5. Barge-in | 0/? | Not started | - |
+| 6. Polish & Verification | 0/? | Not started | - |

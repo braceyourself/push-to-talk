@@ -1,64 +1,78 @@
-# Push-to-Talk: Live Mode
+# Push-to-Talk
 
 ## What This Is
 
-A new "live" dictation mode for push-to-talk that provides real-time voice conversation with AI via the OpenAI Realtime API, with the ability to manage async Claude CLI tasks. You talk, the AI responds through speakers, and it can spawn, monitor, and report on Claude CLI processes running in the background — acting as a voice-controlled task orchestrator. The current "live" mode gets renamed to "dictate."
+A Linux desktop tool providing global hotkey-driven voice input with multiple AI modes. The flagship "live" mode runs a real-time voice conversation with Claude via a 5-stage asyncio pipeline (audio capture → Whisper STT → Claude CLI → Piper TTS → playback). It can spawn and manage background Claude CLI tasks, learn from conversations, and display status through a floating overlay. Other modes include dictation, interview, and conversation with full tool access.
 
 ## Core Value
 
-Real-time voice-to-voice AI conversation that can delegate real work to Claude CLI and manage multiple async tasks with clean context isolation.
+Natural, low-friction voice conversation with Claude that feels like talking to a person — fast recognition, intelligent responses, no jarring artifacts.
+
+## Current Milestone: v1.1 Voice UX Polish
+
+**Goal:** Make the live voice session feel natural — fix filler conflicts, reduce false STT triggers, suppress stale tool narration, enable barge-in interruption.
+
+**Target features:**
+- Filler system overhaul: non-verbal clips only + clip factory for generation/rotation
+- STT reliability: Whisper no_speech_prob filtering to reject non-speech sounds
+- Tool-use speech flow: only speak the final coherent response after all tool calls
+- Barge-in: let user interrupt AI mid-speech
+- Overlay polish: granular status states, expandable history
 
 ## Requirements
 
 ### Validated
 
-- ✓ OpenAI Realtime API WebSocket integration — existing (`openai_realtime.py`)
-- ✓ Audio recording via PipeWire — existing
-- ✓ TTS playback via aplay — existing
-- ✓ Mic muting during AI speech — existing
-- ✓ Function calling / tool execution — existing
-- ✓ Dictation modes (live/prompt/stream) — existing
-- ✓ Settings UI for mode selection — existing (`indicator.py`)
+- ✓ Mode rename ("live" dictation → "dictate") — v1.0 Phase 1
+- ✓ Live voice session with 5-stage pipeline — v1.0 Phase 1
+- ✓ Claude CLI integration via stream-json — v1.0 Phase 1
+- ✓ MCP tool server for task management — v1.0 Phase 3
+- ✓ TaskManager for async background tasks — v1.0 Phase 2
+- ✓ Filler system (canned clips + smart generation) — v1.0 Phase 1
+- ✓ Learner daemon for persistent memory — v1.0 Phase 3
+- ✓ Live overlay with status, drag, model selection — v1.0 Phase 1
+- ✓ Conversation logging (JSONL) — v1.0 Phase 3
+- ✓ Granular status indicators (thinking, tool_use) — v1.1 pre-work
+- ✓ Expandable status history panel — v1.1 pre-work
+- ✓ Tool-use text suppression (post_tool_buffer) — v1.1 pre-work
+- ✓ Whisper no_speech_prob segment filtering — v1.1 pre-work
 
 ### Active
 
-- [ ] Rename current "live" mode to "dictate" across codebase and UI
-- [ ] New "live" mode that starts an OpenAI Realtime voice session
-- [ ] Hold PTT to speak, release to send — AI responds through speakers
-- [ ] Session memory — conversation persists across PTT presses within a session
-- [ ] Claude CLI task spawning — voice commands spawn Claude CLI processes with prompts
-- [ ] Async task management — Claude processes run in background, don't block conversation
-- [ ] Task status awareness — AI knows what tasks are running, completed, or failed
-- [ ] Context switching — user can refer to different tasks by name/description and AI tracks them
-- [ ] Context isolation — each Claude CLI task runs in its own context, no bleed between tasks
-- [ ] Task result summarization — AI reads Claude CLI output and speaks a summary
+- [ ] Non-verbal filler clips only (remove Ollama smart filler)
+- [ ] Filler clip factory: subprocess generates/rotates clips, capped pool, natural evaluation
+- [ ] STT false trigger tuning and verification
+- [ ] Tool-use speech flow end-to-end verification
+- [ ] Barge-in: user can interrupt AI mid-speech via voice activity detection
+- [ ] Overlay and status polish: verify all states render correctly
 
 ### Out of Scope
 
-- Interactive Claude CLI sessions (steering a running Claude session with voice) — complexity too high for v1
-- Shell commands beyond Claude CLI — keep focused on Claude as the work engine
-- Persistent task state across live mode sessions — each session starts fresh
-- Audio recording/saving of live mode sessions — not a podcast, just a working session
+- OpenAI TTS (sticking with local Piper for now) — latency vs quality tradeoff, revisit later
+- Always-on listening without PTT — privacy, CPU, false positives
+- Visual task dashboard — voice-first tool
+- Persistent tasks across sessions — each session starts fresh
 
 ## Context
 
-Push-to-talk is a Linux desktop tool (X11, PipeWire, systemd user service) that provides global hotkey-driven voice input. It already has multiple AI modes (Claude, Realtime, Interview, Conversation) and dictation modes (live, prompt, stream). The `openai_realtime.py` module already implements WebSocket streaming, mic control, and function calling against the Realtime API. The main work is: (1) renaming the current live mode, (2) elevating the Realtime session into a first-class dictation mode with task orchestration capabilities, and (3) building the async Claude CLI management layer with context isolation.
+The live mode evolved from the original OpenAI Realtime API plan into a Claude CLI-based pipeline using local Whisper for STT and Piper for TTS. The Silero VAD model is already in the codebase (loaded by `_load_vad_model`) but only used for barge-in monitoring which is currently non-functional (mic is muted during playback via pactl). Barge-in requires gating STT instead of muting the physical mic source.
 
 ## Constraints
 
 - **Platform**: Linux X11 with PipeWire — no cross-platform concerns
-- **API**: OpenAI Realtime API (WebSocket) for voice, Claude CLI for task execution
-- **Architecture**: Must integrate with existing hotkey/mode system in `push-to-talk.py` and `indicator.py`
-- **Async**: Claude CLI tasks must be non-blocking — user must be able to keep talking while tasks run
+- **Architecture**: 5-stage asyncio pipeline in `live_session.py`, GTK overlay in `indicator.py`
+- **TTS**: Piper local (22050Hz → 24000Hz resampling), fillers also via Piper
+- **STT**: Local Whisper "small" model, blocking transcription in executor
 
 ## Key Decisions
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Rename "live" → "dictate" | Free up "live" name for the more fitting real-time voice mode | — Pending |
-| OpenAI Realtime as voice layer, Claude CLI as work layer | Realtime gives low-latency voice; Claude gives deep code capabilities | — Pending |
-| Hold-to-talk (not toggle or always-listening) | Consistent with existing PTT UX, user is familiar with it | — Pending |
-| Each Claude task gets isolated context | Prevents confusion when multiple tasks run concurrently | — Pending |
+| Claude CLI pipeline instead of OpenAI Realtime | Direct Claude access, no API key dependency for LLM, lower cost | ✓ Good |
+| Local Whisper + Piper instead of cloud STT/TTS | Zero latency dependency on cloud, works offline | ✓ Good |
+| Non-verbal fillers only | Semantic fillers (smart filler, "okay", "sure") conflict with LLM response | — Pending |
+| Filler clip factory subprocess | Generate varied non-verbal clips, rotate pool, evaluate naturalness | — Pending |
+| Gate STT for barge-in instead of mic mute | Mic must stay live for VAD to detect speech during playback | — Pending |
 
 ---
-*Last updated: 2026-02-13 after initialization*
+*Last updated: 2026-02-17 after v1.1 milestone start*

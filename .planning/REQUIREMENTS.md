@@ -44,6 +44,38 @@
 - [x] **LIVE-03**: Session memory — conversation persists across PTT presses within a session
 - [x] **LIVE-04**: Session start/stop cleanly initializes and tears down task registry
 
+## v1.1 Requirements: Voice UX Polish
+
+### Filler System
+
+- [ ] **FILL-01**: Remove Ollama smart filler generation entirely — no LLM-generated filler text
+- [ ] **FILL-02**: Live session uses only non-verbal canned audio clips as fillers (breaths, hums, etc.)
+- [ ] **FILL-03**: Clip factory subprocess generates new non-verbal clips via Piper TTS
+- [ ] **FILL-04**: Clip pool has a configurable size cap with rotation (phase out old, generate new)
+- [ ] **FILL-05**: Clip factory evaluates naturalness of generated clips before adding to pool
+
+### STT Reliability
+
+- [x] **STT-01**: Whisper no_speech_prob filtering rejects non-speech segments (committed)
+- [ ] **STT-02**: False trigger rate reduced — throat clearing, coughs, ambient noise don't trigger transcription
+
+### Speech Flow
+
+- [x] **FLOW-01**: Tool-use text suppression — only final post-tool response is spoken (committed)
+- [x] **FLOW-02**: Inter-tool narration is discarded via post_tool_buffer (committed)
+
+### Barge-in
+
+- [ ] **BARGE-01**: User can interrupt AI mid-speech by speaking
+- [ ] **BARGE-02**: VAD detects speech during playback without muting the mic
+- [ ] **BARGE-03**: Interruption cancels current TTS playback and queued audio
+- [ ] **BARGE-04**: Interrupted speech is not sent as context (or marked as interrupted)
+
+### Overlay
+
+- [x] **OVL-01**: All status states (listening, thinking, tool_use, speaking, idle, muted) render correctly (committed)
+- [x] **OVL-02**: Status history panel shows transitions with timestamps (committed)
+
 ## v2 Requirements
 
 ### Resilience
@@ -104,11 +136,27 @@
 | LIVE-03 | Phase 1 | Complete |
 | LIVE-04 | Phase 1 | Complete |
 
+| FILL-01 | Phase 4 | Pending |
+| FILL-02 | Phase 4 | Pending |
+| FILL-03 | Phase 4 | Pending |
+| FILL-04 | Phase 4 | Pending |
+| FILL-05 | Phase 4 | Pending |
+| STT-01 | Phase 6 | Complete (pre-work) |
+| STT-02 | Phase 6 | Pending |
+| FLOW-01 | Phase 6 | Complete (pre-work) |
+| FLOW-02 | Phase 6 | Complete (pre-work) |
+| BARGE-01 | Phase 5 | Pending |
+| BARGE-02 | Phase 5 | Pending |
+| BARGE-03 | Phase 5 | Pending |
+| BARGE-04 | Phase 5 | Pending |
+| OVL-01 | Phase 6 | Complete (pre-work) |
+| OVL-02 | Phase 6 | Complete (pre-work) |
+
 **Coverage:**
-- v1 requirements: 24 total
-- Mapped to phases: 24
+- v1.0 requirements: 24 total, all mapped
+- v1.1 requirements: 15 total, all mapped to phases 4-6
 - Unmapped: 0
 
 ---
 *Requirements defined: 2026-02-13*
-*Last updated: 2026-02-15 after Phase 2 completion*
+*Last updated: 2026-02-17 — v1.1 requirements added*
