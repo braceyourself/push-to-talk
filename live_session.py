@@ -1272,7 +1272,8 @@ class LiveSession:
         print("STT: Using local Whisper", flush=True)
         audio_buffer = bytearray()
         SILENCE_THRESHOLD = 18   # RMS below this = silence (ambient ~10)
-        SILENCE_DURATION = 0.8   # seconds of silence to trigger transcription
+        SILENCE_DURATION_NORMAL = 0.8     # seconds of silence to trigger transcription
+        SILENCE_DURATION_POST_BARGE = 0.4 # Faster response after interruption
         SPEECH_ENERGY_MIN = 25   # Per-chunk RMS to flag speech (just above ambient)
         SPEECH_CHUNKS_MIN = 5    # Need ~425ms of speech-level audio
         MIN_BUFFER_SECONDS = 0.5 # Minimum buffer length to transcribe
@@ -1323,6 +1324,7 @@ class LiveSession:
                                     generation_id=self.generation_id,
                                     data=transcript
                                 ))
+                                self._post_barge_in = False
                             elif transcript:
                                 print(f"STT: Rejected hallucination: \"{transcript}\"", flush=True)
                         else:
@@ -1395,34 +1397,37 @@ class LiveSession:
                 if rms < SILENCE_THRESHOLD:
                     if silence_start is None:
                         silence_start = time.time()
-                    elif time.time() - silence_start > SILENCE_DURATION and has_speech and len(audio_buffer) > int(SAMPLE_RATE * MIN_BUFFER_SECONDS * BYTES_PER_SAMPLE):
-                        # Silence detected after speech — transcribe
-                        pcm_data = bytes(audio_buffer)
-                        buf_seconds = len(pcm_data) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
-                        print(f"STT: Transcribing {buf_seconds:.1f}s buffer (peak RMS: {peak_rms:.0f})", flush=True)
-                        audio_buffer.clear()
-                        silence_start = None
-                        has_speech = False
-                        speech_chunk_count = 0
-                        peak_rms = 0.0
+                    else:
+                        current_silence_duration = SILENCE_DURATION_POST_BARGE if self._post_barge_in else SILENCE_DURATION_NORMAL
+                        if time.time() - silence_start > current_silence_duration and has_speech and len(audio_buffer) > int(SAMPLE_RATE * MIN_BUFFER_SECONDS * BYTES_PER_SAMPLE):
+                            # Silence detected after speech — transcribe
+                            pcm_data = bytes(audio_buffer)
+                            buf_seconds = len(pcm_data) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+                            print(f"STT: Transcribing {buf_seconds:.1f}s buffer (peak RMS: {peak_rms:.0f})", flush=True)
+                            audio_buffer.clear()
+                            silence_start = None
+                            has_speech = False
+                            speech_chunk_count = 0
+                            peak_rms = 0.0
 
-                        # Run Whisper in executor to avoid blocking event loop
-                        transcript = await asyncio.get_event_loop().run_in_executor(
-                            None, self._whisper_transcribe, pcm_data
-                        )
-                        if transcript and not _is_hallucination(transcript):
-                            print(f"STT [whisper]: {transcript}", flush=True)
-                            await self._stt_out_q.put(PipelineFrame(
-                                type=FrameType.END_OF_UTTERANCE,
-                                generation_id=self.generation_id
-                            ))
-                            await self._stt_out_q.put(PipelineFrame(
-                                type=FrameType.TRANSCRIPT,
-                                generation_id=self.generation_id,
-                                data=transcript
-                            ))
-                        elif transcript:
-                            print(f"STT: Rejected hallucination: \"{transcript}\"", flush=True)
+                            # Run Whisper in executor to avoid blocking event loop
+                            transcript = await asyncio.get_event_loop().run_in_executor(
+                                None, self._whisper_transcribe, pcm_data
+                            )
+                            if transcript and not _is_hallucination(transcript):
+                                print(f"STT [whisper]: {transcript}", flush=True)
+                                await self._stt_out_q.put(PipelineFrame(
+                                    type=FrameType.END_OF_UTTERANCE,
+                                    generation_id=self.generation_id
+                                ))
+                                await self._stt_out_q.put(PipelineFrame(
+                                    type=FrameType.TRANSCRIPT,
+                                    generation_id=self.generation_id,
+                                    data=transcript
+                                ))
+                                self._post_barge_in = False
+                            elif transcript:
+                                print(f"STT: Rejected hallucination: \"{transcript}\"", flush=True)
                 else:
                     silence_start = None
 
