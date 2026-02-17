@@ -3,7 +3,9 @@ __pycache__/
 *.pyc
 status
 *.wav
+!audio/fillers/**/*.wav
 config.json
 CLAUDE.md
 piper-voices/
 claude-session/
+models/

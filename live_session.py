@@ -1,186 +1,183 @@
 #!/usr/bin/env python3
 """
-Live voice conversation session using OpenAI Realtime API.
-Connects via WebSocket for real-time voice-to-voice conversation
-with personality loading, idle timeout, and context summarization.
+Live voice conversation session using a cascaded pipeline:
+  Streaming STT (Deepgram) -> Claude CLI (streaming + MCP tools) -> OpenAI TTS -> PyAudio playback
+
+Uses the locally installed Claude CLI for LLM processing — no Anthropic API key required.
+Tools are exposed via an MCP server that proxies calls back to this process over a Unix socket.
 """
 
 import os
+import sys
 import json
-import base64
 import asyncio
 import subprocess
 import time
+import re
+import wave
+import random
+import tempfile
+import shutil
+from collections import deque
 from pathlib import Path
 
+from pipeline_frames import PipelineFrame, FrameType
 from task_manager import TaskManager, ClaudeTask, TaskStatus
 
-try:
-    import websockets
-    WEBSOCKETS_AVAILABLE = True
-except ImportError:
-    WEBSOCKETS_AVAILABLE = False
-
-# Audio settings for OpenAI Realtime API
+# Audio settings
 SAMPLE_RATE = 24000
 CHANNELS = 1
-CHUNK_SIZE = 4096
+CHUNK_SIZE = 4096  # bytes per read from pw-record
+BYTES_PER_SAMPLE = 2  # 16-bit PCM
 
-# OpenAI Realtime API endpoint
-REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17"
+# Filler categories and keyword patterns for context-sensitive selection
+FILLER_TOOL_KEYWORDS = {"task", "spawn", "run", "check", "cancel", "status", "fix", "debug", "refactor", "build", "deploy"}
+FILLER_THINKING_KEYWORDS = {"think", "opinion", "should", "best", "recommend", "explain", "why", "how", "compare"}
 
-# Context management thresholds
-SUMMARY_TRIGGER = 20000  # tokens before triggering summarization
-KEEP_LAST_TURNS = 3
-REALTIME_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"}      # turns to preserve when summarizing
+# TTS sentence buffer — accumulate text until a sentence boundary before sending to TTS
+SENTENCE_END_RE = re.compile(r'[.!?]\s|[.!?]$|\n')
 
-# Task management tools for OpenAI Realtime API function calling
-TASK_TOOLS = [
-    {
-        "type": "function",
-        "name": "spawn_task",
-        "description": (
-            "Start a Claude CLI task in the background. Use when the user asks you to do "
-            "real work -- coding, refactoring, debugging, analysis. Return immediately with "
-            "a brief acknowledgment. Keep acknowledgments short, every word takes time to speak."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Short descriptive name, 2-4 words"
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "Detailed prompt for Claude CLI to execute"
-                },
-                "project_dir": {
-                    "type": "string",
-                    "description": "Absolute path to the project directory where Claude should work"
-                }
-            },
-            "required": ["name", "prompt", "project_dir"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "list_tasks",
-        "description": (
-            "List all tasks with their current status. Use when the user asks what tasks "
-            "are running or wants a status update. Summarize concisely -- every word costs "
-            "time to speak aloud."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "required": []
-        }
-    },
-    {
-        "type": "function",
-        "name": "get_task_status",
-        "description": "Get status of a specific task by name or number.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "identifier": {
-                    "type": "string",
-                    "description": "Task name, partial name, or ID number"
-                }
-            },
-            "required": ["identifier"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "get_task_result",
-        "description": (
-            "Read a task's output. For completed tasks, summarizes what was accomplished. "
-            "For running tasks, shows recent progress. Keep spoken summaries brief."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "identifier": {
-                    "type": "string",
-                    "description": "Task name, partial name, or ID number"
-                },
-                "tail_lines": {
-                    "type": "integer",
-                    "description": "Number of output lines to return from the end -- use fewer for quick summaries, more for detailed results"
-                }
-            },
-            "required": ["identifier"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "cancel_task",
-        "description": "Cancel a running task. No confirmation needed -- just do it.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "identifier": {
-                    "type": "string",
-                    "description": "Task name, partial name, or ID number"
-                }
-            },
-            "required": ["identifier"]
-        }
-    },
-]
+# Supported OpenAI TTS voices
+TTS_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer"}
+
+# Piper TTS configuration
+PIPER_CMD = str(Path.home() / ".local" / "share" / "push-to-talk" / "venv" / "bin" / "piper")
+PIPER_MODEL = str(Path.home() / ".local" / "share" / "push-to-talk" / "piper-voices" / "en_US-lessac-medium.onnx")
+PIPER_SAMPLE_RATE = 22050
 
 
-class ConversationState:
-    """Tracks conversation turns for context management."""
+class CircuitBreaker:
+    """Track consecutive failures per service and trip to fallback."""
 
-    def __init__(self):
-        self.history = []        # list of {role, item_id, text}
-        self.summary_count = 0
-        self.latest_tokens = 0
-        self.summarizing = False
+    def __init__(self, name, max_failures=3, recovery_time=60):
+        self.name = name
+        self.max_failures = max_failures
+        self.recovery_time = recovery_time
+        self.failures = 0
+        self.tripped = False
+        self.tripped_at = 0
+
+    def record_failure(self):
+        self.failures += 1
+        if self.failures >= self.max_failures:
+            self.tripped = True
+            self.tripped_at = time.time()
+            print(f"Circuit breaker: {self.name} tripped after {self.failures} failures", flush=True)
+
+    def record_success(self):
+        self.failures = 0
+        if self.tripped:
+            self.tripped = False
+            print(f"Circuit breaker: {self.name} recovered", flush=True)
+
+    def is_tripped(self) -> bool:
+        if self.tripped and (time.time() - self.tripped_at) > self.recovery_time:
+            # Auto-retry after recovery period
+            print(f"Circuit breaker: {self.name} attempting recovery", flush=True)
+            self.tripped = False
+            self.failures = 0
+        return self.tripped
 
 
 class LiveSession:
-    """OpenAI Realtime voice session with personality and memory."""
+    """Cascaded voice pipeline: STT -> Claude CLI -> TTS -> Playback."""
 
-    def __init__(self, api_key, voice="ash", on_status=None):
-        self.api_key = api_key
-        self.voice = voice if voice in REALTIME_VOICES else "ash"
+    def __init__(self, openai_api_key=None, deepgram_api_key=None,
+                 voice="ash", model="claude-sonnet-4-5-20250929", on_status=None,
+                 fillers_enabled=True, barge_in_enabled=True, whisper_model=None):
+        self.openai_api_key = openai_api_key
+        self.deepgram_api_key = deepgram_api_key
+        self.whisper_model = whisper_model
+        self.voice = voice if voice in TTS_VOICES else "ash"
+        self.model = model
         self.on_status = on_status or (lambda s: None)
-        self.ws = None
+
         self.running = False
-        self.audio_player = None
         self.playing_audio = False
         self.audio_done_time = 0
         self._interrupt_requested = False
-        self.conversation = ConversationState()
-        self.personality_prompt = self._build_personality()
-        self._idle_timer = None
-        self._idle_timeout = 120  # 2 minutes
-        self._unmute_task = None  # Track pending delayed_unmute to cancel on new audio
-        self.muted = False  # User-toggled mute via overlay click
-        self.task_manager = TaskManager()
-        self._notification_queue = []  # Task completion/failure notifications
+        self.muted = False
+        self._spoken_filler = None  # Text spoken as filler, for dedup
 
-        # Register task lifecycle callbacks
+        # Generation ID for interrupt coherence — all frames carry this.
+        # On interrupt, ID increments; stages discard stale frames.
+        self.generation_id = 0
+
+        self.personality_prompt = self._build_personality()
+
+        self._idle_timer = None
+        self._idle_timeout = 120  # seconds
+
+        # Playback state
+        self._playback_buffer = deque()
+        self._bytes_played = 0
+
+        # Task manager
+        self.task_manager = TaskManager()
+        self._notification_queue = []
         self.task_manager.on('on_task_complete', self._on_task_complete)
         self.task_manager.on('on_task_failed', self._on_task_failed)
+
+        # Mic mute state tracking
+        self._unmute_task = None
+
+        # Conversation logging and learner
+        self._session_log_path = None
+        self._learner_process = None
+
+        # Filler system
+        self.fillers_enabled = fillers_enabled
+        self._filler_clips = {}  # {category: [pcm_bytes, ...]}
+        self._last_filler = {}   # {category: index} for no-repeat guard
+        self._filler_cancel = None  # asyncio.Event to cancel filler playback
+        if self.fillers_enabled:
+            self._load_filler_clips()
+
+        # Barge-in (VAD) system
+        self.barge_in_enabled = barge_in_enabled
+        self._vad_model = None
+        self._vad_state = None
+
+        # Circuit breakers for service fallback
+        self._stt_breaker = CircuitBreaker("STT/Deepgram")
+        self._tts_breaker = CircuitBreaker("TTS/OpenAI")
+
+        # Pipeline queues (created in run())
+        self._audio_in_q = None
+        self._stt_out_q = None
+        self._llm_out_q = None
+        self._audio_out_q = None
+
+        # STT flush signal — set when mic mutes to flush accumulated transcripts
+        self._stt_flush_event = None  # Created in run()
+        self._loop = None  # Event loop reference for thread-safe calls
+
+        # Claude CLI subprocess and IPC
+        self._cli_process = None
+        self._cli_ready = False
+        self._last_send_time = None
+        self._tool_ipc_server = None
+        self._tool_socket_path = None
+        self._mcp_config_path = None
+
+        # Find claude CLI
+        self._claude_cli_path = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+
+    # ── Personality (reused unchanged) ──────────────────────────────
 
     def _build_personality(self):
         """Load personality from .md files, memories, and CLAUDE.md context."""
         parts = []
         personality_dir = Path(__file__).parent / "personality"
 
-        # 1. Core personality files (personality/*.md)
+        # 1. Core personality files
         if personality_dir.exists():
             for md_file in sorted(personality_dir.glob("*.md")):
                 content = md_file.read_text().strip()
                 if content:
                     parts.append(content)
 
-        # 2. Persistent memories (personality/memories/*.md)
+        # 2. Persistent memories
         memories_dir = personality_dir / "memories"
         if memories_dir.exists():
             memory_files = sorted(memories_dir.glob("*.md"))
@@ -193,14 +190,14 @@ class LiveSession:
                 if memory_parts:
                     parts.append("# Memories\n\n" + "\n\n".join(memory_parts))
 
-        # 3. User global context (~/.claude/CLAUDE.md)
+        # 3. User global context
         global_claude = Path.home() / ".claude" / "CLAUDE.md"
         if global_claude.exists():
             content = global_claude.read_text().strip()
             if content:
                 parts.append(f"# User Context\n\n{content}")
 
-        # 4. Project context (./CLAUDE.md relative to this script)
+        # 4. Project context
         project_claude = Path(__file__).parent / "CLAUDE.md"
         if project_claude.exists():
             content = project_claude.read_text().strip()
@@ -209,15 +206,44 @@ class LiveSession:
 
         return "\n\n".join(parts)
 
+    # ── Conversation Logger ──────────────────────────────────────────
+
+    def _log_event(self, event_type, **kwargs):
+        """Append a JSONL event to the session log file."""
+        if not self._session_log_path:
+            return
+        entry = {"ts": time.time(), "type": event_type, **kwargs}
+        try:
+            with open(self._session_log_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception as e:
+            print(f"Live session: Log write error: {e}", flush=True)
+
+    def _spawn_learner(self):
+        """Spawn the background learner daemon that watches the conversation log."""
+        learner_script = Path(__file__).parent / "learner.py"
+        if not learner_script.exists():
+            print("Live session: learner.py not found, skipping", flush=True)
+            return
+        cmd = [sys.executable, str(learner_script), str(self._session_log_path)]
+        try:
+            self._learner_process = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+            print(f"Live session: Learner spawned (PID {self._learner_process.pid})", flush=True)
+        except Exception as e:
+            print(f"Live session: Failed to spawn learner: {e}", flush=True)
+
+    # ── Task tools (reused unchanged) ──────────────────────────────
+
     def _resolve_task(self, identifier: str) -> ClaudeTask | None:
         """Resolve a task identifier (name or ID) to a ClaudeTask."""
-        # Try as integer ID first
         try:
             task_id = int(identifier)
             return self.task_manager.get_task(task_id)
         except ValueError:
             pass
-        # Try name match
         return self.task_manager.find_task_by_name(identifier)
 
     async def _execute_tool(self, name: str, args: dict) -> str:
@@ -231,9 +257,7 @@ class LiveSession:
                     task_name, prompt, Path(project_dir)
                 )
                 return json.dumps({
-                    "id": task.id,
-                    "name": task.name,
-                    "status": task.status.value
+                    "id": task.id, "name": task.name, "status": task.status.value
                 })
             except ValueError as e:
                 return json.dumps({"error": str(e)})
@@ -245,11 +269,9 @@ class LiveSession:
             for t in tasks:
                 info = {"id": t.id, "name": t.name, "status": t.status.value}
                 if t.status == TaskStatus.COMPLETED and t.completed_at and t.started_at:
-                    duration = t.completed_at - t.started_at
-                    info["duration"] = f"completed in {duration:.1f}s"
+                    info["duration"] = f"completed in {t.completed_at - t.started_at:.1f}s"
                 elif t.status == TaskStatus.RUNNING and t.started_at:
-                    duration = now - t.started_at
-                    info["duration"] = f"running for {duration:.1f}s"
+                    info["duration"] = f"running for {now - t.started_at:.1f}s"
                 elif t.status == TaskStatus.PENDING:
                     info["duration"] = "pending"
                 result.append(info)
@@ -262,16 +284,13 @@ class LiveSession:
                 return json.dumps({"error": f"No task found matching '{identifier}'"})
             now = time.time()
             info = {
-                "id": task.id,
-                "name": task.name,
-                "status": task.status.value,
+                "id": task.id, "name": task.name, "status": task.status.value,
                 "project_dir": str(task.project_dir),
             }
             if task.status == TaskStatus.COMPLETED and task.completed_at and task.started_at:
                 info["duration"] = f"completed in {task.completed_at - task.started_at:.1f}s"
             elif task.status == TaskStatus.RUNNING and task.started_at:
                 info["duration"] = f"running for {now - task.started_at:.1f}s"
-            # Last 5 lines of output as recent_output
             output_lines = list(task.output_lines)
             info["recent_output"] = output_lines[-5:] if output_lines else []
             return json.dumps(info)
@@ -286,11 +305,8 @@ class LiveSession:
             lines = output.split('\n') if output else []
             tail = lines[-tail_lines:] if len(lines) > tail_lines else lines
             return json.dumps({
-                "id": task.id,
-                "name": task.name,
-                "status": task.status.value,
-                "output": '\n'.join(tail),
-                "total_lines": len(lines)
+                "id": task.id, "name": task.name, "status": task.status.value,
+                "output": '\n'.join(tail), "total_lines": len(lines)
             })
 
         elif name == "cancel_task":
@@ -304,66 +320,73 @@ class LiveSession:
             else:
                 return json.dumps({"success": False, "message": f"Task '{task.name}' is not running"})
 
+        elif name == "send_notification":
+            title = args.get("title", "Notification")
+            body = args.get("body", "")
+            urgency = args.get("urgency", "normal")
+            try:
+                import subprocess as _sp
+                cmd = ['notify-send', '-u', urgency, title, body]
+                _sp.Popen(cmd, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                return json.dumps({"success": True})
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+
         else:
             return json.dumps({"error": f"Unknown tool: {name}"})
 
+    # ── Notifications ──────────────────────────────────────────────
+
     async def _on_task_complete(self, task):
-        """Handle task completion -- queue notification for delivery."""
-        if not self.running or not self.ws:
+        """Handle task completion — queue notification for delivery."""
+        if not self.running:
             return
         duration = (task.completed_at or time.time()) - (task.started_at or task.created_at)
-        # Get last few lines of output for summary context
         output_tail = '\n'.join(list(task.output_lines)[-20:])
-        notification = {
+        self._notification_queue.append({
             "type": "task_complete",
-            "task_id": task.id,
-            "task_name": task.name,
+            "task_id": task.id, "task_name": task.name,
             "duration": f"{duration:.1f}s",
             "output_summary": output_tail[:1500],
             "project_dir": str(task.project_dir)
-        }
-        self._notification_queue.append(notification)
+        })
         print(f"Live session: Queued completion notification for task {task.id} '{task.name}'", flush=True)
-
-        # If not currently speaking, flush immediately
         if not self.playing_audio:
             await self._flush_notifications()
 
     async def _on_task_failed(self, task):
-        """Handle task failure -- queue notification for delivery."""
-        if not self.running or not self.ws:
+        """Handle task failure — queue notification for delivery."""
+        if not self.running:
             return
         duration = (task.completed_at or time.time()) - (task.started_at or task.created_at)
         output_tail = '\n'.join(list(task.output_lines)[-20:])
-        notification = {
+        self._notification_queue.append({
             "type": "task_failed",
-            "task_id": task.id,
-            "task_name": task.name,
+            "task_id": task.id, "task_name": task.name,
             "duration": f"{duration:.1f}s",
             "exit_code": task.return_code,
             "error_output": output_tail[:1500],
             "project_dir": str(task.project_dir)
-        }
-        self._notification_queue.append(notification)
+        })
         print(f"Live session: Queued failure notification for task {task.id} '{task.name}'", flush=True)
-
         if not self.playing_audio:
             await self._flush_notifications()
 
     async def _flush_notifications(self):
-        """Deliver any queued task notifications to the conversation."""
-        if not self._notification_queue or not self.ws or not self.running:
+        """Deliver queued task notifications by sending to CLI."""
+        if not self._notification_queue or not self.running:
+            return
+        if not self._cli_process or not self._cli_ready:
             return
 
-        # Drain the queue
         notifications = self._notification_queue[:]
         self._notification_queue.clear()
 
         for notification in notifications:
             notif_type = notification["type"]
-            task_name = notification["task_name"]
 
             if notif_type == "task_complete":
+                task_name = notification["task_name"]
                 message = (
                     f"[Task notification] Task '{task_name}' (ID {notification['task_id']}) "
                     f"completed successfully in {notification['duration']}. "
@@ -372,6 +395,7 @@ class LiveSession:
                     f"Inform the user briefly that this task finished. One or two sentences max."
                 )
             elif notif_type == "task_failed":
+                task_name = notification["task_name"]
                 message = (
                     f"[Task notification] Task '{task_name}' (ID {notification['task_id']}) "
                     f"failed after {notification['duration']} with exit code {notification['exit_code']}. "
@@ -379,356 +403,789 @@ class LiveSession:
                     f"Error output:\n{notification['error_output']}\n\n"
                     f"Inform the user briefly that this task failed and what went wrong. Keep it short."
                 )
+            elif notif_type == "learning":
+                message = (
+                    f"[Learning notification] You just learned something new about the user: "
+                    f"{notification['summary']}\n\n"
+                    f"Briefly and naturally mention what you learned. Don't be robotic about it."
+                )
             else:
                 continue
 
-            print(f"Live session: Delivering notification for task '{task_name}'", flush=True)
+            print(f"Live session: Delivering {notif_type} notification", flush=True)
+            await self._send_to_cli(message)
+            await self._read_cli_response()
 
-            # Inject as system message so AI can speak about it
-            await self.ws.send(json.dumps({
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "system",
-                    "content": [{"type": "input_text", "text": message}]
-                }
-            }))
-
-            # Trigger AI to speak the notification
-            await self.ws.send(json.dumps({
-                "type": "response.create"
-            }))
-
-    async def _inject_task_context(self):
-        """Inject current task status into conversation for ambient awareness."""
-        if not self.ws or not self.running:
-            return
+    def _build_task_context(self) -> str:
+        """Build ambient task context string to prepend to user messages."""
         running = self.task_manager.get_running_tasks()
         recent_completed = [
             t for t in self.task_manager.get_all_tasks()
             if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
-            and t.completed_at and (time.time() - t.completed_at) < 300  # last 5 min
+            and t.completed_at and (time.time() - t.completed_at) < 300
         ]
-
         if not running and not recent_completed:
-            return
+            return ""
 
         parts = []
         if running:
-            task_strs = [f"'{t.name}' (running {time.time() - (t.started_at or t.created_at):.0f}s)" for t in running]
+            task_strs = [
+                f"'{t.name}' (running {time.time() - (t.started_at or t.created_at):.0f}s)"
+                for t in running
+            ]
             parts.append(f"Running tasks: {', '.join(task_strs)}")
         if recent_completed:
             task_strs = [f"'{t.name}' ({t.status.value})" for t in recent_completed[:3]]
             parts.append(f"Recently finished: {', '.join(task_strs)}")
 
-        context = "[Background task status] " + ". ".join(parts)
+        return "[Background task status] " + ". ".join(parts)
 
-        await self.ws.send(json.dumps({
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "system",
-                "content": [{"type": "input_text", "text": context}]
-            }
-        }))
+    # ── Status and timers ──────────────────────────────────────────
 
     def _set_status(self, status):
-        """Update status via callback."""
         self.on_status(status)
 
-    async def connect(self):
-        """Connect to OpenAI Realtime API and configure session."""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "OpenAI-Beta": "realtime=v1"
+    def _reset_idle_timer(self):
+        self._cancel_idle_timer()
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                self._idle_timer = loop.call_later(self._idle_timeout, self._on_idle_timeout)
+        except RuntimeError:
+            pass
+
+    def _cancel_idle_timer(self):
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+
+    def _on_idle_timeout(self):
+        print(f"Live session: Idle timeout ({self._idle_timeout}s), disconnecting", flush=True)
+        self.running = False
+
+    # ── Mic mute/unmute ────────────────────────────────────────────
+
+    def _mute_mic(self):
+        subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '1'], capture_output=True)
+
+    def _unmute_mic(self):
+        subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'], capture_output=True)
+
+    # ── Filler System ────────────────────────────────────────────────
+
+    def _load_filler_clips(self):
+        """Load pre-generated filler WAV files as raw PCM bytes."""
+        filler_dir = Path(__file__).parent / "audio" / "fillers"
+        if not filler_dir.exists():
+            print("Live session: No filler directory found, fillers disabled", flush=True)
+            self.fillers_enabled = False
+            return
+
+        for category in ("acknowledge", "thinking", "tool_use"):
+            cat_dir = filler_dir / category
+            if not cat_dir.exists():
+                continue
+            clips = []
+            for wav_path in sorted(cat_dir.glob("*.wav")):
+                try:
+                    with wave.open(str(wav_path), 'rb') as wf:
+                        pcm = wf.readframes(wf.getnframes())
+                        rate = wf.getframerate()
+                    # Resample to SAMPLE_RATE if needed (e.g. Piper 22050 → 24000)
+                    if rate != SAMPLE_RATE:
+                        pcm = self._resample_22050_to_24000(pcm)
+                    clips.append(pcm)
+                except Exception as e:
+                    print(f"Live session: Error loading filler {wav_path}: {e}", flush=True)
+            if clips:
+                self._filler_clips[category] = clips
+                self._last_filler[category] = -1
+
+        total = sum(len(c) for c in self._filler_clips.values())
+        if total == 0:
+            print("Live session: No filler clips loaded, fillers disabled", flush=True)
+            self.fillers_enabled = False
+        else:
+            print(f"Live session: Loaded {total} filler clips across {len(self._filler_clips)} categories", flush=True)
+
+    def _pick_filler(self, category: str) -> bytes | None:
+        """Pick a random filler clip from category, avoiding consecutive repeats."""
+        clips = self._filler_clips.get(category)
+        if not clips:
+            return None
+        if len(clips) == 1:
+            return clips[0]
+
+        last = self._last_filler.get(category, -1)
+        choices = [i for i in range(len(clips)) if i != last]
+        idx = random.choice(choices)
+        self._last_filler[category] = idx
+        return clips[idx]
+
+    def _classify_filler_category(self, text: str) -> str:
+        """Classify user text to select appropriate filler category."""
+        words = set(text.lower().split())
+        if words & FILLER_TOOL_KEYWORDS:
+            return "tool_use"
+        if words & FILLER_THINKING_KEYWORDS:
+            return "thinking"
+        return "acknowledge"
+
+    async def _filler_manager(self, user_text: str, cancel_event: asyncio.Event):
+        """Smart filler: use local LLM for contextual acknowledgment, fall back to clips."""
+
+        # Stage 1: Wait 300ms gate — skip filler if LLM responds fast
+        try:
+            await asyncio.wait_for(cancel_event.wait(), timeout=0.3)
+            return  # LLM responded fast, no filler needed
+        except asyncio.TimeoutError:
+            pass
+
+        if cancel_event.is_set():
+            return
+
+        # Try smart filler via local Ollama
+        filler_text = await self._generate_smart_filler(user_text)
+        if filler_text and not cancel_event.is_set():
+            print(f"  [filler] Smart: \"{filler_text}\"", flush=True)
+            pcm = await self._tts_to_pcm(filler_text)
+            if pcm and not cancel_event.is_set():
+                self._spoken_filler = filler_text
+                await self._play_filler_audio(pcm, cancel_event)
+                return
+
+        # Fallback to canned clips if Ollama failed
+        if not cancel_event.is_set() and self.fillers_enabled:
+            category = self._classify_filler_category(user_text)
+            clip = self._pick_filler("acknowledge")
+            if clip:
+                await self._play_filler_audio(clip, cancel_event)
+
+        # Stage 2: If still waiting after 4s, play a thinking clip
+        try:
+            await asyncio.wait_for(cancel_event.wait(), timeout=4.0)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        if self.fillers_enabled:
+            think_pcm = self._pick_filler("thinking")
+            if think_pcm:
+                await self._play_filler_audio(think_pcm, cancel_event)
+
+    async def _generate_smart_filler(self, user_text: str) -> str | None:
+        """Generate a brief contextual acknowledgment via local Ollama."""
+        import aiohttp
+        prompt = (
+            "Say a brief 2-4 word reaction. ONLY the reaction, no explanation.\n"
+            'User: "Hello" → Hey there.\n'
+            'User: "How are you?" → Doing great.\n'
+            'User: "Check the tests" → Checking now.\n'
+            'User: "What does this function do?" → Let me look.\n'
+            'User: "Fix the login bug" → On it.\n'
+            f'User: "{user_text}" →'
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "http://localhost:11434/api/generate",
+                    json={
+                        "model": "qwen2.5:1.5b",
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"num_predict": 15, "temperature": 0.9},
+                    },
+                    timeout=aiohttp.ClientTimeout(total=1.5),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        text = data.get("response", "").strip().strip('"\'').split("\n")[0].strip()
+                        # Sanity check: reject if too long, contains markdown, or is a full answer
+                        if text and len(text) < 30 and "*" not in text and "#" not in text and "?" not in text:
+                            return text
+        except Exception as e:
+            print(f"  [filler] Ollama error: {e}", flush=True)
+        return None
+
+    async def _tts_to_pcm(self, text: str) -> bytes | None:
+        """Convert text to PCM audio via Piper. Returns resampled 24kHz bytes."""
+        try:
+            process = await asyncio.create_subprocess_exec(
+                PIPER_CMD, '--model', PIPER_MODEL, '--output-raw',
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            stdout, _ = await asyncio.wait_for(
+                process.communicate(input=text.encode()),
+                timeout=3.0
+            )
+            if stdout:
+                return self._resample_22050_to_24000(stdout)
+        except Exception as e:
+            print(f"  [filler] TTS error: {e}", flush=True)
+        return None
+
+    async def _play_filler_audio(self, pcm_data: bytes, cancel_event: asyncio.Event):
+        """Push filler PCM to playback queue as FILLER type frames."""
+        gen_id = self.generation_id
+        offset = 0
+        while offset < len(pcm_data):
+            if cancel_event.is_set() or self.generation_id != gen_id:
+                return
+            chunk = pcm_data[offset:offset + 4096]
+            offset += 4096
+            await self._audio_out_q.put(PipelineFrame(
+                type=FrameType.FILLER,
+                generation_id=gen_id,
+                data=chunk
+            ))
+
+    # ── VAD Barge-in ──────────────────────────────────────────────
+
+    def _load_vad_model(self):
+        """Load Silero VAD ONNX model."""
+        model_path = Path(__file__).parent / "models" / "silero_vad.onnx"
+        if not model_path.exists():
+            print(f"Live session: VAD model not found at {model_path}, barge-in disabled", flush=True)
+            self.barge_in_enabled = False
+            return
+
+        try:
+            import onnxruntime
+            self._vad_model = onnxruntime.InferenceSession(
+                str(model_path),
+                providers=['CPUExecutionProvider']
+            )
+            # Initialize VAD state: h and c tensors (2, 1, 64)
+            import numpy as np
+            self._vad_state = {
+                'h': np.zeros((2, 1, 64), dtype=np.float32),
+                'c': np.zeros((2, 1, 64), dtype=np.float32),
+                'sr': np.array([SAMPLE_RATE], dtype=np.int64)
+            }
+            print("Live session: Silero VAD loaded", flush=True)
+        except Exception as e:
+            print(f"Live session: Failed to load VAD model: {e}", flush=True)
+            self.barge_in_enabled = False
+
+    def _run_vad(self, audio_bytes: bytes) -> float:
+        """Run VAD inference on audio chunk, return speech probability."""
+        if not self._vad_model:
+            return 0.0
+
+        import numpy as np
+
+        # Convert bytes to float32 samples
+        samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+        # Silero VAD expects 512 samples at 16kHz, or 768 at 24kHz
+        # Resample to 16kHz if needed by taking every 1.5th sample (simple decimation)
+        if SAMPLE_RATE == 24000:
+            # Approximate resample 24k->16k by taking 2 of every 3
+            indices = np.arange(0, len(samples), 1.5).astype(int)
+            indices = indices[indices < len(samples)]
+            samples = samples[indices]
+
+        # Pad or trim to 512 samples
+        if len(samples) < 512:
+            samples = np.pad(samples, (0, 512 - len(samples)))
+        else:
+            samples = samples[:512]
+
+        input_data = samples.reshape(1, -1)
+
+        try:
+            ort_inputs = {
+                'input': input_data,
+                'h': self._vad_state['h'],
+                'c': self._vad_state['c'],
+                'sr': self._vad_state['sr']
+            }
+            ort_outputs = self._vad_model.run(None, ort_inputs)
+            prob = ort_outputs[0].item()
+            self._vad_state['h'] = ort_outputs[1]
+            self._vad_state['c'] = ort_outputs[2]
+            return prob
+        except Exception:
+            return 0.0
+
+    async def _vad_monitor_stage(self):
+        """Monitor mic audio during playback for barge-in detection."""
+        if not self.barge_in_enabled:
+            return
+
+        self._load_vad_model()
+        if not self._vad_model:
+            return
+
+        print("Live session: VAD monitor started", flush=True)
+
+        try:
+            while self.running:
+                # TODO: For barge-in to work, we need to gate STT instead of muting mic source.
+                # Currently mic is muted via pactl during playback, so VAD can't hear speech.
+                await asyncio.sleep(0.1)
+
+        except Exception as e:
+            print(f"VAD monitor error: {e}", flush=True)
+
+    # ── Fallback: Whisper STT ────────────────────────────────────
+
+    async def _stt_whisper_fallback(self):
+        """Fallback STT using local Whisper when Deepgram is unavailable."""
+        import numpy as np
+
+        print("STT: Running Whisper fallback mode", flush=True)
+        audio_buffer = bytearray()
+        SILENCE_THRESHOLD = 500  # RMS threshold for silence detection
+        SILENCE_DURATION = 0.7   # seconds of silence to trigger transcription
+
+        silence_start = None
+
+        try:
+            while self.running:
+                try:
+                    frame = self._audio_in_q.get_nowait()
+                    if frame.type == FrameType.AUDIO_RAW:
+                        audio_buffer.extend(frame.data)
+
+                        # Check RMS for silence detection
+                        samples = np.frombuffer(frame.data, dtype=np.int16)
+                        rms = np.sqrt(np.mean(samples.astype(np.float64) ** 2))
+
+                        if rms < SILENCE_THRESHOLD:
+                            if silence_start is None:
+                                silence_start = time.time()
+                            elif time.time() - silence_start > SILENCE_DURATION and len(audio_buffer) > SAMPLE_RATE * 2:
+                                # Silence detected after speech — transcribe
+                                pcm_data = bytes(audio_buffer)
+                                audio_buffer.clear()
+                                silence_start = None
+
+                                # Run Whisper in executor
+                                transcript = await asyncio.get_event_loop().run_in_executor(
+                                    None, self._whisper_transcribe, pcm_data
+                                )
+                                if transcript:
+                                    await self._stt_out_q.put(PipelineFrame(
+                                        type=FrameType.END_OF_UTTERANCE,
+                                        generation_id=self.generation_id
+                                    ))
+                                    await self._stt_out_q.put(PipelineFrame(
+                                        type=FrameType.TRANSCRIPT,
+                                        generation_id=self.generation_id,
+                                        data=transcript
+                                    ))
+                        else:
+                            silence_start = None
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0.02)
+
+        except Exception as e:
+            print(f"Whisper fallback error: {e}", flush=True)
+
+    def _whisper_transcribe(self, pcm_data: bytes) -> str | None:
+        """Transcribe PCM audio using Whisper (blocking, run in executor)."""
+        try:
+            import numpy as np
+            import wave as wave_mod
+
+            if not self.whisper_model:
+                import whisper
+                self.whisper_model = whisper.load_model("small")
+
+            # Write to temp WAV file for Whisper
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+                tmp_path = tmp.name
+                with wave_mod.open(tmp_path, 'wb') as wf:
+                    wf.setnchannels(CHANNELS)
+                    wf.setsampwidth(BYTES_PER_SAMPLE)
+                    wf.setframerate(SAMPLE_RATE)
+                    wf.writeframes(pcm_data)
+
+            result = self.whisper_model.transcribe(tmp_path, language="en")
+            text = result.get("text", "").strip()
+
+            os.unlink(tmp_path)
+            return text if text else None
+
+        except Exception as e:
+            print(f"Whisper transcribe error: {e}", flush=True)
+            return None
+
+    # ── Fallback: Piper TTS ──────────────────────────────────────
+
+    async def _tts_piper_fallback(self, text: str, gen_id: int):
+        """Fallback TTS using local Piper (used by filler system)."""
+        try:
+            process = await asyncio.create_subprocess_exec(
+                PIPER_CMD, '--model', PIPER_MODEL, '--output-raw',
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            stdout, _ = await process.communicate(input=text.encode())
+            if stdout and self.generation_id == gen_id:
+                resampled = self._resample_22050_to_24000(stdout)
+                offset = 0
+                while offset < len(resampled):
+                    if self.generation_id != gen_id:
+                        break
+                    chunk = resampled[offset:offset + 4096]
+                    offset += 4096
+                    await self._audio_out_q.put(PipelineFrame(
+                        type=FrameType.TTS_AUDIO,
+                        generation_id=gen_id,
+                        data=chunk
+                    ))
+        except Exception as e:
+            print(f"Piper TTS fallback error: {e}", flush=True)
+
+    # ── Claude CLI Management ──────────────────────────────────────
+
+    async def _start_tool_ipc_server(self):
+        """Start Unix socket server for MCP tool call proxying."""
+        self._tool_socket_path = f"/tmp/ptt-tools-{os.getpid()}.sock"
+
+        # Clean up stale socket
+        if os.path.exists(self._tool_socket_path):
+            os.unlink(self._tool_socket_path)
+
+        async def handle_client(reader, writer):
+            try:
+                data = await asyncio.wait_for(reader.readline(), timeout=30)
+                if data:
+                    request = json.loads(data.decode().strip())
+                    tool_name = request.get("tool", "")
+                    args = request.get("args", {})
+                    result = await self._execute_tool(tool_name, args)
+                    writer.write(result.encode() + b"\n")
+                    await writer.drain()
+            except Exception as e:
+                error = json.dumps({"error": str(e)})
+                writer.write(error.encode() + b"\n")
+                try:
+                    await writer.drain()
+                except Exception:
+                    pass
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        self._tool_ipc_server = await asyncio.start_unix_server(
+            handle_client, self._tool_socket_path
+        )
+        print(f"Live session: Tool IPC server started at {self._tool_socket_path}", flush=True)
+
+    async def _stop_tool_ipc_server(self):
+        """Stop the Unix socket server."""
+        if self._tool_ipc_server:
+            self._tool_ipc_server.close()
+            try:
+                await self._tool_ipc_server.wait_closed()
+            except Exception:
+                pass
+        if self._tool_socket_path and os.path.exists(self._tool_socket_path):
+            try:
+                os.unlink(self._tool_socket_path)
+            except Exception:
+                pass
+
+    def _generate_mcp_config(self) -> str:
+        """Generate a temporary MCP config file for the CLI."""
+        mcp_server_script = str(Path(__file__).parent / "task_tools_mcp.py")
+
+        config = {
+            "mcpServers": {
+                "ptt-task-tools": {
+                    "command": "python3",
+                    "args": [mcp_server_script],
+                    "env": {
+                        "PTT_TOOL_SOCKET": self._tool_socket_path
+                    }
+                }
+            }
         }
 
-        self.ws = await websockets.connect(
-            REALTIME_URL,
-            additional_headers=headers,
-            ping_interval=20,
-            max_size=None
+        # Write to temp file
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="ptt-mcp-")
+        with os.fdopen(fd, 'w') as f:
+            json.dump(config, f)
+
+        self._mcp_config_path = path
+        return path
+
+    async def _start_cli_process(self):
+        """Start the Claude CLI subprocess for LLM processing."""
+        t0 = time.time()
+        # Start tool IPC server first
+        await self._start_tool_ipc_server()
+
+        # Generate MCP config pointing to our tool server
+        mcp_config = self._generate_mcp_config()
+
+        # Build command
+        cmd = [
+            self._claude_cli_path,
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--model", self.model,
+            "--system-prompt", self.personality_prompt,
+            "--mcp-config", mcp_config,
+            "--strict-mcp-config",
+        ]
+
+        # Disable all built-in tools — only MCP tools available
+        cmd.extend(["--tools", ""])
+
+        env = {**os.environ}
+        # Unset Claude Code env vars to avoid nesting error
+        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        env.pop("CLAUDECODE", None)
+
+        self._cli_process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
+        self._cli_ready = True
+        print(f"Live session: Claude CLI started (PID {self._cli_process.pid}, model={self.model}) [{time.time()-t0:.2f}s]", flush=True)
 
-        # Configure session with personality and voice settings
-        await self.ws.send(json.dumps({
-            "type": "session.update",
-            "session": {
-                "modalities": ["text", "audio"],
-                "instructions": self.personality_prompt,
-                "voice": self.voice,
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {"model": "whisper-1"},
-                "turn_detection": {
-                    "type": "semantic_vad",
-                    "eagerness": "medium",
-                    "interrupt_response": True
-                },
-                "tools": TASK_TOOLS,
-                "tool_choice": "auto"
-            }
-        }))
+        # Start stderr reader to log CLI errors
+        asyncio.create_task(self._read_cli_stderr())
 
-        print("Live session: Connected", flush=True)
+    async def _stop_cli_process(self):
+        """Stop the Claude CLI subprocess and clean up."""
+        self._cli_ready = False
 
-        # Seed context from previous conversation if available
-        await self.seed_context()
-
-        return True
-
-    async def disconnect(self):
-        """Disconnect from the API and clean up resources."""
-        self.running = False
-        self._cancel_idle_timer()
-
-        if self.ws:
+        if self._cli_process:
             try:
-                await self.ws.close()
+                self._cli_process.stdin.close()
             except Exception:
                 pass
-            self.ws = None
-
-        if self.audio_player:
             try:
-                self.audio_player.terminate()
-                self.audio_player.wait(timeout=2)
+                self._cli_process.terminate()
+                await asyncio.wait_for(self._cli_process.wait(), timeout=5)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                try:
+                    self._cli_process.kill()
+                except Exception:
+                    pass
+            self._cli_process = None
+
+        await self._stop_tool_ipc_server()
+
+        # Clean up temp MCP config
+        if self._mcp_config_path and os.path.exists(self._mcp_config_path):
+            try:
+                os.unlink(self._mcp_config_path)
             except Exception:
                 pass
-            self.audio_player = None
 
-        # Always unmute mic on disconnect
-        subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
-                       capture_output=True)
-        print("Live session: Disconnected", flush=True)
-
-    def start_audio_player(self):
-        """Start the audio player subprocess for PCM16 playback."""
-        self.audio_player = subprocess.Popen(
-            ['aplay', '-r', '24000', '-f', 'S16_LE', '-t', 'raw', '-q'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-
-    async def send_audio(self, audio_data):
-        """Send audio data to the API as base64-encoded PCM16."""
-        if self.ws:
-            encoded = base64.b64encode(audio_data).decode('utf-8')
-            await self.ws.send(json.dumps({
-                "type": "input_audio_buffer.append",
-                "audio": encoded
-            }))
-
-    async def handle_events(self):
-        """Process incoming events from the Realtime API."""
+    async def _read_cli_stderr(self):
+        """Read and log stderr from the CLI process."""
+        if not self._cli_process or not self._cli_process.stderr:
+            return
         try:
-            async for message in self.ws:
-                if not self.running:
+            while True:
+                line = await self._cli_process.stderr.readline()
+                if not line:
+                    break
+                text = line.decode().strip()
+                if text:
+                    print(f"CLI stderr: {text}", flush=True)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _strip_markdown(text: str) -> str:
+        """Strip markdown formatting for TTS output."""
+        import re
+        s = text
+        s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)  # **bold**
+        s = re.sub(r'\*(.+?)\*', r'\1', s)        # *italic*
+        s = re.sub(r'__(.+?)__', r'\1', s)        # __bold__
+        s = re.sub(r'_(.+?)_', r'\1', s)          # _italic_
+        s = re.sub(r'`(.+?)`', r'\1', s)          # `code`
+        s = re.sub(r'^#{1,6}\s+', '', s)           # # headings
+        s = re.sub(r'^[-*+]\s+', '', s)            # - bullet points
+        s = re.sub(r'^\d+\.\s+', '', s)            # 1. numbered lists
+        s = re.sub(r'^>\s+', '', s)                # > blockquotes
+        s = s.replace('```', '')                    # code fences
+        return s.strip()
+
+    async def _send_to_cli(self, text: str):
+        """Send a user message to the CLI subprocess via stream-json."""
+        if not self._cli_process or not self._cli_ready:
+            print("Live session: CLI not ready, dropping message", flush=True)
+            return
+
+        message = json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": text}
+        })
+        try:
+            self._last_send_time = time.time()
+            self._cli_process.stdin.write(message.encode() + b"\n")
+            await self._cli_process.stdin.drain()
+        except Exception as e:
+            print(f"Live session: Error sending to CLI: {e}", flush=True)
+            self._cli_ready = False
+
+    async def _read_cli_response(self):
+        """Read streaming events from CLI until turn is complete. Route text to TTS."""
+        if not self._cli_process or not self._cli_process.stdout:
+            return
+
+        gen_id = self.generation_id
+        sentence_buffer = ""
+        full_response = ""
+        first_text_time = None
+        saw_tool_use = False  # Track if model is making tool calls
+
+        try:
+            while self.running:
+                try:
+                    line = await asyncio.wait_for(
+                        self._cli_process.stdout.readline(),
+                        timeout=120  # 2 min timeout for long tool operations
+                    )
+                except asyncio.TimeoutError:
+                    print("Live session: CLI response timeout", flush=True)
                     break
 
-                # Check for interrupt request
-                if self._interrupt_requested:
-                    self._interrupt_requested = False
-                    await self._interrupt()
+                if not line:
+                    # CLI process ended
+                    print("Live session: CLI process ended unexpectedly", flush=True)
+                    self._cli_ready = False
+                    break
 
-                data = json.loads(message)
-                event_type = data.get("type", "")
+                line_str = line.decode().strip()
+                if not line_str:
+                    continue
 
-                # Log non-audio events for debugging
-                if event_type not in ("response.audio.delta",):
-                    print(f"Live session event: {event_type}", flush=True)
+                try:
+                    event_data = json.loads(line_str)
+                except json.JSONDecodeError:
+                    continue
 
-                if event_type == "response.audio.delta":
-                    # Cancel any pending delayed_unmute -- new audio is starting
-                    if self._unmute_task and not self._unmute_task.done():
-                        self._unmute_task.cancel()
-                        self._unmute_task = None
-                    # Play audio chunk and mute mic to prevent echo
-                    if not self.playing_audio:
-                        self.playing_audio = True
-                        self._set_status("speaking")
-                        subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '1'],
-                                       capture_output=True)
-                    self._reset_idle_timer()
-                    audio_data = base64.b64decode(data.get("delta", ""))
-                    if audio_data and self.audio_player and self.audio_player.stdin:
-                        try:
-                            self.audio_player.stdin.write(audio_data)
-                            self.audio_player.stdin.flush()
-                        except Exception:
-                            pass
+                # Check for interrupt
+                if self.generation_id != gen_id:
+                    # Keep reading until we see the result message, but discard output
+                    if event_data.get("type") == "result":
+                        break
+                    continue
 
-                elif event_type == "response.audio_transcript.delta":
-                    text = data.get("delta", "")
-                    if text:
-                        print(text, end="", flush=True)
+                event_type = event_data.get("type", "")
 
-                elif event_type == "response.audio_transcript.done":
-                    print("", flush=True)
+                if event_type == "stream_event":
+                    event = event_data.get("event", {})
+                    inner_type = event.get("type", "")
 
-                elif event_type == "response.audio.done":
-                    # Audio finished playing - unmute mic after brief delay
-                    self.audio_done_time = time.time()
+                    if inner_type == "content_block_start":
+                        content_block = event.get("content_block", {})
+                        if content_block.get("type") == "tool_use":
+                            # Model is making a tool call — discard any pre-tool narration
+                            if sentence_buffer.strip():
+                                print(f" [suppressed pre-tool text: \"{sentence_buffer.strip()[:60]}\"]", flush=True)
+                                sentence_buffer = ""
+                            saw_tool_use = True
+                            self._set_status("tool_use")
 
-                    async def delayed_unmute():
-                        await asyncio.sleep(0.5)
-                        # Bail if new audio started while we waited
-                        if self._unmute_task and self._unmute_task.cancelled():
-                            return
-                        self.playing_audio = False
-                        subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
-                                       capture_output=True)
-                        self._set_status("listening")
-                        print("Live session: Mic unmuted", flush=True)
+                    elif inner_type == "content_block_delta":
+                        delta = event.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            text = delta.get("text", "")
+                            if first_text_time is None:
+                                first_text_time = time.time()
+                                print(f"\n  [timing] first token: {first_text_time - (self._last_send_time or first_text_time):.2f}s", flush=True)
+                            sentence_buffer += text
+                            full_response += text
+                            print(text, end="", flush=True)
 
-                    self._unmute_task = asyncio.create_task(delayed_unmute())
+                            # Cancel filler on first text from LLM
+                            # Don't drain queued filler frames — let them finish
+                            # playing so the transition isn't jarring
+                            if self._filler_cancel and not self._filler_cancel.is_set():
+                                self._filler_cancel.set()
 
-                elif event_type == "response.done":
-                    # Track conversation turn and token usage
-                    response = data.get("response", {})
-                    usage = response.get("usage", {})
-                    total_tokens = usage.get("total_tokens", 0)
-                    self.conversation.latest_tokens = total_tokens
-
-                    # Extract assistant transcript from output items
-                    output_items = response.get("output", [])
-                    has_function_call = False
-                    for item in output_items:
-                        if item.get("type") == "message" and item.get("role") == "assistant":
-                            item_id = item.get("id", "")
-                            # Extract text from content
-                            content = item.get("content", [])
-                            text = ""
-                            for part in content:
-                                if part.get("type") == "audio":
-                                    text = part.get("transcript", "")
+                            # Flush complete sentences to TTS
+                            while True:
+                                match = SENTENCE_END_RE.search(sentence_buffer)
+                                if not match:
                                     break
-                            self.conversation.history.append({
-                                "role": "assistant",
-                                "item_id": item_id,
-                                "text": text
-                            })
+                                end_pos = match.end()
+                                sentence = sentence_buffer[:end_pos].strip()
+                                sentence_buffer = sentence_buffer[end_pos:]
+                                if sentence:
+                                    # Skip first sentence if it duplicates the filler
+                                    if self._spoken_filler:
+                                        filler_lower = self._spoken_filler.lower().rstrip('.!').strip()
+                                        sent_lower = sentence.lower().rstrip('.!').strip()
+                                        self._spoken_filler = None  # Only check first sentence
+                                        if filler_lower in sent_lower or sent_lower in filler_lower:
+                                            print(f"  [filler] Skipped duplicate: \"{sentence}\"", flush=True)
+                                            continue
+                                    # Strip markdown for TTS
+                                    clean = self._strip_markdown(sentence)
+                                    if clean:
+                                        await self._llm_out_q.put(PipelineFrame(
+                                            type=FrameType.TEXT_DELTA,
+                                            generation_id=gen_id,
+                                            data=clean
+                                        ))
 
-                    # Handle function calls from tool use
-                    for item in output_items:
-                        if item.get("type") == "function_call":
-                            has_function_call = True
-                            call_id = item.get("call_id")
-                            fn_name = item.get("name")
-                            arguments = item.get("arguments", "{}")
-                            print(f"Live session: Tool call - {fn_name}({arguments})", flush=True)
+                elif event_type == "result":
+                    # CLI finished processing this message (including any tool use rounds)
+                    print("", flush=True)  # newline after streaming
+                    break
 
-                            # Execute tool asynchronously
-                            try:
-                                fn_args = json.loads(arguments)
-                                result = await self._execute_tool(fn_name, fn_args)
-                            except Exception as e:
-                                result = json.dumps({"error": str(e)})
-
-                            # Send result back to conversation
-                            await self.ws.send(json.dumps({
-                                "type": "conversation.item.create",
-                                "item": {
-                                    "type": "function_call_output",
-                                    "call_id": call_id,
-                                    "output": result
-                                }
-                            }))
-
-                            # Trigger AI to respond with the result
-                            await self.ws.send(json.dumps({
-                                "type": "response.create"
-                            }))
-
-                    self._reset_idle_timer()
-
-                    # Skip summarize and fallback unmute during tool call cycles --
-                    # those will fire on the final response.done (after tool results)
-                    if not has_function_call:
-                        # Trigger summarization if needed
-                        await self.maybe_summarize()
-
-                        # If audio.done hasn't fired yet, do delayed unmute
-                        if self.playing_audio:
-                            async def fallback_unmute():
-                                await asyncio.sleep(1.0)
-                                if self.playing_audio:
-                                    self.playing_audio = False
-                                    subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
-                                                   capture_output=True)
-                                    self._set_status("listening")
-                                    print("Live session: Mic unmuted (fallback)", flush=True)
-
-                            self._unmute_task = asyncio.create_task(fallback_unmute())
-
-                        # Flush pending task notifications after response completes
-                        if self._notification_queue:
-                            async def delayed_flush():
-                                await asyncio.sleep(1.5)
-                                if not self.playing_audio:
-                                    await self._flush_notifications()
-                            asyncio.create_task(delayed_flush())
-
-                elif event_type == "input_audio_buffer.speech_started":
-                    self.playing_audio = False
-                    subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
-                                   capture_output=True)
-                    self._set_status("listening")
-                    self._reset_idle_timer()
-                    print("\n[Listening...]", flush=True)
-
-                elif event_type == "input_audio_buffer.speech_stopped":
-                    self.playing_audio = True
-                    subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '1'],
-                                   capture_output=True)
-                    self._set_status("speaking")
-                    self._reset_idle_timer()
-                    print("[Processing...]", flush=True)
-
-                    # Inject ambient task awareness before AI responds
-                    await self._inject_task_context()
-
-                elif event_type == "conversation.item.input_audio_transcription.completed":
-                    # Track user turn in conversation history
-                    item_id = data.get("item_id", "")
-                    transcript = data.get("transcript", "").strip()
-                    if transcript:
-                        self.conversation.history.append({
-                            "role": "user",
-                            "item_id": item_id,
-                            "text": transcript
-                        })
-                        print(f"User: {transcript}", flush=True)
-
-                elif event_type == "error":
-                    error = data.get("error", {})
-                    print(f"Live session error: {error}", flush=True)
-                    self._set_status("error")
-
-                elif event_type == "session.created":
-                    session = data.get("session", {})
-                    session_id = session.get("id", "unknown")
-                    print(f"Live session: Session ID {session_id}", flush=True)
-
-        except websockets.exceptions.ConnectionClosed:
-            print("Live session: Connection closed", flush=True)
-            self._set_status("disconnected")
         except Exception as e:
-            print(f"Live session: Event handler error: {e}", flush=True)
+            print(f"Live session: Error reading CLI response: {e}", flush=True)
 
-    async def record_and_send(self):
-        """Record audio from microphone and send to API continuously."""
+        # Log full assistant response
+        if full_response.strip() and self.generation_id == gen_id:
+            self._log_event("assistant", text=full_response.strip())
+
+        # Flush remaining text
+        if sentence_buffer.strip() and self.generation_id == gen_id:
+            clean = self._strip_markdown(sentence_buffer)
+            if clean:
+                await self._llm_out_q.put(PipelineFrame(
+                    type=FrameType.TEXT_DELTA,
+                    generation_id=gen_id,
+                    data=clean
+                ))
+
+        # Signal end of turn
+        if self.generation_id == gen_id:
+            await self._llm_out_q.put(PipelineFrame(
+                type=FrameType.END_OF_TURN,
+                generation_id=gen_id
+            ))
+
+    # ── Pipeline Stage 1: Audio Capture ────────────────────────────
+
+    async def _audio_capture_stage(self):
+        """Record audio from mic via pw-record and push to audio_in queue."""
         process = await asyncio.create_subprocess_exec(
-            'pw-record', '--format', 's16', '--rate', '24000', '--channels', '1', '-',
+            'pw-record', '--format', 's16', '--rate', str(SAMPLE_RATE), '--channels', str(CHANNELS), '-',
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL
         )
-
-        print("Live session: Audio recording started", flush=True)
-        chunks_sent = 0
+        print("Live session: Audio capture started", flush=True)
 
         mute_signal = Path(__file__).parent / "live_mute_toggle"
+        chunks_sent = 0
+
         try:
             while self.running:
                 # Check for mute toggle signal from overlay
@@ -746,7 +1203,6 @@ class LiveSession:
                             self._reset_idle_timer()
                             print("Live session: Muted by user", flush=True)
                         else:
-                            # Legacy toggle
                             self.muted = not self.muted
                             status = "muted" if self.muted else "listening"
                             self._set_status(status)
@@ -755,177 +1211,454 @@ class LiveSession:
                     except Exception:
                         pass
 
+                # Check for learner notification
+                learner_notify = Path(__file__).parent / "learner_notify"
+                if learner_notify.exists():
+                    try:
+                        summary = learner_notify.read_text().strip()
+                        learner_notify.unlink()
+                        if summary:
+                            self._notification_queue.append({"type": "learning", "summary": summary})
+                            print(f"Live session: Learner notification: {summary[:80]}...", flush=True)
+                            if not self.playing_audio:
+                                asyncio.ensure_future(self._flush_notifications())
+                    except Exception:
+                        pass
+
                 audio_data = await process.stdout.read(CHUNK_SIZE)
-                if audio_data:
-                    # Skip sending while AI is speaking, or while user-muted
-                    time_since_audio = time.time() - self.audio_done_time
-                    if not self.muted and not self.playing_audio and time_since_audio > 1.0:
-                        await self.send_audio(audio_data)
-                        chunks_sent += 1
-                        if chunks_sent % 200 == 0:
-                            print(f"Live session: Sent {chunks_sent} audio chunks", flush=True)
-                else:
+                if not audio_data:
                     await asyncio.sleep(0.01)
+                    continue
+
+                # Always send audio to Deepgram to keep the connection alive.
+                # During playback the physical mic is muted (pactl), so Deepgram
+                # gets silence but doesn't timeout. The STT stage ignores
+                # transcripts that arrive during playback.
+                await self._audio_in_q.put(PipelineFrame(
+                    type=FrameType.AUDIO_RAW,
+                    generation_id=self.generation_id,
+                    data=audio_data
+                ))
+                chunks_sent += 1
+                if chunks_sent % 200 == 0:
+                    print(f"Live session: Sent {chunks_sent} audio chunks to STT", flush=True)
+
         finally:
             process.terminate()
             await process.wait()
-            print(f"Live session: Audio recording stopped ({chunks_sent} chunks sent)", flush=True)
+            print(f"Live session: Audio capture stopped ({chunks_sent} chunks)", flush=True)
 
-    async def maybe_summarize(self):
-        """Summarize older conversation turns if approaching token limit."""
-        if self.conversation.summarizing:
-            return
-        if self.conversation.latest_tokens < SUMMARY_TRIGGER:
-            return
+    # ── Pipeline Stage 2: STT (Whisper local) ───────────────────
 
-        self.conversation.summarizing = True
+    async def _stt_stage(self):
+        """Accumulate audio, detect silence, transcribe with Whisper."""
+        import numpy as np
+
+        print("STT: Using local Whisper", flush=True)
+        audio_buffer = bytearray()
+        SILENCE_THRESHOLD = 18   # RMS below this = silence (ambient ~10)
+        SILENCE_DURATION = 0.8   # seconds of silence to trigger transcription
+        SPEECH_ENERGY_MIN = 25   # Per-chunk RMS to flag speech (just above ambient)
+        SPEECH_CHUNKS_MIN = 5    # Need ~425ms of speech-level audio
+        MIN_BUFFER_SECONDS = 0.5 # Minimum buffer length to transcribe
+        # Whisper hallucinates these on silence/noise — reject them
+        HALLUCINATION_PHRASES = {
+            "thank you", "thanks for watching", "thanks for listening",
+            "thank you for watching", "thanks for your time",
+            "goodbye", "bye", "you", "the end", "to", "so",
+            "please subscribe", "like and subscribe", "i'm sorry",
+            "hmm", "uh", "um", "oh",
+        }
+
+        silence_start = None
+        has_speech = False  # True if enough chunks exceeded SPEECH_ENERGY_MIN
+        speech_chunk_count = 0  # Number of chunks exceeding SPEECH_ENERGY_MIN
+        peak_rms = 0.0  # Track peak for debugging
+
+        def _is_hallucination(text):
+            return text.lower().strip().rstrip('.!?') in HALLUCINATION_PHRASES
+
         try:
-            # Keep last N turns, summarize the rest
-            to_summarize = self.conversation.history[:-KEEP_LAST_TURNS]
-            if not to_summarize:
-                return
+            while self.running:
+                try:
+                    frame = self._audio_in_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0.02)
 
-            text = "\n".join(
-                f"{t['role']}: {t['text']}" for t in to_summarize if t.get('text')
-            )
-            if not text.strip():
-                return
+                    # Check for flush signal (key released / mic muted)
+                    if self._stt_flush_event and self._stt_flush_event.is_set():
+                        self._stt_flush_event.clear()
+                        if len(audio_buffer) > int(SAMPLE_RATE * MIN_BUFFER_SECONDS * BYTES_PER_SAMPLE):
+                            pcm_data = bytes(audio_buffer)
+                            audio_buffer.clear()
+                            silence_start = None
+                            has_speech = False
+                            speech_chunk_count = 0
+                            transcript = await asyncio.get_event_loop().run_in_executor(
+                                None, self._whisper_transcribe, pcm_data
+                            )
+                            if transcript and not _is_hallucination(transcript):
+                                print(f"STT: Flushed on mute: \"{transcript[:60]}\"", flush=True)
+                                await self._stt_out_q.put(PipelineFrame(
+                                    type=FrameType.END_OF_UTTERANCE,
+                                    generation_id=self.generation_id
+                                ))
+                                await self._stt_out_q.put(PipelineFrame(
+                                    type=FrameType.TRANSCRIPT,
+                                    generation_id=self.generation_id,
+                                    data=transcript
+                                ))
+                            elif transcript:
+                                print(f"STT: Rejected hallucination: \"{transcript}\"", flush=True)
+                        else:
+                            audio_buffer.clear()
+                            silence_start = None
+                            has_speech = False
+                            speech_chunk_count = 0
+                    continue
 
-            print("Live session: Summarizing conversation context...", flush=True)
+                if frame.type != FrameType.AUDIO_RAW:
+                    continue
 
-            # Use gpt-4o-mini for cheap summarization (run in executor to not block)
-            loop = asyncio.get_event_loop()
-            summary = await loop.run_in_executor(None, self._summarize_text, text)
+                # Ignore audio during playback or when user-muted
+                if self.playing_audio or self.muted:
+                    audio_buffer.clear()
+                    silence_start = None
+                    has_speech = False
+                    speech_chunk_count = 0
+                    continue
 
-            if not summary:
-                return
+                audio_buffer.extend(frame.data)
 
-            # Inject summary as system message at root position
-            self.conversation.summary_count += 1
-            await self.ws.send(json.dumps({
-                "type": "conversation.item.create",
-                "previous_item_id": "root",
-                "item": {
-                    "id": f"summary_{self.conversation.summary_count}",
-                    "type": "message",
-                    "role": "system",
-                    "content": [{"type": "input_text", "text": f"[Conversation summary]: {summary}"}]
-                }
-            }))
+                # Check RMS for silence detection
+                samples = np.frombuffer(frame.data, dtype=np.int16)
+                rms = np.sqrt(np.mean(samples.astype(np.float64) ** 2))
 
-            # Delete summarized turns from server
-            for turn in to_summarize:
-                if turn.get("item_id"):
-                    try:
-                        await self.ws.send(json.dumps({
-                            "type": "conversation.item.delete",
-                            "item_id": turn["item_id"]
-                        }))
-                    except Exception as e:
-                        print(f"Live session: Failed to delete item {turn['item_id']}: {e}", flush=True)
+                # Track whether we've seen real speech energy
+                if rms > SPEECH_ENERGY_MIN:
+                    speech_chunk_count += 1
+                    if speech_chunk_count >= SPEECH_CHUNKS_MIN:
+                        has_speech = True
+                if rms > peak_rms:
+                    peak_rms = rms
 
-            # Update local state
-            self.conversation.history = self.conversation.history[-KEEP_LAST_TURNS:]
-            print(f"Live session: Summarized {len(to_summarize)} turns", flush=True)
+                if rms < SILENCE_THRESHOLD:
+                    if silence_start is None:
+                        silence_start = time.time()
+                    elif time.time() - silence_start > SILENCE_DURATION and has_speech and len(audio_buffer) > int(SAMPLE_RATE * MIN_BUFFER_SECONDS * BYTES_PER_SAMPLE):
+                        # Silence detected after speech — transcribe
+                        pcm_data = bytes(audio_buffer)
+                        buf_seconds = len(pcm_data) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+                        print(f"STT: Transcribing {buf_seconds:.1f}s buffer (peak RMS: {peak_rms:.0f})", flush=True)
+                        audio_buffer.clear()
+                        silence_start = None
+                        has_speech = False
+                        speech_chunk_count = 0
+                        peak_rms = 0.0
+
+                        # Run Whisper in executor to avoid blocking event loop
+                        transcript = await asyncio.get_event_loop().run_in_executor(
+                            None, self._whisper_transcribe, pcm_data
+                        )
+                        if transcript and not _is_hallucination(transcript):
+                            print(f"STT [whisper]: {transcript}", flush=True)
+                            await self._stt_out_q.put(PipelineFrame(
+                                type=FrameType.END_OF_UTTERANCE,
+                                generation_id=self.generation_id
+                            ))
+                            await self._stt_out_q.put(PipelineFrame(
+                                type=FrameType.TRANSCRIPT,
+                                generation_id=self.generation_id,
+                                data=transcript
+                            ))
+                        elif transcript:
+                            print(f"STT: Rejected hallucination: \"{transcript}\"", flush=True)
+                else:
+                    silence_start = None
 
         except Exception as e:
-            print(f"Live session: Summarization error: {e}", flush=True)
+            print(f"STT Whisper error: {e}", flush=True)
+
+    # ── Pipeline Stage 3: LLM (Claude CLI) ────────────────────────
+
+    async def _llm_stage(self):
+        """Consume transcripts, send to Claude CLI, emit text deltas."""
+        # Start CLI subprocess
+        await self._start_cli_process()
+
+        try:
+            while self.running:
+                try:
+                    frame = await asyncio.wait_for(self._stt_out_q.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    # Check for pending notifications during idle
+                    if self._notification_queue and not self.playing_audio:
+                        await self._flush_notifications()
+                    continue
+
+                if frame.generation_id != self.generation_id:
+                    continue  # Stale frame
+
+                if frame.type == FrameType.END_OF_UTTERANCE:
+                    self._set_status("thinking")
+                    self._mute_mic()
+                    continue
+
+                if frame.type != FrameType.TRANSCRIPT:
+                    continue
+
+                transcript = frame.data
+                t_start = time.time()
+                print(f"User: {transcript}", flush=True)
+                self._log_event("user", text=transcript)
+                self._reset_idle_timer()
+
+                # Start filler manager (will be cancelled when LLM responds)
+                self._filler_cancel = asyncio.Event()
+                self._spoken_filler = None
+                filler_task = None
+                if self.fillers_enabled:
+                    filler_task = asyncio.create_task(
+                        self._filler_manager(transcript, self._filler_cancel)
+                    )
+
+                # Build user message with ambient task context
+                task_context = self._build_task_context()
+                user_content = f"{task_context}\n\n{transcript}" if task_context else transcript
+
+                # Send to CLI and read response
+                await self._send_to_cli(user_content)
+                t_sent = time.time()
+                print(f"  [timing] CLI send: {t_sent - t_start:.2f}s", flush=True)
+                await self._read_cli_response()
+                t_done = time.time()
+                print(f"  [timing] CLI response: {t_done - t_sent:.2f}s, total: {t_done - t_start:.2f}s", flush=True)
+
+                # Cancel filler if still running
+                if self._filler_cancel:
+                    self._filler_cancel.set()
+                if filler_task and not filler_task.done():
+                    filler_task.cancel()
+
+                self._reset_idle_timer()
+
         finally:
-            self.conversation.summarizing = False
+            await self._stop_cli_process()
 
-    def _summarize_text(self, text):
-        """Synchronous helper for summarization via gpt-4o-mini."""
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=self.api_key)
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{
-                    "role": "system",
-                    "content": "Summarize this conversation concisely, preserving key facts, "
-                               "decisions, and context the assistant needs to continue naturally."
-                }, {
-                    "role": "user",
-                    "content": text
-                }],
-                max_tokens=500
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"Live session: Summarization API error: {e}", flush=True)
-            return None
+    # ── Pipeline Stage 4: TTS (Piper local) ─────────────────────
 
-    async def seed_context(self):
-        """Inject conversation summary as first message on reconnect."""
-        if not self.conversation.history:
-            return
+    def _resample_22050_to_24000(self, pcm_data: bytes) -> bytes:
+        """Resample 16-bit PCM from 22050Hz to 24000Hz using linear interpolation."""
+        import struct
+        samples = struct.unpack(f'<{len(pcm_data)//2}h', pcm_data)
+        ratio = PIPER_SAMPLE_RATE / SAMPLE_RATE
+        out_len = int(len(samples) / ratio)
+        out = []
+        for i in range(out_len):
+            src = i * ratio
+            idx = int(src)
+            frac = src - idx
+            if idx + 1 < len(samples):
+                val = samples[idx] * (1 - frac) + samples[idx + 1] * frac
+            else:
+                val = samples[idx] if idx < len(samples) else 0
+            out.append(int(val))
+        return struct.pack(f'<{len(out)}h', *out)
 
-        # Build summary from existing history
-        text = "\n".join(
-            f"{t['role']}: {t['text']}" for t in self.conversation.history if t.get('text')
-        )
-        if not text.strip():
-            return
+    async def _tts_stage(self):
+        """Consume text deltas, convert to PCM audio via Piper TTS, push to playback."""
+        while self.running:
+            try:
+                frame = await asyncio.wait_for(self._llm_out_q.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
 
-        loop = asyncio.get_event_loop()
-        summary = await loop.run_in_executor(None, self._summarize_text, text)
+            if frame.generation_id != self.generation_id:
+                continue
 
-        if summary:
-            self.conversation.summary_count += 1
-            await self.ws.send(json.dumps({
-                "type": "conversation.item.create",
-                "previous_item_id": "root",
-                "item": {
-                    "id": f"seed_{self.conversation.summary_count}",
-                    "type": "message",
-                    "role": "system",
-                    "content": [{"type": "input_text", "text": f"[Previous conversation context]: {summary}"}]
-                }
-            }))
-            print("Live session: Seeded context from previous conversation", flush=True)
+            if frame.type == FrameType.END_OF_TURN:
+                await self._audio_out_q.put(PipelineFrame(
+                    type=FrameType.END_OF_TURN,
+                    generation_id=frame.generation_id
+                ))
+                continue
 
-    def _reset_idle_timer(self):
-        """Reset the idle timeout timer."""
-        self._cancel_idle_timer()
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                self._idle_timer = loop.call_later(
-                    self._idle_timeout, self._on_idle_timeout
+            if frame.type != FrameType.TEXT_DELTA:
+                continue
+
+            text = frame.data
+            if not text.strip():
+                continue
+
+            gen_id = frame.generation_id
+
+            try:
+                tts_start = time.time()
+                process = await asyncio.create_subprocess_exec(
+                    PIPER_CMD, '--model', PIPER_MODEL, '--output-raw',
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL
                 )
-        except RuntimeError:
-            pass  # No event loop available
 
-    def _cancel_idle_timer(self):
-        """Cancel the current idle timer if active."""
-        if self._idle_timer is not None:
-            self._idle_timer.cancel()
-            self._idle_timer = None
+                # Feed text and close stdin to trigger synthesis
+                process.stdin.write(text.encode())
+                process.stdin.close()
 
-    def _on_idle_timeout(self):
-        """Handle idle timeout - gracefully stop the session."""
-        print(f"Live session: Idle timeout ({self._idle_timeout}s), disconnecting", flush=True)
-        self.running = False
+                # Stream chunks as they arrive
+                first_chunk = True
+                while self.generation_id == gen_id:
+                    chunk = await process.stdout.read(4096)
+                    if not chunk:
+                        break
+                    if first_chunk:
+                        print(f"  [timing] TTS first byte: {time.time() - tts_start:.2f}s for \"{text[:40]}...\"", flush=True)
+                        first_chunk = False
+                    # Resample 22050 → 24000
+                    resampled = self._resample_22050_to_24000(chunk)
+                    await self._audio_out_q.put(PipelineFrame(
+                        type=FrameType.TTS_AUDIO,
+                        generation_id=gen_id,
+                        data=resampled
+                    ))
 
-    async def _interrupt(self):
-        """Interrupt the current response."""
-        if self.ws and self.playing_audio:
-            print("Live session: Interrupting response", flush=True)
-            self.playing_audio = False
-            await self.ws.send(json.dumps({"type": "response.cancel"}))
-            await self.ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                await process.wait()
+            except Exception as e:
+                print(f"Piper TTS error: {e}", flush=True)
+
+    # ── Pipeline Stage 5: Playback (PyAudio) ──────────────────────
+
+    async def _playback_stage(self):
+        """Consume TTS audio frames and play through PyAudio."""
+        import pyaudio
+
+        pa = pyaudio.PyAudio()
+        stream = pa.open(
+            format=pyaudio.paInt16,
+            channels=CHANNELS,
+            rate=SAMPLE_RATE,
+            output=True,
+            frames_per_buffer=1024,
+        )
+
+        print("Live session: Playback started", flush=True)
+
+        try:
+            while self.running:
+                try:
+                    frame = await asyncio.wait_for(self._audio_out_q.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+
+                if frame.generation_id != self.generation_id:
+                    continue
+
+                if frame.type == FrameType.END_OF_TURN:
+                    # Audio done — unmute mic after brief cooldown
+                    self.audio_done_time = time.time()
+
+                    async def delayed_unmute():
+                        await asyncio.sleep(0.5)
+                        if self.playing_audio:
+                            self.playing_audio = False
+                            self._unmute_mic()
+                            if not self.muted:
+                                self._set_status("listening")
+                            else:
+                                self._set_status("muted")
+                            print("Live session: Mic unmuted", flush=True)
+
+                            # Flush pending notifications
+                            if self._notification_queue:
+                                await asyncio.sleep(1.0)
+                                if not self.playing_audio:
+                                    await self._flush_notifications()
+
+                    # Cancel previous unmute if pending
+                    if self._unmute_task and not self._unmute_task.done():
+                        self._unmute_task.cancel()
+                    self._unmute_task = asyncio.create_task(delayed_unmute())
+                    continue
+
+                if frame.type in (FrameType.TTS_AUDIO, FrameType.FILLER):
+                    # Cancel any pending unmute — new audio arrived
+                    if self._unmute_task and not self._unmute_task.done():
+                        self._unmute_task.cancel()
+
+                    # First audio chunk — mute mic and set status
+                    if not self.playing_audio:
+                        self.playing_audio = True
+                        self._set_status("speaking")
+                        self._mute_mic()
+
+                    self._reset_idle_timer()
+
+                    # Write audio to PyAudio stream (runs in executor to avoid blocking)
+                    audio_data = frame.data
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, stream.write, audio_data
+                    )
+                    if frame.type == FrameType.TTS_AUDIO:
+                        self._bytes_played += len(audio_data)
+
+        finally:
+            stream.stop_stream()
+            stream.close()
+            pa.terminate()
+            print("Live session: Playback stopped", flush=True)
+
+    # ── Interrupt ──────────────────────────────────────────────────
+
+    def set_muted(self, muted: bool):
+        """Thread-safe mute/unmute from UI thread."""
+        if not self.running:
+            return  # Pipeline not ready yet
+        self.muted = muted
+        if muted:
+            self._set_status("muted")
+            # Signal STT to flush accumulated transcripts (thread-safe)
+            if self._stt_flush_event:
+                if self._loop and self._loop.is_running():
+                    self._loop.call_soon_threadsafe(self._stt_flush_event.set)
+                else:
+                    self._stt_flush_event.set()
+            print("Live session: Muted (key released)", flush=True)
+        else:
+            self._set_status("listening")
+            self._reset_idle_timer()
+            print("Live session: Unmuted (key held)", flush=True)
 
     def request_interrupt(self):
-        """Thread-safe way to request an interrupt."""
+        """Thread-safe way to request an interrupt (from UI thread)."""
         self._interrupt_requested = True
 
-    async def run(self):
-        """Run the live session main loop."""
-        self._set_status("processing")
-        self.running = True
-        self.muted = False
+    async def _check_interrupt(self):
+        """Check and handle pending interrupt request."""
+        if self._interrupt_requested:
+            self._interrupt_requested = False
+            print("Live session: Interrupting response", flush=True)
+            self.generation_id += 1
+            self.playing_audio = False
+            # Drain pending audio and LLM queues
+            for q in (self._audio_out_q, self._llm_out_q):
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+            self._unmute_mic()
+            self._set_status("listening")
 
-        # Clean up stale toggle signal from previous session
+    # ── Main loop ──────────────────────────────────────────────────
+
+    async def run(self):
+        """Run the live session — 5 concurrent pipeline stages."""
+        self._set_status("thinking")
+        self.running = True
+        self._started_at = time.time()
+        self.muted = False  # Start unmuted — key is held when session launches
+
+        # Clean up stale toggle signal
         stale_signal = Path(__file__).parent / "live_mute_toggle"
         if stale_signal.exists():
             try:
@@ -933,24 +1666,69 @@ class LiveSession:
             except Exception:
                 pass
 
+        # Set up session logging
+        session_id = time.strftime("%Y%m%d_%H%M%S")
+        session_dir = Path("~/Audio/push-to-talk/sessions").expanduser() / session_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        self._session_log_path = session_dir / "conversation.jsonl"
+        self._log_event("session_start", model=self.model, session_id=session_id)
+
+        # Write active session pointer and spawn learner
+        active_file = Path("~/.local/share/push-to-talk/active_session").expanduser()
+        active_file.parent.mkdir(parents=True, exist_ok=True)
+        active_file.write_text(str(self._session_log_path))
+        self._spawn_learner()
+
+        # Create pipeline queues
+        self._audio_in_q = asyncio.Queue(maxsize=100)
+        self._stt_out_q = asyncio.Queue(maxsize=50)
+        self._llm_out_q = asyncio.Queue(maxsize=50)
+        self._audio_out_q = asyncio.Queue(maxsize=200)
+        self._stt_flush_event = asyncio.Event()
+        self._loop = asyncio.get_event_loop()
+
+        self._set_status("listening")
+        self._reset_idle_timer()
+        print("Live session: Pipeline started", flush=True)
+
         try:
-            await self.connect()
-            self.start_audio_player()
-            self._set_status("listening")
-            self._reset_idle_timer()
+            # Run interrupt checker as background task
+            async def interrupt_loop():
+                while self.running:
+                    await self._check_interrupt()
+                    await asyncio.sleep(0.05)
 
-            # Run event handler and audio recording concurrently
-            await asyncio.gather(
-                self.handle_events(),
-                self.record_and_send()
-            )
+            stages = [
+                self._audio_capture_stage(),
+                self._stt_stage(),
+                self._llm_stage(),
+                self._tts_stage(),
+                self._playback_stage(),
+                interrupt_loop(),
+            ]
+            if self.barge_in_enabled:
+                stages.append(self._vad_monitor_stage())
 
+            await asyncio.gather(*stages, return_exceptions=True)
         except Exception as e:
             print(f"Live session error: {e}", flush=True)
             self._set_status("error")
         finally:
-            await self.disconnect()
+            self._log_event("session_end")
+            self.running = False
+            self._cancel_idle_timer()
+            self._unmute_mic()
             self._set_status("idle")
+
+            # Clean up active session pointer
+            try:
+                active_file = Path("~/.local/share/push-to-talk/active_session").expanduser()
+                if active_file.exists():
+                    active_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            print("Live session: Pipeline stopped", flush=True)
 
     def stop(self):
         """Stop the session gracefully."""

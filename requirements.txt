@@ -19,3 +19,12 @@ pathvalidate
 
 # Audio processing helpers (optional, for noise detection)
 numpy
+
+# Streaming STT
+deepgram-sdk>=3.0
+
+# Audio playback (callback mode)
+pyaudio>=0.2.14
+
+# Silero VAD inference (for barge-in detection)
+onnxruntime>=1.18

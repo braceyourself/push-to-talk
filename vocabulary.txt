@@ -12,6 +12,7 @@ Ethan Brace
 Hello World
 not to look in
 the configuration on Refresh
+this for future interactions on this project
 to do formatting as we've discussed using HTML so that Google Docs understands it appropriately
 to do this testing automated in the future for future phases
 to not look at it

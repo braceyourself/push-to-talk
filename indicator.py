@@ -14,6 +14,7 @@ import os
 import json
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 # Try to load AppIndicator3 for tray mode
@@ -124,6 +125,8 @@ COLORS = {
     'error': (1.0, 0.0, 0.0, 0.9),
     'listening': (0.2, 0.6, 1.0, 0.9),  # Blue - AI listening
     'speaking': (0.8, 0.4, 1.0, 0.9),   # Purple - AI speaking (mic muted)
+    'thinking': (1.0, 0.8, 0.0, 0.9),   # Yellow - AI thinking
+    'tool_use': (0.95, 0.55, 0.0, 0.9), # Orange-amber - AI using tool
 }
 
 STATUS_TEXT = {
@@ -134,6 +137,8 @@ STATUS_TEXT = {
     'error': 'Error',
     'listening': 'AI Listening...',
     'speaking': 'AI Speaking...',
+    'thinking': 'AI Thinking...',
+    'tool_use': 'Using Tool...',
 }
 
 
@@ -158,6 +163,7 @@ class SettingsWindow(Gtk.Window):
 
         # Add tabs
         notebook.append_page(self.create_general_tab(), Gtk.Label(label="General"))
+        notebook.append_page(self.create_live_tab(), Gtk.Label(label="Live"))
         notebook.append_page(self.create_api_keys_tab(), Gtk.Label(label="API Keys"))
         notebook.append_page(self.create_hotkeys_tab(), Gtk.Label(label="Hotkeys"))
         notebook.append_page(self.create_advanced_tab(), Gtk.Label(label="Advanced"))
@@ -509,6 +515,121 @@ class SettingsWindow(Gtk.Window):
         box.pack_start(tts_section, False, False, 0)
 
         return box
+
+    def create_live_tab(self):
+        """Create the Live Voice session settings tab."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        box.set_margin_top(20)
+        box.set_margin_bottom(20)
+        box.set_margin_start(20)
+        box.set_margin_end(20)
+
+        config = load_config()
+
+        # Model section
+        model_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        model_label = Gtk.Label(label="Live Voice Pipeline")
+        model_label.set_xalign(0)
+        model_label.get_style_context().add_class('section-title')
+        model_section.pack_start(model_label, False, False, 0)
+
+        # Model dropdown
+        model_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        model_row_label = Gtk.Label(label="Claude Model:")
+        model_row_label.set_xalign(0)
+        model_row.pack_start(model_row_label, False, False, 0)
+
+        self.live_model_combo = Gtk.ComboBoxText()
+        self.live_model_combo.append("claude-sonnet-4-5-20250929", "Sonnet 4.5")
+        self.live_model_combo.append("claude-opus-4-6", "Opus 4.6")
+        self.live_model_combo.set_active_id(config.get('live_model', 'claude-sonnet-4-5-20250929'))
+        self.live_model_combo.connect("changed", self.on_live_model_changed)
+        model_row.pack_end(self.live_model_combo, False, False, 0)
+        model_section.pack_start(model_row, False, False, 0)
+
+        # STT dropdown
+        stt_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        stt_label = Gtk.Label(label="Speech-to-Text:")
+        stt_label.set_xalign(0)
+        stt_row.pack_start(stt_label, False, False, 0)
+
+        self.live_stt_combo = Gtk.ComboBoxText()
+        self.live_stt_combo.append("deepgram", "Deepgram (cloud)")
+        self.live_stt_combo.append("whisper", "Whisper (local)")
+        self.live_stt_combo.set_active_id(config.get('live_stt', 'deepgram'))
+        self.live_stt_combo.connect("changed", self.on_live_stt_changed)
+        stt_row.pack_end(self.live_stt_combo, False, False, 0)
+        model_section.pack_start(stt_row, False, False, 0)
+
+        # TTS dropdown
+        tts_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        tts_label = Gtk.Label(label="Text-to-Speech:")
+        tts_label.set_xalign(0)
+        tts_row.pack_start(tts_label, False, False, 0)
+
+        self.live_tts_combo = Gtk.ComboBoxText()
+        self.live_tts_combo.append("openai", "OpenAI (cloud)")
+        self.live_tts_combo.append("piper", "Piper (local)")
+        self.live_tts_combo.set_active_id(config.get('live_tts', 'openai'))
+        self.live_tts_combo.connect("changed", self.on_live_tts_changed)
+        tts_row.pack_end(self.live_tts_combo, False, False, 0)
+        model_section.pack_start(tts_row, False, False, 0)
+
+        box.pack_start(model_section, False, False, 0)
+
+        # Features section
+        features_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        features_label = Gtk.Label(label="Features")
+        features_label.set_xalign(0)
+        features_label.get_style_context().add_class('section-title')
+        features_section.pack_start(features_label, False, False, 0)
+
+        # Fillers toggle
+        self.live_fillers_check = Gtk.CheckButton(label="Conversational fillers (mhm, let me think...)")
+        self.live_fillers_check.set_active(config.get('live_fillers', True))
+        self.live_fillers_check.connect("toggled", self.on_live_fillers_toggled)
+        features_section.pack_start(self.live_fillers_check, False, False, 0)
+
+        # Barge-in toggle
+        self.live_barge_in_check = Gtk.CheckButton(label="Barge-in (speak to interrupt AI)")
+        self.live_barge_in_check.set_active(config.get('live_barge_in', True))
+        self.live_barge_in_check.connect("toggled", self.on_live_barge_in_toggled)
+        features_section.pack_start(self.live_barge_in_check, False, False, 0)
+
+        box.pack_start(features_section, False, False, 0)
+
+        # Info text
+        info = Gtk.Label(label="Changes take effect on the next live session start.\nRequires Anthropic + Deepgram + OpenAI API keys.")
+        info.set_xalign(0)
+        info.get_style_context().add_class('info-text')
+        box.pack_start(info, False, False, 0)
+
+        return box
+
+    def on_live_model_changed(self, combo):
+        config = load_config()
+        config['live_model'] = combo.get_active_id()
+        save_config(config)
+
+    def on_live_stt_changed(self, combo):
+        config = load_config()
+        config['live_stt'] = combo.get_active_id()
+        save_config(config)
+
+    def on_live_tts_changed(self, combo):
+        config = load_config()
+        config['live_tts'] = combo.get_active_id()
+        save_config(config)
+
+    def on_live_fillers_toggled(self, check):
+        config = load_config()
+        config['live_fillers'] = check.get_active()
+        save_config(config)
+
+    def on_live_barge_in_toggled(self, check):
+        config = load_config()
+        config['live_barge_in'] = check.get_active()
+        save_config(config)
 
     def create_api_keys_tab(self):
         """Create the API Keys settings tab."""
@@ -1203,6 +1324,8 @@ class StatusIndicator(Gtk.Window):
             self.drag_start_x = event.x_root
             self.drag_start_y = event.y_root
             self.dragging = False  # Not yet — wait for motion threshold
+        elif event.button == 3:
+            self.show_model_menu(event)
         return True
 
     def on_button_release(self, widget, event):
@@ -1243,6 +1366,41 @@ class StatusIndicator(Gtk.Window):
                 self.drag_start_x = event.x_root
                 self.drag_start_y = event.y_root
         return True
+
+    def show_model_menu(self, event):
+        """Show right-click context menu for model selection."""
+        config = load_config()
+        current_model = config.get('live_model', 'claude-sonnet-4-5-20250929')
+
+        models = [
+            ('claude-sonnet-4-5-20250929', 'Sonnet 4.5'),
+            ('claude-opus-4-6', 'Opus 4.6'),
+            ('claude-haiku-4-5-20251001', 'Haiku 4.5'),
+        ]
+
+        menu = Gtk.Menu()
+
+        # Model section header
+        header = Gtk.MenuItem(label='Live Model')
+        header.set_sensitive(False)
+        menu.append(header)
+        menu.append(Gtk.SeparatorMenuItem())
+
+        for model_id, display_name in models:
+            is_current = model_id == current_model
+            label = f"  {display_name}" if not is_current else f"\u2713 {display_name}"
+            item = Gtk.MenuItem(label=label)
+            item.connect('activate', self.on_model_selected, model_id)
+            menu.append(item)
+
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def on_model_selected(self, widget, model_id):
+        """Handle model selection from context menu."""
+        config = load_config()
+        config['live_model'] = model_id
+        save_config(config)
 
     def show_popup(self):
         if not self.popup:
@@ -1663,6 +1821,8 @@ class LiveOverlayWidget(Gtk.Window):
         'disconnected': (0.42, 0.45, 0.50),   # #6b7280 gray
         'error':        (1.0,  0.2,  0.2),    # red
         'muted':        (0.8,  0.4,  0.0),    # orange
+        'thinking':     (1.0,  0.8,  0.0),    # yellow
+        'tool_use':     (0.95, 0.55, 0.0),    # orange-amber
     }
 
     STATUS_LABELS = {
@@ -1675,6 +1835,8 @@ class LiveOverlayWidget(Gtk.Window):
         'recording':    'Listening',
         'success':      'Ready',
         'muted':        'Muted',
+        'thinking':     'Thinking',
+        'tool_use':     'Using Tool',
     }
 
     def __init__(self):
@@ -1687,7 +1849,7 @@ class LiveOverlayWidget(Gtk.Window):
         self.set_type_hint(Gdk.WindowTypeHint.DOCK)
         self.set_app_paintable(True)
         self.set_default_size(self.OVERLAY_WIDTH, self.OVERLAY_HEIGHT)
-        self.set_resizable(False)
+        self.set_resizable(True)
 
         # Enable transparency
         screen = self.get_screen()
@@ -1697,6 +1859,8 @@ class LiveOverlayWidget(Gtk.Window):
 
         # Status state
         self.status = 'idle'
+        self.status_history = []  # [(HH:MM:SS, status), ...] capped at 50
+        self.expanded = False
 
         # Drag state
         self.dragging = False
@@ -1737,32 +1901,51 @@ class LiveOverlayWidget(Gtk.Window):
 
         self.move(self.pos_x, self.pos_y)
 
+    HISTORY_ROW_HEIGHT = 22
+    HISTORY_MAX_VISIBLE = 10
+
+    def _resize_window(self):
+        """Resize window based on expanded state."""
+        if self.expanded and self.status_history:
+            visible = min(len(self.status_history), self.HISTORY_MAX_VISIBLE)
+            total_h = self.OVERLAY_HEIGHT + 4 + visible * self.HISTORY_ROW_HEIGHT + 8
+        else:
+            total_h = self.OVERLAY_HEIGHT
+        self.set_size_request(self.OVERLAY_WIDTH, total_h)
+        self.resize(self.OVERLAY_WIDTH, total_h)
+
+    def _draw_rounded_rect(self, cr, x, y, w, h, r):
+        """Draw a rounded rectangle path."""
+        PI = 3.14159
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -PI / 2, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, PI / 2)
+        cr.arc(x + r, y + h - r, r, PI / 2, PI)
+        cr.arc(x + r, y + r, r, PI, 3 * PI / 2)
+        cr.close_path()
+
     def on_draw(self, widget, cr):
-        """Draw the overlay: rounded dark background, colored dot, status text."""
-        width = self.OVERLAY_WIDTH
-        height = self.OVERLAY_HEIGHT
+        """Draw the overlay: rounded dark background, colored dot, status text, and optional history."""
+        alloc = self.get_allocation()
+        width = alloc.width
+        height = alloc.height
         r = self.CORNER_RADIUS
+        PI = 3.14159
 
         # Clear to transparent
         cr.set_operator(1)  # CAIRO_OPERATOR_SOURCE
         cr.set_source_rgba(0, 0, 0, 0)
         cr.paint()
 
-        # Draw rounded rectangle background
+        # Draw rounded rectangle background (full window)
         cr.set_operator(0)  # CAIRO_OPERATOR_CLEAR first
         cr.paint()
         cr.set_operator(2)  # CAIRO_OPERATOR_OVER
 
-        # Rounded rectangle path
-        cr.new_sub_path()
-        cr.arc(width - r, r, r, -3.14159 / 2, 0)
-        cr.arc(width - r, height - r, r, 0, 3.14159 / 2)
-        cr.arc(r, height - r, r, 3.14159 / 2, 3.14159)
-        cr.arc(r, r, r, 3.14159, 3 * 3.14159 / 2)
-        cr.close_path()
+        self._draw_rounded_rect(cr, 0, 0, width, height, r)
 
         # Semi-transparent dark background
-        cr.set_source_rgba(0.118, 0.118, 0.118, 0.85)  # rgba(30, 30, 30, 0.85)
+        cr.set_source_rgba(0.118, 0.118, 0.118, 0.85)
         cr.fill_preserve()
 
         # Subtle border
@@ -1772,37 +1955,98 @@ class LiveOverlayWidget(Gtk.Window):
 
         # Draw status dot
         dot_x = 22
-        dot_y = height / 2
+        dot_y = self.OVERLAY_HEIGHT / 2
         dot_color = self.DOT_COLORS.get(self.status, self.DOT_COLORS['idle'])
         cr.set_source_rgba(dot_color[0], dot_color[1], dot_color[2], 1.0)
-        cr.arc(dot_x, dot_y, self.DOT_RADIUS, 0, 2 * 3.14159)
+        cr.arc(dot_x, dot_y, self.DOT_RADIUS, 0, 2 * PI)
         cr.fill()
 
         # Draw status text
         label = self.STATUS_LABELS.get(self.status, self.status.title())
         cr.set_source_rgba(0.9, 0.9, 0.9, 1.0)
-        cr.select_font_face("Sans", 0, 0)  # CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL
+        cr.select_font_face("Sans", 0, 0)
         cr.set_font_size(13)
-        cr.move_to(38, height / 2 + 5)
+        cr.move_to(38, self.OVERLAY_HEIGHT / 2 + 5)
         cr.show_text(label)
+
+        # Draw chevron indicator (right side of header)
+        if self.status_history:
+            chev_x = width - 18
+            chev_y = self.OVERLAY_HEIGHT / 2
+            cr.set_source_rgba(0.5, 0.5, 0.5, 0.7)
+            cr.set_line_width(1.5)
+            if self.expanded:
+                # Chevron up
+                cr.move_to(chev_x - 4, chev_y + 2)
+                cr.line_to(chev_x, chev_y - 2)
+                cr.line_to(chev_x + 4, chev_y + 2)
+            else:
+                # Chevron down
+                cr.move_to(chev_x - 4, chev_y - 2)
+                cr.line_to(chev_x, chev_y + 2)
+                cr.line_to(chev_x + 4, chev_y - 2)
+            cr.stroke()
+
+        # Draw history panel when expanded
+        if self.expanded and self.status_history:
+            # Separator line
+            sep_y = self.OVERLAY_HEIGHT + 2
+            cr.set_source_rgba(0.3, 0.3, 0.3, 0.6)
+            cr.set_line_width(0.5)
+            cr.move_to(10, sep_y)
+            cr.line_to(width - 10, sep_y)
+            cr.stroke()
+
+            # Draw history entries (most recent first)
+            entries = list(reversed(self.status_history))[:self.HISTORY_MAX_VISIBLE]
+            row_y = self.OVERLAY_HEIGHT + 8
+            for ts, st in entries:
+                # Small colored dot
+                dc = self.DOT_COLORS.get(st, self.DOT_COLORS['idle'])
+                cr.set_source_rgba(dc[0], dc[1], dc[2], 0.9)
+                cr.arc(18, row_y + self.HISTORY_ROW_HEIGHT / 2, 3.5, 0, 2 * PI)
+                cr.fill()
+
+                # Timestamp
+                cr.set_source_rgba(0.55, 0.55, 0.55, 1.0)
+                cr.select_font_face("Sans", 0, 0)
+                cr.set_font_size(11)
+                cr.move_to(28, row_y + self.HISTORY_ROW_HEIGHT / 2 + 4)
+                cr.show_text(ts)
+
+                # Label
+                sl = self.STATUS_LABELS.get(st, st.title())
+                cr.set_source_rgba(0.75, 0.75, 0.75, 1.0)
+                cr.move_to(82, row_y + self.HISTORY_ROW_HEIGHT / 2 + 4)
+                cr.show_text(sl)
+
+                row_y += self.HISTORY_ROW_HEIGHT
 
         return False
 
     def update_status(self, status):
         """Update the displayed status. Call from any thread via GLib.idle_add."""
+        if status != self.status:
+            timestamp = time.strftime("%H:%M:%S")
+            self.status_history.append((timestamp, status))
+            if len(self.status_history) > 50:
+                self.status_history = self.status_history[-50:]
         self.status = status
+        self._resize_window()
         self.queue_draw()
 
     def on_button_press(self, widget, event):
-        """Start drag tracking."""
+        """Start drag tracking or show model menu."""
         if event.button == 1:
             self.drag_start_x = event.x_root
             self.drag_start_y = event.y_root
             self.dragging = False
+        elif event.button == 3:
+            self._show_model_menu(event)
         return True
 
     def on_button_release(self, widget, event):
-        """End drag or toggle mute on click."""
+        """End drag or toggle expand on left-click."""
         if event.button == 1:
             if self.dragging:
                 self.dragging = False
@@ -1811,26 +2055,86 @@ class LiveOverlayWidget(Gtk.Window):
                 config['live_overlay_y'] = self.pos_y
                 save_config(config)
             else:
-                # Click (not drag) — cycle mode
-                self._cycle_mode()
+                # Click (not drag) — toggle history panel
+                self.expanded = not self.expanded
+                self._resize_window()
+                self.queue_draw()
         return True
 
-    def _cycle_mode(self):
-        """Cycle: Listening → Muted → Idle (disconnect) → Listening (reconnect)."""
-        signal_file = Path(__file__).parent / "live_mute_toggle"
-        status_file = Path(__file__).parent / "status"
-        if self.status in ('listening',):
-            # Listening → Muted
-            signal_file.write_text("mute")
-            self.update_status('muted')
+    def _show_model_menu(self, event):
+        """Show right-click context menu with session controls and model selection."""
+        menu = Gtk.Menu()
+
+        # Session controls
+        if self.status in ('listening', 'thinking', 'tool_use', 'speaking'):
+            mute_item = Gtk.MenuItem(label='Mute')
+            mute_item.connect('activate', self._on_mute_clicked)
+            menu.append(mute_item)
         elif self.status == 'muted':
-            # Muted → Idle (stop session)
-            signal_file.write_text("stop")
-            self.update_status('idle')
+            unmute_item = Gtk.MenuItem(label='Unmute')
+            unmute_item.connect('activate', self._on_unmute_clicked)
+            menu.append(unmute_item)
         elif self.status in ('idle', 'disconnected', 'error'):
-            # Idle → Listening (restart session)
-            status_file.write_text("restart_live")
-            self.update_status('listening')
+            restart_item = Gtk.MenuItem(label='Start Session')
+            restart_item.connect('activate', self._on_restart_clicked)
+            menu.append(restart_item)
+
+        if self.status not in ('idle', 'disconnected'):
+            stop_item = Gtk.MenuItem(label='Stop Session')
+            stop_item.connect('activate', self._on_stop_clicked)
+            menu.append(stop_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Model selection
+        config = load_config()
+        current_model = config.get('live_model', 'claude-sonnet-4-5-20250929')
+
+        models = [
+            ('claude-sonnet-4-5-20250929', 'Sonnet 4.5'),
+            ('claude-opus-4-6', 'Opus 4.6'),
+            ('claude-haiku-4-5-20251001', 'Haiku 4.5'),
+        ]
+
+        model_header = Gtk.MenuItem(label='Live Model')
+        model_header.set_sensitive(False)
+        menu.append(model_header)
+
+        for model_id, display_name in models:
+            is_current = model_id == current_model
+            label = f"\u2713 {display_name}" if is_current else f"  {display_name}"
+            item = Gtk.MenuItem(label=label)
+            item.connect('activate', self._on_model_selected, model_id)
+            menu.append(item)
+
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def _on_mute_clicked(self, widget):
+        signal_file = Path(__file__).parent / "live_mute_toggle"
+        signal_file.write_text("mute")
+        self.update_status('muted')
+
+    def _on_unmute_clicked(self, widget):
+        signal_file = Path(__file__).parent / "live_mute_toggle"
+        signal_file.write_text("unmute")
+        self.update_status('listening')
+
+    def _on_stop_clicked(self, widget):
+        signal_file = Path(__file__).parent / "live_mute_toggle"
+        signal_file.write_text("stop")
+        self.update_status('idle')
+
+    def _on_restart_clicked(self, widget):
+        status_file = Path(__file__).parent / "status"
+        status_file.write_text("restart_live")
+        self.update_status('listening')
+
+    def _on_model_selected(self, widget, model_id):
+        """Handle model selection from context menu."""
+        config = load_config()
+        config['live_model'] = model_id
+        save_config(config)
 
     def on_motion(self, widget, event):
         """Handle drag motion."""
@@ -1879,42 +2183,57 @@ def update_live_overlay(status):
 
 def main():
     config = load_config()
-    style = config.get('indicator_style', 'floating')
+    ai_mode = config.get('ai_mode', 'claude')
 
-    if style == 'tray' and APPINDICATOR_AVAILABLE:
-        print("Starting tray indicator", flush=True)
-        indicator = TrayIndicator()
-    else:
-        if style == 'tray' and not APPINDICATOR_AVAILABLE:
-            print("AppIndicator3 not available, falling back to floating dot", flush=True)
-        print("Starting floating indicator", flush=True)
-        indicator = StatusIndicator()
+    # Only create the status dot for non-live modes
+    indicator = None
+    if ai_mode != 'live':
+        style = config.get('indicator_style', 'floating')
+        if style == 'tray' and APPINDICATOR_AVAILABLE:
+            print("Starting tray indicator", flush=True)
+            indicator = TrayIndicator()
+        else:
+            if style == 'tray' and not APPINDICATOR_AVAILABLE:
+                print("AppIndicator3 not available, falling back to floating dot", flush=True)
+            print("Starting floating indicator", flush=True)
+            indicator = StatusIndicator()
 
     # Create live overlay (hidden by default)
     global _live_overlay
     _live_overlay = LiveOverlayWidget()
 
-    # Poll for live mode status to show/hide overlay
-    def check_live_mode():
+    # Poll for status updates and show/hide appropriate indicator
+    def check_status():
         try:
             cfg = load_config()
             is_live = cfg.get('ai_mode', 'claude') == 'live'
             if is_live:
+                # Hide dot indicator if it exists
+                if indicator and isinstance(indicator, StatusIndicator) and indicator.get_visible():
+                    indicator.hide()
+                # Show live overlay
                 if not _live_overlay.get_visible():
                     _live_overlay.show_all()
-                # Route status updates to overlay, but don't override muted
-                if _live_overlay.status != 'muted' and STATUS_FILE.exists():
+                # Route status updates to overlay
+                if STATUS_FILE.exists():
                     status = STATUS_FILE.read_text().strip()
-                    if status != 'muted':
+                    # Don't override user-set muted status
+                    if _live_overlay.status == 'muted' and status != 'muted':
+                        pass  # Keep muted until explicitly changed
+                    else:
                         _live_overlay.update_status(status)
             else:
+                # Hide live overlay
                 if _live_overlay.get_visible():
                     _live_overlay.hide()
+                # Show dot indicator if it exists
+                if indicator and isinstance(indicator, StatusIndicator) and not indicator.get_visible():
+                    indicator.show_all()
         except Exception:
             pass
         return True
 
-    GLib.timeout_add(500, check_live_mode)
+    GLib.timeout_add(500, check_status)
 
     Gtk.main()
 

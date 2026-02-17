@@ -123,6 +123,20 @@ def get_openai_api_key():
     return None
 
 
+def get_deepgram_api_key():
+    """Get Deepgram API key from environment or file."""
+    key = os.environ.get("DEEPGRAM_API_KEY")
+    if key:
+        return key
+    for path in [
+        Path.home() / ".config" / "deepgram" / "api_key",
+        Path.home() / ".deepgram" / "api_key",
+    ]:
+        if path.exists():
+            return path.read_text().strip()
+    return None
+
+
 def prompt_api_key():
     """Open a terminal to prompt the user for their OpenAI API key.
     Returns True if a key was saved, False otherwise."""
@@ -238,6 +252,11 @@ def load_config():
         "interview_topic": "",  # Topic for interview mode
         "interview_context_dirs": [],  # Repo paths for interview context
         "conversation_project_dir": "",  # Project directory for conversation mode
+        "live_model": "claude-sonnet-4-5-20250929",  # Claude model for live voice
+        "live_stt": "deepgram",          # "deepgram" or "whisper"
+        "live_tts": "openai",            # "openai" or "piper"
+        "live_fillers": True,            # Play filler sounds during processing
+        "live_barge_in": True,           # Allow speaking over AI response
         "verbal_hooks": [
             # Example hooks - customize these:
             # {"trigger": "open browser", "command": "xdg-open https://google.com"},
@@ -684,6 +703,7 @@ class PushToTalk:
         self.ai_mode = False  # True when recording for AI assistant
         self.ctrl_r_pressed = False
         self.shift_r_pressed = False
+        self._ptt_muted_live = False  # True when live session muted for PTT dictation
         self.tts_process = None  # Track TTS process for interruption
 
         # Interview mode
@@ -883,17 +903,31 @@ class PushToTalk:
             set_status('error')
             return False
 
-        api_key = get_openai_api_key()
-        if not api_key:
-            print("No OpenAI API key found for live session", flush=True)
+        openai_key = get_openai_api_key()
+        if not openai_key:
+            print("No OpenAI API key found for live session TTS", flush=True)
             prompt_api_key()
             return False
 
+        deepgram_key = get_deepgram_api_key()
+        if not deepgram_key:
+            print("No Deepgram API key found for live session STT", flush=True)
+            self.show_error("Deepgram API key required. Set DEEPGRAM_API_KEY env var.")
+            return False
+
         voice = self.config.get('openai_voice', 'ash')
+        model = self.config.get('live_model', 'claude-sonnet-4-5-20250929')
+        fillers = self.config.get('live_fillers', True)
+        barge_in = self.config.get('live_barge_in', True)
         self.live_session = LiveSession(
-            api_key=api_key,
+            openai_api_key=openai_key,
+            deepgram_api_key=deepgram_key,
             voice=voice,
-            on_status=set_status
+            model=model,
+            on_status=set_status,
+            fillers_enabled=fillers,
+            barge_in_enabled=barge_in,
+            whisper_model=self.model,
         )
 
         # Ensure TaskManager singleton is initialized for this session
@@ -925,6 +959,10 @@ class PushToTalk:
         subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'],
                        capture_output=True)
         set_status('idle')
+
+    # No timers. All logic runs synchronously in the pynput thread.
+    # Press: record time + state, unmute if muted (optimistic for hold-to-talk).
+    # Release: check elapsed. Tap (<500ms) = cycle. Hold (>=500ms) = mute+flush.
 
     def show_error(self, message):
         """Show error notification and briefly flash error status."""
@@ -2200,6 +2238,14 @@ class PushToTalk:
         set_status('idle')
 
     def on_press(self, key):
+        try:
+            self._on_press_inner(key)
+        except Exception as e:
+            print(f"ERROR in on_press: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+
+    def _on_press_inner(self, key):
         # Interrupt key stops realtime AI or live session
         if key == self.interrupt_key and self.realtime_session:
             print("Interrupt key pressed - interrupting AI", flush=True)
@@ -2217,6 +2263,43 @@ class PushToTalk:
             self.shift_r_pressed = True
             # Stop any ongoing TTS when starting new recording
             self.stop_tts()
+
+        # Live mode: Right Shift = tap to cycle, hold for push-to-talk
+        # No timers. Press records state; release decides tap vs hold.
+        if key == self.ai_key and not self.ctrl_r_pressed:
+            ai_mode = self.config.get('ai_mode', 'claude')
+            if ai_mode == 'live':
+                # Guard against key repeat events (Linux sends repeats while held)
+                # Time-based fallback: if held flag stuck >2s, force reset (missed release)
+                if getattr(self, '_live_key_held', False):
+                    if time.time() - getattr(self, '_live_key_press_time', 0) > 2.0:
+                        print("Live: force-resetting stuck key held flag", flush=True)
+                        self._live_key_held = False
+                    else:
+                        return
+                self._live_key_held = True
+                self._live_press_processed = True  # Release handler checks this
+                self._live_key_press_time = time.time()
+                self._live_starting_session = False
+                if not self.live_session:
+                    # Idle → start session
+                    self._live_starting_session = True
+                    self.start_live_session()
+                elif self.live_session.playing_audio:
+                    # Interrupt playback immediately
+                    print("Live: interrupting playback", flush=True)
+                    self.live_session.request_interrupt()
+                    # Record state so release handler knows context
+                    self._live_press_state = 'interrupted'
+                    self.live_session.set_muted(False)
+                else:
+                    # Record state at press time for release handler
+                    self._live_press_state = 'muted' if self.live_session.muted else 'listening'
+                    # Optimistic unmute: if muted, unmute now for hold-to-talk.
+                    # If this turns out to be a tap, release handler reverts it.
+                    if self.live_session.muted:
+                        self.live_session.set_muted(False)
+                return
 
         # Check for AI assistant mode (both modifiers held)
         if self.ctrl_r_pressed and self.shift_r_pressed and not self.recording:
@@ -2250,11 +2333,13 @@ class PushToTalk:
                     # Subsequent triggers: record a follow-up
                     self.start_recording(force=True)
             elif ai_mode == 'live':
-                if not self.live_session:
-                    # Session not running (timed out or first start) — reconnect
+                if self.live_session:
+                    # Session running — Ctrl+Shift stops it (toggle)
+                    print("Stopping live session (Ctrl+Shift toggle)", flush=True)
+                    self.stop_live_session()
+                else:
+                    # Session not running — start it
                     self.start_live_session()
-                # Live session handles audio via its own record_and_send loop
-                # PTT press in live mode is a no-op for recording since session auto-listens
             elif ai_mode == 'realtime':
                 # Check why Realtime might not work and report errors
                 if not REALTIME_AVAILABLE:
@@ -2283,18 +2368,79 @@ class PushToTalk:
             if self.other_keys_pressed:
                 print(f"Clearing stale keys: {self.other_keys_pressed}", flush=True)
                 self.other_keys_pressed.clear()
-            print("PTT key pressed, starting recording", flush=True)
+            # Mute live session during PTT dictation so it doesn't pick up the audio
+            if self.live_session and not self.live_session.muted:
+                self._ptt_muted_live = True
+                self.live_session.set_muted(True)
+                print("PTT key pressed, muted live session, starting recording", flush=True)
+            else:
+                self._ptt_muted_live = False
+                print("PTT key pressed, starting recording", flush=True)
             self.ai_mode = False
             self.start_recording()
         elif key not in (self.ptt_key, self.ai_key):
             self.other_keys_pressed.add(key)
 
     def on_release(self, key):
+        try:
+            self._on_release_inner(key)
+        except Exception as e:
+            print(f"ERROR in on_release: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+
+    def _on_release_inner(self, key):
         # Track modifier releases
         if key == self.ptt_key:
             self.ctrl_r_pressed = False
         elif key == self.ai_key:
             self.shift_r_pressed = False
+
+        # Live mode: tap = cycle, hold = mute+flush on release
+        if key == self.ai_key:
+            ai_mode = self.config.get('ai_mode', 'claude')
+            if ai_mode == 'live':
+                self._live_key_held = False  # Clear repeat guard
+
+                # Only process release if the press handler actually ran.
+                # Without this, a blocked press (e.g. ctrl_r_pressed was True)
+                # causes the release handler to read stale state and mute incorrectly.
+                if not getattr(self, '_live_press_processed', False):
+                    return
+                self._live_press_processed = False
+
+                press_time = getattr(self, '_live_key_press_time', 0)
+                elapsed = time.time() - press_time
+                elapsed_ms = int(elapsed * 1000)
+                press_state = getattr(self, '_live_press_state', None)
+
+                if getattr(self, '_live_starting_session', False):
+                    # First tap started the session — don't do anything
+                    self._live_starting_session = False
+                    print("Live: session started (ignoring release)", flush=True)
+
+                elif elapsed < 0.5 and self.live_session:
+                    # TAP (<500ms): cycle based on state at press time
+                    if press_state == 'listening':
+                        self.live_session.set_muted(True)
+                        print(f"Live tap ({elapsed_ms}ms): listening → muted", flush=True)
+                    elif press_state == 'muted':
+                        # Tap from muted → back to listening (optimistic unmute already applied on press)
+                        print(f"Live tap ({elapsed_ms}ms): muted → listening", flush=True)
+                    elif press_state == 'interrupted':
+                        print(f"Live tap ({elapsed_ms}ms): interrupted → listening", flush=True)
+
+                elif self.live_session:
+                    if elapsed >= 2.0 and press_state == 'muted':
+                        # LONG HOLD (>=2s) from muted: stop session
+                        print(f"Live long hold ({elapsed_ms}ms): stopping session", flush=True)
+                        self.stop_live_session()
+                    else:
+                        # HOLD (>=500ms): mute + flush transcript
+                        self.live_session.set_muted(True)
+                        print(f"Live hold ({elapsed_ms}ms): muted (released)", flush=True)
+
+                return
 
         # Stop recording when keys are released (but NOT realtime session - that's toggle-based)
         if key in (self.ptt_key, self.ai_key):
@@ -2331,6 +2477,13 @@ class PushToTalk:
             self.record_process.terminate()
             self.record_process.wait()
             self.record_process = None
+
+        # Restore live session mute state if we muted it for PTT dictation
+        if getattr(self, '_ptt_muted_live', False):
+            self._ptt_muted_live = False
+            if self.live_session:
+                self.live_session.set_muted(False)
+                print("PTT done, unmuted live session", flush=True)
 
         # Dismiss indicator immediately - transcription happens in background
         set_status('idle')

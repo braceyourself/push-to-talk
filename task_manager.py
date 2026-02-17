@@ -157,11 +157,17 @@ class TaskManager:
 
             cmd = self._build_claude_command(task)
 
+            # Clean env to avoid Claude CLI nesting detection
+            env = {**os.environ}
+            env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+            env.pop("CLAUDECODE", None)
+
             task.process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=str(task.project_dir),
+                env=env,
                 start_new_session=True,
             )
 
