@@ -666,25 +666,12 @@ class LiveSession:
         except Exception:
             return 0.0
 
-    async def _vad_monitor_stage(self):
-        """Monitor mic audio during playback for barge-in detection."""
-        if not self.barge_in_enabled:
-            return
-
-        self._load_vad_model()
-        if not self._vad_model:
-            return
-
-        print("Live session: VAD monitor started", flush=True)
-
-        try:
-            while self.running:
-                # TODO: For barge-in to work, we need to gate STT instead of muting mic source.
-                # Currently mic is muted via pactl during playback, so VAD can't hear speech.
-                await asyncio.sleep(0.1)
-
-        except Exception as e:
-            print(f"VAD monitor error: {e}", flush=True)
+    def _reset_vad_state(self):
+        """Reset VAD hidden state to avoid contamination between segments."""
+        if self._vad_state:
+            import numpy as np
+            self._vad_state['h'] = np.zeros((2, 1, 64), dtype=np.float32)
+            self._vad_state['c'] = np.zeros((2, 1, 64), dtype=np.float32)
 
     # ── Fallback: Whisper STT ────────────────────────────────────
 
@@ -1331,13 +1318,48 @@ class LiveSession:
                 if frame.type != FrameType.AUDIO_RAW:
                     continue
 
-                # Ignore audio during playback or when user-muted
-                if self.playing_audio or self.muted:
+                # Branch 1: User pressed mute — discard everything
+                if self.muted:
                     audio_buffer.clear()
                     silence_start = None
                     has_speech = False
                     speech_chunk_count = 0
+                    self._was_stt_gated = self._stt_gated
                     continue
+
+                # Branch 2: STT gated (AI playback) — run VAD but don't transcribe
+                if self._stt_gated:
+                    audio_buffer.clear()
+                    silence_start = None
+                    has_speech = False
+                    speech_chunk_count = 0
+                    self._was_stt_gated = True
+
+                    # Run VAD to detect barge-in speech
+                    if self.barge_in_enabled and self._vad_model and self.playing_audio:
+                        if time.time() < self._barge_in_cooldown_until:
+                            continue
+                        prob = self._run_vad(frame.data)
+                        if prob > 0.5:
+                            self._vad_speech_count += 1
+                            # ~0.5s sustained speech: 4096 bytes at 24kHz 16-bit = ~85ms per chunk
+                            # 0.5s / 0.085s ~ 6 chunks
+                            if self._vad_speech_count >= 6:
+                                print(f"Barge-in: Sustained speech detected ({self._vad_speech_count} chunks, prob={prob:.2f})", flush=True)
+                                await self._trigger_barge_in()
+                        else:
+                            self._vad_speech_count = 0
+                    continue
+
+                # Branch 3: Gated->ungated transition — reset silence tracking for clean start
+                if self._was_stt_gated:
+                    self._was_stt_gated = False
+                    audio_buffer.clear()
+                    silence_start = None
+                    has_speech = False
+                    speech_chunk_count = 0
+                    peak_rms = 0.0
+                    # Don't continue — fall through to normal audio processing below
 
                 audio_buffer.extend(frame.data)
 
@@ -1651,6 +1673,8 @@ class LiveSession:
             print("Live session: Interrupting response", flush=True)
             self.generation_id += 1
             self.playing_audio = False
+            self._stt_gated = False
+            self._vad_speech_count = 0
             # Drain pending audio and LLM queues
             for q in (self._audio_out_q, self._llm_out_q):
                 while not q.empty():
@@ -1692,6 +1716,10 @@ class LiveSession:
         self._spawn_learner()
         self._spawn_clip_factory()
 
+        # Load VAD model once at startup (used by STT stage for barge-in)
+        if self.barge_in_enabled:
+            self._load_vad_model()
+
         # Create pipeline queues
         self._audio_in_q = asyncio.Queue(maxsize=100)
         self._stt_out_q = asyncio.Queue(maxsize=50)
@@ -1719,8 +1747,6 @@ class LiveSession:
                 self._playback_stage(),
                 interrupt_loop(),
             ]
-            if self.barge_in_enabled:
-                stages.append(self._vad_monitor_stage())
 
             await asyncio.gather(*stages, return_exceptions=True)
         except Exception as e:
