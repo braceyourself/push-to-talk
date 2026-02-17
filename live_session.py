@@ -30,10 +30,6 @@ CHANNELS = 1
 CHUNK_SIZE = 4096  # bytes per read from pw-record
 BYTES_PER_SAMPLE = 2  # 16-bit PCM
 
-# Filler categories and keyword patterns for context-sensitive selection
-FILLER_TOOL_KEYWORDS = {"task", "spawn", "run", "check", "cancel", "status", "fix", "debug", "refactor", "build", "deploy"}
-FILLER_THINKING_KEYWORDS = {"think", "opinion", "should", "best", "recommend", "explain", "why", "how", "compare"}
-
 # TTS sentence buffer — accumulate text until a sentence boundary before sending to TTS
 SENTENCE_END_RE = re.compile(r'[.!?]\s|[.!?]$|\n')
 
@@ -97,7 +93,6 @@ class LiveSession:
         self.audio_done_time = 0
         self._interrupt_requested = False
         self.muted = False
-        self._spoken_filler = None  # Text spoken as filler, for dedup
 
         # Generation ID for interrupt coherence — all frames carry this.
         # On interrupt, ID increments; stages discard stale frames.
@@ -124,6 +119,7 @@ class LiveSession:
         # Conversation logging and learner
         self._session_log_path = None
         self._learner_process = None
+        self._clip_factory_process = None
 
         # Filler system
         self.fillers_enabled = fillers_enabled
@@ -234,6 +230,22 @@ class LiveSession:
             print(f"Live session: Learner spawned (PID {self._learner_process.pid})", flush=True)
         except Exception as e:
             print(f"Live session: Failed to spawn learner: {e}", flush=True)
+
+    def _spawn_clip_factory(self):
+        """Spawn the clip factory to top up the non-verbal filler pool."""
+        factory_script = Path(__file__).parent / "clip_factory.py"
+        if not factory_script.exists():
+            print("Live session: clip_factory.py not found, skipping", flush=True)
+            return
+        cmd = [sys.executable, str(factory_script)]
+        try:
+            self._clip_factory_process = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+            print(f"Live session: Clip factory spawned (PID {self._clip_factory_process.pid})", flush=True)
+        except Exception as e:
+            print(f"Live session: Failed to spawn clip factory: {e}", flush=True)
 
     # ── Task tools (reused unchanged) ──────────────────────────────
 
@@ -474,39 +486,32 @@ class LiveSession:
     # ── Filler System ────────────────────────────────────────────────
 
     def _load_filler_clips(self):
-        """Load pre-generated filler WAV files as raw PCM bytes."""
-        filler_dir = Path(__file__).parent / "audio" / "fillers"
+        """Load non-verbal filler WAV files as raw PCM bytes."""
+        filler_dir = Path(__file__).parent / "audio" / "fillers" / "nonverbal"
         if not filler_dir.exists():
-            print("Live session: No filler directory found, fillers disabled", flush=True)
+            print("Live session: No nonverbal filler directory found, fillers disabled", flush=True)
             self.fillers_enabled = False
             return
 
-        for category in ("acknowledge", "thinking", "tool_use"):
-            cat_dir = filler_dir / category
-            if not cat_dir.exists():
-                continue
-            clips = []
-            for wav_path in sorted(cat_dir.glob("*.wav")):
-                try:
-                    with wave.open(str(wav_path), 'rb') as wf:
-                        pcm = wf.readframes(wf.getnframes())
-                        rate = wf.getframerate()
-                    # Resample to SAMPLE_RATE if needed (e.g. Piper 22050 → 24000)
-                    if rate != SAMPLE_RATE:
-                        pcm = self._resample_22050_to_24000(pcm)
-                    clips.append(pcm)
-                except Exception as e:
-                    print(f"Live session: Error loading filler {wav_path}: {e}", flush=True)
-            if clips:
-                self._filler_clips[category] = clips
-                self._last_filler[category] = -1
+        clips = []
+        for wav_path in sorted(filler_dir.glob("*.wav")):
+            try:
+                with wave.open(str(wav_path), 'rb') as wf:
+                    pcm = wf.readframes(wf.getnframes())
+                    rate = wf.getframerate()
+                if rate != SAMPLE_RATE:
+                    pcm = self._resample_22050_to_24000(pcm)
+                clips.append(pcm)
+            except Exception as e:
+                print(f"Live session: Error loading filler {wav_path}: {e}", flush=True)
 
-        total = sum(len(c) for c in self._filler_clips.values())
-        if total == 0:
+        if clips:
+            self._filler_clips["nonverbal"] = clips
+            self._last_filler["nonverbal"] = -1
+            print(f"Live session: Loaded {len(clips)} non-verbal filler clips", flush=True)
+        else:
             print("Live session: No filler clips loaded, fillers disabled", flush=True)
             self.fillers_enabled = False
-        else:
-            print(f"Live session: Loaded {total} filler clips across {len(self._filler_clips)} categories", flush=True)
 
     def _pick_filler(self, category: str) -> bytes | None:
         """Pick a random filler clip from category, avoiding consecutive repeats."""
@@ -522,90 +527,34 @@ class LiveSession:
         self._last_filler[category] = idx
         return clips[idx]
 
-    def _classify_filler_category(self, text: str) -> str:
-        """Classify user text to select appropriate filler category."""
-        words = set(text.lower().split())
-        if words & FILLER_TOOL_KEYWORDS:
-            return "tool_use"
-        if words & FILLER_THINKING_KEYWORDS:
-            return "thinking"
-        return "acknowledge"
-
     async def _filler_manager(self, user_text: str, cancel_event: asyncio.Event):
-        """Smart filler: use local LLM for contextual acknowledgment, fall back to clips."""
-
+        """Play a non-verbal filler clip while waiting for LLM response."""
         # Stage 1: Wait 300ms gate — skip filler if LLM responds fast
         try:
             await asyncio.wait_for(cancel_event.wait(), timeout=0.3)
-            return  # LLM responded fast, no filler needed
+            return
         except asyncio.TimeoutError:
             pass
 
         if cancel_event.is_set():
             return
 
-        # Try smart filler via local Ollama
-        filler_text = await self._generate_smart_filler(user_text)
-        if filler_text and not cancel_event.is_set():
-            print(f"  [filler] Smart: \"{filler_text}\"", flush=True)
-            pcm = await self._tts_to_pcm(filler_text)
-            if pcm and not cancel_event.is_set():
-                self._spoken_filler = filler_text
-                await self._play_filler_audio(pcm, cancel_event)
-                return
+        # Play a non-verbal clip
+        clip = self._pick_filler("nonverbal")
+        if clip:
+            await self._play_filler_audio(clip, cancel_event)
 
-        # Fallback to canned clips if Ollama failed
-        if not cancel_event.is_set() and self.fillers_enabled:
-            category = self._classify_filler_category(user_text)
-            clip = self._pick_filler("acknowledge")
-            if clip:
-                await self._play_filler_audio(clip, cancel_event)
-
-        # Stage 2: If still waiting after 4s, play a thinking clip
+        # Stage 2: If still waiting after 4s, play another clip
         try:
             await asyncio.wait_for(cancel_event.wait(), timeout=4.0)
             return
         except asyncio.TimeoutError:
             pass
 
-        if self.fillers_enabled:
-            think_pcm = self._pick_filler("thinking")
-            if think_pcm:
-                await self._play_filler_audio(think_pcm, cancel_event)
-
-    async def _generate_smart_filler(self, user_text: str) -> str | None:
-        """Generate a brief contextual acknowledgment via local Ollama."""
-        import aiohttp
-        prompt = (
-            "Say a brief 2-4 word reaction. ONLY the reaction, no explanation.\n"
-            'User: "Hello" → Hey there.\n'
-            'User: "How are you?" → Doing great.\n'
-            'User: "Check the tests" → Checking now.\n'
-            'User: "What does this function do?" → Let me look.\n'
-            'User: "Fix the login bug" → On it.\n'
-            f'User: "{user_text}" →'
-        )
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "http://localhost:11434/api/generate",
-                    json={
-                        "model": "qwen2.5:1.5b",
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {"num_predict": 15, "temperature": 0.9},
-                    },
-                    timeout=aiohttp.ClientTimeout(total=1.5),
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        text = data.get("response", "").strip().strip('"\'').split("\n")[0].strip()
-                        # Sanity check: reject if too long, contains markdown, or is a full answer
-                        if text and len(text) < 30 and "*" not in text and "#" not in text and "?" not in text:
-                            return text
-        except Exception as e:
-            print(f"  [filler] Ollama error: {e}", flush=True)
-        return None
+        if not cancel_event.is_set():
+            clip = self._pick_filler("nonverbal")
+            if clip:
+                await self._play_filler_audio(clip, cancel_event)
 
     async def _tts_to_pcm(self, text: str) -> bytes | None:
         """Convert text to PCM audio via Piper. Returns resampled 24kHz bytes."""
@@ -1132,9 +1081,9 @@ class LiveSession:
                                             break
                                 if drained:
                                     print(f"  [tool] Drained {drained} pre-tool frames", flush=True)
-                                # Play a tool_use filler clip
+                                # Play a nonverbal filler clip
                                 if self.fillers_enabled:
-                                    clip = self._pick_filler("tool_use")
+                                    clip = self._pick_filler("nonverbal")
                                     if clip:
                                         asyncio.create_task(
                                             self._play_filler_audio(clip, asyncio.Event())
@@ -1180,14 +1129,6 @@ class LiveSession:
                                     sentence = sentence_buffer[:end_pos].strip()
                                     sentence_buffer = sentence_buffer[end_pos:]
                                     if sentence:
-                                        # Skip first sentence if it duplicates the filler
-                                        if self._spoken_filler:
-                                            filler_lower = self._spoken_filler.lower().rstrip('.!').strip()
-                                            sent_lower = sentence.lower().rstrip('.!').strip()
-                                            self._spoken_filler = None  # Only check first sentence
-                                            if filler_lower in sent_lower or sent_lower in filler_lower:
-                                                print(f"  [filler] Skipped duplicate: \"{sentence}\"", flush=True)
-                                                continue
                                         # Strip markdown for TTS
                                         clean = self._strip_markdown(sentence)
                                         if clean:
@@ -1479,7 +1420,6 @@ class LiveSession:
 
                 # Start filler manager (will be cancelled when LLM responds)
                 self._filler_cancel = asyncio.Event()
-                self._spoken_filler = None
                 filler_task = None
                 if self.fillers_enabled:
                     filler_task = asyncio.create_task(
@@ -1742,6 +1682,7 @@ class LiveSession:
         active_file.parent.mkdir(parents=True, exist_ok=True)
         active_file.write_text(str(self._session_log_path))
         self._spawn_learner()
+        self._spawn_clip_factory()
 
         # Create pipeline queues
         self._audio_in_q = asyncio.Queue(maxsize=100)
@@ -1791,6 +1732,20 @@ class LiveSession:
                     active_file.unlink(missing_ok=True)
             except Exception:
                 pass
+
+            # Clean up background processes
+            for name, proc in [("learner", self._learner_process),
+                               ("clip factory", self._clip_factory_process)]:
+                if proc and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=3)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    print(f"Live session: {name} stopped", flush=True)
 
             print("Live session: Pipeline stopped", flush=True)
 
