@@ -64,7 +64,7 @@ Plans:
 **Plans:** 2 plans
 
 Plans:
-- [ ] 04-01-PLAN.md -- Create clip factory daemon with generation, evaluation, and pool rotation
+- [x] 04-01-PLAN.md -- Create clip factory daemon with generation, evaluation, and pool rotation
 - [ ] 04-02-PLAN.md -- Remove smart filler code, simplify filler system, wire clip factory, clean up
 
 ### Phase 5: Barge-in (v1.1)
@@ -102,6 +102,6 @@ v1.1: 4 & 5 (parallel) → 6
 | 1. Mode Rename and Live Voice Session | 2/2 | Complete | 2026-02-13 |
 | 2. Async Task Infrastructure | 1/1 | Complete | 2026-02-15 |
 | 3. Voice-Controlled Task Orchestration | 2/2 | Complete | 2026-02-17 |
-| 4. Filler System Overhaul | 0/2 | Not started | - |
+| 4. Filler System Overhaul | 1/2 | In progress | - |
 | 5. Barge-in | 0/? | Not started | - |
 | 6. Polish & Verification | 0/? | Not started | - |
