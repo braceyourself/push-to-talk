@@ -78,7 +78,11 @@ Plans:
   3. Detection cancels current TTS playback and all queued audio frames
   4. Interrupted (unspoken) text is either excluded from context or marked as interrupted
   5. Conversation continues naturally after interruption
-**Plans**: TBD
+**Plans:** 2 plans
+
+Plans:
+- [ ] 05-01-PLAN.md -- STT gating, VAD detection in STT stage, barge-in trigger with fade-out and cooldown
+- [ ] 05-02-PLAN.md -- Sentence tracking, interruption context annotation, post-interrupt silence tuning
 
 ### Phase 6: Polish & Verification (v1.1)
 **Goal**: Verify and tune all pre-work features (STT filtering, tool-use speech suppression, overlay states) end-to-end to ensure they work correctly in real usage
@@ -104,5 +108,5 @@ v1.1: 4 & 5 (parallel) → 6
 | 2. Async Task Infrastructure | 1/1 | Complete | 2026-02-15 |
 | 3. Voice-Controlled Task Orchestration | 2/2 | Complete | 2026-02-17 |
 | 4. Filler System Overhaul | 2/2 | Complete | 2026-02-17 |
-| 5. Barge-in | 0/? | Not started | - |
+| 5. Barge-in | 0/2 | Not started | - |
 | 6. Polish & Verification | 0/? | Not started | - |
