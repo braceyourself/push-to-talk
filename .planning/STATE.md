@@ -5,24 +5,24 @@
 See: .planning/PROJECT.md (updated 2026-02-17)
 
 **Core value:** Natural, low-friction voice conversation with Claude that feels like talking to a person
-**Current focus:** v1.1 Voice UX Polish — Phase 5 in progress (Barge-in)
+**Current focus:** v1.1 Voice UX Polish — Phase 5 complete (Barge-in)
 
 ## Current Position
 
 Milestone: v1.1 Voice UX Polish
 Phase: 5 of 6 (Barge-in)
-Plan: 1 of 2
-Status: In progress
-Last activity: 2026-02-17 — Completed 05-01-PLAN.md (core barge-in mechanism)
+Plan: 2 of 2
+Status: Phase complete
+Last activity: 2026-02-17 — Completed 05-02-PLAN.md (barge-in intelligence layer)
 
-Progress: [█████████████████░░░░░░░░░░░░░░] 56% (5/9 v1.1 plans complete)
+Progress: [████████████████████░░░░░░░░░░░] 67% (6/9 v1.1 plans complete)
 
 ## Performance Metrics
 
 **v1.0 Velocity:**
-- Total plans completed: 5
-- Average duration: ~10 minutes
-- Total execution time: ~48 minutes
+- Total plans completed: 6
+- Average duration: ~9 minutes
+- Total execution time: ~51 minutes
 
 **By Phase:**
 
@@ -32,7 +32,7 @@ Progress: [█████████████████░░░░░░
 | 02 | 1/1 | ~3min | ~3min |
 | 03 | 2/2 | ~3min | ~3min |
 | 04 | 2/2 | ~7.5min | ~3.75min |
-| 05 | 1/2 | ~3min | ~3min |
+| 05 | 2/2 | ~5.5min | ~2.75min |
 
 *Updated after each plan completion*
 
@@ -58,6 +58,10 @@ Phase 5 additions:
 - 1.5s cooldown after barge-in prevents rapid-fire re-triggers
 - Trailing filler: 150ms nonverbal clip with 0.8->0.0 linear fade for natural cutoff
 - Three-branch audio processing in _stt_stage: muted / gated (VAD) / normal
+- Sentence tracking at 3 flush sites for spoken/unspoken annotation on barge-in
+- Annotation prepended to next user message (not separate turn) so AI knows it was cut off
+- Post-barge-in silence threshold 0.4s (vs 0.8s normal) for faster response after interruption
+- No separate overlay state for barge-in -- status transition is the visual acknowledgment
 
 ### Pending Todos
 
@@ -69,6 +73,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-02-17T23:21:54Z
-Stopped at: Completed 05-01-PLAN.md — core barge-in mechanism implemented
+Last session: 2026-02-17T23:27:15Z
+Stopped at: Completed 05-02-PLAN.md — barge-in intelligence layer (phase 5 complete)
 Resume file: None
