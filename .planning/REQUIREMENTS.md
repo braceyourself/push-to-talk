@@ -66,10 +66,10 @@
 
 ### Barge-in
 
-- [ ] **BARGE-01**: User can interrupt AI mid-speech by speaking
-- [ ] **BARGE-02**: VAD detects speech during playback without muting the mic
-- [ ] **BARGE-03**: Interruption cancels current TTS playback and queued audio
-- [ ] **BARGE-04**: Interrupted speech is not sent as context (or marked as interrupted)
+- [x] **BARGE-01**: User can interrupt AI mid-speech by speaking
+- [x] **BARGE-02**: VAD detects speech during playback without muting the mic
+- [x] **BARGE-03**: Interruption cancels current TTS playback and queued audio
+- [x] **BARGE-04**: Interrupted speech is not sent as context (or marked as interrupted)
 
 ### Overlay
 
@@ -145,10 +145,10 @@
 | STT-02 | Phase 6 | Pending |
 | FLOW-01 | Phase 6 | Complete (pre-work) |
 | FLOW-02 | Phase 6 | Complete (pre-work) |
-| BARGE-01 | Phase 5 | Pending |
-| BARGE-02 | Phase 5 | Pending |
-| BARGE-03 | Phase 5 | Pending |
-| BARGE-04 | Phase 5 | Pending |
+| BARGE-01 | Phase 5 | Complete |
+| BARGE-02 | Phase 5 | Complete |
+| BARGE-03 | Phase 5 | Complete |
+| BARGE-04 | Phase 5 | Complete |
 | OVL-01 | Phase 6 | Complete (pre-work) |
 | OVL-02 | Phase 6 | Complete (pre-work) |
 

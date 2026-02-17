@@ -20,7 +20,7 @@ This roadmap covers all milestones. v1.0 delivered the core live voice session w
 ### v1.1: Voice UX Polish
 
 - [x] **Phase 4: Filler System Overhaul** - Replace smart fillers with non-verbal clips and a clip factory subprocess
-- [ ] **Phase 5: Barge-in** - User can interrupt AI mid-speech via voice activity detection
+- [x] **Phase 5: Barge-in** - User can interrupt AI mid-speech via voice activity detection
 - [ ] **Phase 6: Polish & Verification** - Verify and tune all pre-work features end-to-end
 
 ## Phase Details
@@ -68,10 +68,11 @@ Plans:
 - [x] 04-01-PLAN.md -- Create clip factory daemon with generation, evaluation, and pool rotation
 - [x] 04-02-PLAN.md -- Remove smart filler code, simplify filler system, wire clip factory, clean up
 
-### Phase 5: Barge-in (v1.1)
+### Phase 5: Barge-in (v1.1) ✓
 **Goal**: User can interrupt AI mid-speech by speaking, which cancels current TTS playback and queued audio, allowing the conversation to continue naturally
 **Depends on**: Nothing (independent of other v1.1 phases)
 **Requirements**: BARGE-01, BARGE-02, BARGE-03, BARGE-04
+**Status**: Complete (2026-02-17)
 **Success Criteria** (what must be TRUE):
   1. User can speak while AI is talking and be heard (mic not muted during playback)
   2. VAD detects user speech during AI playback
@@ -81,8 +82,8 @@ Plans:
 **Plans:** 2 plans
 
 Plans:
-- [ ] 05-01-PLAN.md -- STT gating, VAD detection in STT stage, barge-in trigger with fade-out and cooldown
-- [ ] 05-02-PLAN.md -- Sentence tracking, interruption context annotation, post-interrupt silence tuning
+- [x] 05-01-PLAN.md -- STT gating, VAD detection in STT stage, barge-in trigger with fade-out and cooldown
+- [x] 05-02-PLAN.md -- Sentence tracking, interruption context annotation, post-interrupt silence tuning
 
 ### Phase 6: Polish & Verification (v1.1)
 **Goal**: Verify and tune all pre-work features (STT filtering, tool-use speech suppression, overlay states) end-to-end to ensure they work correctly in real usage
@@ -108,5 +109,5 @@ v1.1: 4 & 5 (parallel) → 6
 | 2. Async Task Infrastructure | 1/1 | Complete | 2026-02-15 |
 | 3. Voice-Controlled Task Orchestration | 2/2 | Complete | 2026-02-17 |
 | 4. Filler System Overhaul | 2/2 | Complete | 2026-02-17 |
-| 5. Barge-in | 0/2 | Not started | - |
+| 5. Barge-in | 2/2 | Complete | 2026-02-17 |
 | 6. Polish & Verification | 0/? | Not started | - |
