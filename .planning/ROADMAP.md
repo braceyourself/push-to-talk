@@ -95,7 +95,12 @@ Plans:
   3. Only the final post-tool response is spoken; inter-tool narration is discarded
   4. All overlay status states (listening, thinking, tool_use, speaking, idle, muted) render correctly
   5. Status history panel shows transitions with timestamps
-**Plans**: TBD
+**Plans:** 3 plans
+
+Plans:
+- [ ] 06-01-PLAN.md -- Multi-layer Whisper filtering (logprob + compression ratio) and STT rejection flash in overlay
+- [ ] 06-02-PLAN.md -- Acknowledgment clip factory, gated pre-tool playback, tool intent map, JSON status metadata
+- [ ] 06-03-PLAN.md -- Dynamic tool-use overlay with intent labels, history enrichment, end-to-end verification
 
 ## Progress
 
@@ -110,4 +115,4 @@ v1.1: 4 & 5 (parallel) → 6
 | 3. Voice-Controlled Task Orchestration | 2/2 | Complete | 2026-02-17 |
 | 4. Filler System Overhaul | 2/2 | Complete | 2026-02-17 |
 | 5. Barge-in | 2/2 | Complete | 2026-02-17 |
-| 6. Polish & Verification | 0/? | Not started | - |
+| 6. Polish & Verification | 0/3 | Not started | - |
