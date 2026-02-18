@@ -8,7 +8,7 @@ This roadmap covers all milestones. v1.0 delivered the core live voice session w
 
 **Phase Numbering:**
 - Integer phases (1, 2, 3): v1.0 milestone (complete)
-- Phases 4-6: v1.1 Voice UX Polish
+- Phases 4-7: v1.1 Voice UX Polish
 - Decimal phases (e.g., 4.1): Urgent insertions (marked with INSERTED)
 
 ### v1.0: Live Mode (Complete)
@@ -22,6 +22,7 @@ This roadmap covers all milestones. v1.0 delivered the core live voice session w
 - [x] **Phase 4: Filler System Overhaul** - Replace smart fillers with non-verbal clips and a clip factory subprocess
 - [x] **Phase 5: Barge-in** - User can interrupt AI mid-speech via voice activity detection
 - [x] **Phase 6: Polish & Verification** - Verify and tune all pre-work features end-to-end
+- [ ] **Phase 7: Nonverbal System Cleanup** - Fix broken barge-in trailing filler, remove orphaned nonverbal code and assets
 
 ## Phase Details
 
@@ -103,11 +104,26 @@ Plans:
 - [x] 06-02-PLAN.md -- Acknowledgment clip factory, gated pre-tool playback, tool intent map, JSON status metadata
 - [x] 06-03-PLAN.md -- Dynamic tool-use overlay with intent labels, history enrichment, end-to-end verification
 
+### Phase 7: Nonverbal System Cleanup (v1.1)
+**Goal**: Fix broken barge-in trailing filler and remove all orphaned nonverbal filler code/assets left behind when Phase 6 dropped the nonverbal system
+**Depends on**: Phase 6 (gap closure from milestone audit)
+**Requirements**: FILL-02 (documentation update)
+**Gap Closure**: Closes all gaps from v1.1-MILESTONE-AUDIT.md
+**Status**: Not started
+**Success Criteria** (what must be TRUE):
+  1. Barge-in trailing filler plays an acknowledgment clip (not silently skipped)
+  2. No nonverbal clip generation code remains in clip_factory.py
+  3. No unused nonverbal audio files on disk
+  4. FILL-02 requirement text reflects the actual acknowledgment-phrase behavior
+
+Plans:
+- [ ] 07-01-PLAN.md -- Fix barge-in filler, remove nonverbal generation/assets, update docs
+
 ## Progress
 
 **Execution Order:**
 v1.0: 1 → 2 → 3 (complete)
-v1.1: 4 & 5 (parallel) → 6
+v1.1: 4 & 5 (parallel) → 6 → 7
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
@@ -117,3 +133,4 @@ v1.1: 4 & 5 (parallel) → 6
 | 4. Filler System Overhaul | 2/2 | Complete | 2026-02-17 |
 | 5. Barge-in | 2/2 | Complete | 2026-02-17 |
 | 6. Polish & Verification | 3/3 | Complete | 2026-02-18 |
+| 7. Nonverbal System Cleanup | 0/1 | Not started | — |
