@@ -5,24 +5,24 @@
 See: .planning/PROJECT.md (updated 2026-02-17)
 
 **Core value:** Natural, low-friction voice conversation with Claude that feels like talking to a person
-**Current focus:** v1.1 Voice UX Polish — Phase 6 in progress (Polish & Verification)
+**Current focus:** v1.1 Voice UX Polish — Complete
 
 ## Current Position
 
 Milestone: v1.1 Voice UX Polish
 Phase: 6 of 6 (Polish & Verification)
-Plan: 2 of 3
-Status: In progress
-Last activity: 2026-02-18 — Completed 06-02-PLAN.md (pre-tool acknowledgment clips + tool intent)
+Plan: 3 of 3
+Status: Milestone complete
+Last activity: 2026-02-18 — Completed Phase 6 (Polish & Verification)
 
-Progress: [█████████████████████████░░░░░░] 89% (8/9 v1.1 plans complete)
+Progress: [██████████████████████████████] 100% (9/9 v1.1 plans complete)
 
 ## Performance Metrics
 
 **v1.0 Velocity:**
-- Total plans completed: 8
+- Total plans completed: 9
 - Average duration: ~7 minutes
-- Total execution time: ~55 minutes
+- Total execution time: ~60 minutes
 
 **By Phase:**
 
@@ -33,7 +33,7 @@ Progress: [███████████████████████
 | 03 | 2/2 | ~3min | ~3min |
 | 04 | 2/2 | ~7.5min | ~3.75min |
 | 05 | 2/2 | ~5.5min | ~2.75min |
-| 06 | 2/3 | ~4min | ~2min |
+| 06 | 3/3 | ~20min | ~6.5min |
 
 *Updated after each plan completion*
 
@@ -69,9 +69,12 @@ Phase 6 additions:
 - stt_rejected as transient overlay flash (300ms dot dim), not a state transition
 - Clip factory refactored to generic _top_up helper supporting multiple pool categories
 - Acknowledgment clip pool: 10-15 verbal phrases, relaxed quality thresholds (0.3-4.0s, RMS > 200)
+- Nonverbal filler clips dropped — Piper TTS can't produce natural interjections
+- Acknowledgment clips used for all filler roles (pre-response + pre-tool)
 - Gated pre-tool acknowledgment: 300ms asyncio gate, skips if tool completes fast
-- TOOL_INTENT_MAP maps MCP tool names to human-readable intents for overlay display
+- TOOL_INTENT_MAP maps MCP tool names to human-readable intents (with MCP prefix stripping)
 - _set_status accepts optional metadata dict, serialized as JSON through existing callback chain
+- Overlay parses JSON status for tool intent display, coalesces consecutive tool_use history entries
 
 ### Pending Todos
 
@@ -83,6 +86,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-02-18T12:52:10Z
-Stopped at: Completed 06-02-PLAN.md — pre-tool acknowledgment clips + tool intent
+Last session: 2026-02-18T13:00:00Z
+Stopped at: Milestone v1.1 complete
 Resume file: None

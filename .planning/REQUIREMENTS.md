@@ -57,7 +57,7 @@
 ### STT Reliability
 
 - [x] **STT-01**: Whisper no_speech_prob filtering rejects non-speech segments (committed)
-- [ ] **STT-02**: False trigger rate reduced — throat clearing, coughs, ambient noise don't trigger transcription
+- [x] **STT-02**: False trigger rate reduced — throat clearing, coughs, ambient noise don't trigger transcription
 
 ### Speech Flow
 
@@ -141,16 +141,16 @@
 | FILL-03 | Phase 4 | Complete |
 | FILL-04 | Phase 4 | Complete |
 | FILL-05 | Phase 4 | Complete |
-| STT-01 | Phase 6 | Complete (pre-work) |
-| STT-02 | Phase 6 | Pending |
-| FLOW-01 | Phase 6 | Complete (pre-work) |
-| FLOW-02 | Phase 6 | Complete (pre-work) |
+| STT-01 | Phase 6 | Complete |
+| STT-02 | Phase 6 | Complete |
+| FLOW-01 | Phase 6 | Complete |
+| FLOW-02 | Phase 6 | Complete |
 | BARGE-01 | Phase 5 | Complete |
 | BARGE-02 | Phase 5 | Complete |
 | BARGE-03 | Phase 5 | Complete |
 | BARGE-04 | Phase 5 | Complete |
-| OVL-01 | Phase 6 | Complete (pre-work) |
-| OVL-02 | Phase 6 | Complete (pre-work) |
+| OVL-01 | Phase 6 | Complete |
+| OVL-02 | Phase 6 | Complete |
 
 **Coverage:**
 - v1.0 requirements: 24 total, all mapped

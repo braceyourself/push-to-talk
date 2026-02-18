@@ -21,7 +21,7 @@ This roadmap covers all milestones. v1.0 delivered the core live voice session w
 
 - [x] **Phase 4: Filler System Overhaul** - Replace smart fillers with non-verbal clips and a clip factory subprocess
 - [x] **Phase 5: Barge-in** - User can interrupt AI mid-speech via voice activity detection
-- [ ] **Phase 6: Polish & Verification** - Verify and tune all pre-work features end-to-end
+- [x] **Phase 6: Polish & Verification** - Verify and tune all pre-work features end-to-end
 
 ## Phase Details
 
@@ -85,10 +85,11 @@ Plans:
 - [x] 05-01-PLAN.md -- STT gating, VAD detection in STT stage, barge-in trigger with fade-out and cooldown
 - [x] 05-02-PLAN.md -- Sentence tracking, interruption context annotation, post-interrupt silence tuning
 
-### Phase 6: Polish & Verification (v1.1)
+### Phase 6: Polish & Verification (v1.1) ✓
 **Goal**: Verify and tune all pre-work features (STT filtering, tool-use speech suppression, overlay states) end-to-end to ensure they work correctly in real usage
 **Depends on**: Phase 4, Phase 5 (run after new features are stable)
 **Requirements**: STT-01, STT-02, FLOW-01, FLOW-02, OVL-01, OVL-02
+**Status**: Complete (2026-02-18)
 **Success Criteria** (what must be TRUE):
   1. Whisper no_speech_prob filtering correctly rejects throat clearing, coughs, ambient noise
   2. STT false trigger rate is acceptably low in real usage
@@ -98,9 +99,9 @@ Plans:
 **Plans:** 3 plans
 
 Plans:
-- [ ] 06-01-PLAN.md -- Multi-layer Whisper filtering (logprob + compression ratio) and STT rejection flash in overlay
-- [ ] 06-02-PLAN.md -- Acknowledgment clip factory, gated pre-tool playback, tool intent map, JSON status metadata
-- [ ] 06-03-PLAN.md -- Dynamic tool-use overlay with intent labels, history enrichment, end-to-end verification
+- [x] 06-01-PLAN.md -- Multi-layer Whisper filtering (logprob + compression ratio) and STT rejection flash in overlay
+- [x] 06-02-PLAN.md -- Acknowledgment clip factory, gated pre-tool playback, tool intent map, JSON status metadata
+- [x] 06-03-PLAN.md -- Dynamic tool-use overlay with intent labels, history enrichment, end-to-end verification
 
 ## Progress
 
@@ -115,4 +116,4 @@ v1.1: 4 & 5 (parallel) → 6
 | 3. Voice-Controlled Task Orchestration | 2/2 | Complete | 2026-02-17 |
 | 4. Filler System Overhaul | 2/2 | Complete | 2026-02-17 |
 | 5. Barge-in | 2/2 | Complete | 2026-02-17 |
-| 6. Polish & Verification | 0/3 | Not started | - |
+| 6. Polish & Verification | 3/3 | Complete | 2026-02-18 |
