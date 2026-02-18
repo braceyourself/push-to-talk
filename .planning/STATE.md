@@ -12,8 +12,8 @@ See: .planning/PROJECT.md (updated 2026-02-18)
 Milestone: v1.2 Adaptive Quick Responses
 Phase: Not started
 Plan: Not started
-Status: Ready to plan
-Last activity: 2026-02-18 — v1.1 milestone complete
+Status: Defining requirements
+Last activity: 2026-02-18 — Milestone v1.2 started
 
 Progress: [                              ] 0% (milestone not yet planned)
 
@@ -49,5 +49,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-18
-Stopped at: v1.1 milestone archived, v1.2 seeded
+Stopped at: v1.2 milestone initialization
 Resume file: None

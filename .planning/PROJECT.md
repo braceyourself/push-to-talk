@@ -14,7 +14,7 @@ Natural, low-friction voice conversation with Claude that feels like talking to 
 
 **Status:** All 15 requirements satisfied, 4/4 phases passed. Audit passed 2026-02-18.
 
-## Next Milestone: v1.2 Adaptive Quick Responses
+## Current Milestone: v1.2 Adaptive Quick Responses
 
 **Goal:** Replace the dumb filler system with an AI-driven quick response library that learns what to say based on context — making the assistant feel socially aware, not just technically capable.
 
@@ -85,4 +85,4 @@ The live mode evolved from the original OpenAI Realtime API plan into a Claude C
 | AI-driven quick response library | Dumb random fillers sound wrong in context; AI should choose what to say | — v1.2 |
 
 ---
-*Last updated: 2026-02-18 after v1.1 milestone*
+*Last updated: 2026-02-18 after v1.2 milestone started*
