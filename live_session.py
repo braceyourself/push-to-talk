@@ -257,7 +257,7 @@ class LiveSession:
             print(f"Live session: Failed to spawn learner: {e}", flush=True)
 
     def _spawn_clip_factory(self):
-        """Spawn the clip factory to top up the non-verbal filler pool."""
+        """Spawn the clip factory to top up the acknowledgment filler pool."""
         factory_script = Path(__file__).parent / "clip_factory.py"
         if not factory_script.exists():
             print("Live session: clip_factory.py not found, skipping", flush=True)
@@ -568,7 +568,7 @@ class LiveSession:
         if cancel_event.is_set():
             return
 
-        # Play an acknowledgment clip (verbal phrases sound natural, nonverbal don't)
+        # Play an acknowledgment clip
         clip = self._pick_filler("acknowledgment")
         if clip:
             await self._play_filler_audio(clip, cancel_event)
@@ -1825,9 +1825,9 @@ class LiveSession:
         # 8. Unmute mic (undo the _llm_stage mute from thinking phase)
         self._unmute_mic()
 
-        # 9. Play a trailing non-verbal filler clip for naturalness
+        # 9. Play a trailing acknowledgment filler clip for naturalness
         if self.fillers_enabled:
-            clip = self._pick_filler("nonverbal")
+            clip = self._pick_filler("acknowledgment")
             if clip:
                 gen_id = self.generation_id
                 # Only queue the first ~150ms worth of clip for a brief trail
