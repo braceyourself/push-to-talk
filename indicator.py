@@ -1861,6 +1861,7 @@ class LiveOverlayWidget(Gtk.Window):
         self.status = 'idle'
         self.status_history = []  # [(HH:MM:SS, status), ...] capped at 50
         self.expanded = False
+        self._rejection_flash = False
 
         # Drag state
         self.dragging = False
@@ -1957,7 +1958,8 @@ class LiveOverlayWidget(Gtk.Window):
         dot_x = 22
         dot_y = self.OVERLAY_HEIGHT / 2
         dot_color = self.DOT_COLORS.get(self.status, self.DOT_COLORS['idle'])
-        cr.set_source_rgba(dot_color[0], dot_color[1], dot_color[2], 1.0)
+        dot_alpha = 0.3 if self._rejection_flash else 1.0
+        cr.set_source_rgba(dot_color[0], dot_color[1], dot_color[2], dot_alpha)
         cr.arc(dot_x, dot_y, self.DOT_RADIUS, 0, 2 * PI)
         cr.fill()
 
@@ -2024,8 +2026,23 @@ class LiveOverlayWidget(Gtk.Window):
 
         return False
 
+    def _flash_rejection(self):
+        """Brief visual indicator that audio was filtered."""
+        self._rejection_flash = True
+        self.queue_draw()
+        GLib.timeout_add(300, self._clear_rejection_flash)
+
+    def _clear_rejection_flash(self):
+        """Clear rejection flash after timeout."""
+        self._rejection_flash = False
+        self.queue_draw()
+        return False  # Don't repeat the timer
+
     def update_status(self, status):
         """Update the displayed status. Call from any thread via GLib.idle_add."""
+        if status == 'stt_rejected':
+            self._flash_rejection()
+            return
         if status != self.status:
             timestamp = time.strftime("%H:%M:%S")
             self.status_history.append((timestamp, status))
