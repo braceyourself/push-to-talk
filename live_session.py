@@ -514,51 +514,33 @@ class LiveSession:
     # ── Filler System ────────────────────────────────────────────────
 
     def _load_filler_clips(self):
-        """Load non-verbal filler WAV files as raw PCM bytes."""
-        filler_dir = Path(__file__).parent / "audio" / "fillers" / "nonverbal"
-        if not filler_dir.exists():
-            print("Live session: No nonverbal filler directory found, fillers disabled", flush=True)
+        """Load acknowledgment WAV clips as raw PCM bytes."""
+        # Load acknowledgment clips (verbal phrases like "let me check that")
+        ack_dir = Path(__file__).parent / "audio" / "fillers" / "acknowledgment"
+        if not ack_dir.exists():
+            print("Live session: No acknowledgment clips found, fillers disabled", flush=True)
             self.fillers_enabled = False
             return
 
-        clips = []
-        for wav_path in sorted(filler_dir.glob("*.wav")):
+        ack_clips = []
+        for wav_path in sorted(ack_dir.glob("*.wav")):
             try:
                 with wave.open(str(wav_path), 'rb') as wf:
                     pcm = wf.readframes(wf.getnframes())
                     rate = wf.getframerate()
                 if rate != SAMPLE_RATE:
                     pcm = self._resample_22050_to_24000(pcm)
-                clips.append(pcm)
+                ack_clips.append(pcm)
             except Exception as e:
-                print(f"Live session: Error loading filler {wav_path}: {e}", flush=True)
+                print(f"Live session: Error loading ack clip {wav_path}: {e}", flush=True)
 
-        if clips:
-            self._filler_clips["nonverbal"] = clips
-            self._last_filler["nonverbal"] = -1
-            print(f"Live session: Loaded {len(clips)} non-verbal filler clips", flush=True)
+        if ack_clips:
+            self._filler_clips["acknowledgment"] = ack_clips
+            self._last_filler["acknowledgment"] = -1
+            print(f"Live session: Loaded {len(ack_clips)} acknowledgment clips", flush=True)
         else:
-            print("Live session: No filler clips loaded, fillers disabled", flush=True)
+            print("Live session: No acknowledgment clips loaded, fillers disabled", flush=True)
             self.fillers_enabled = False
-
-        # Load acknowledgment clips (verbal phrases like "let me check that")
-        ack_dir = Path(__file__).parent / "audio" / "fillers" / "acknowledgment"
-        if ack_dir.exists():
-            ack_clips = []
-            for wav_path in sorted(ack_dir.glob("*.wav")):
-                try:
-                    with wave.open(str(wav_path), 'rb') as wf:
-                        pcm = wf.readframes(wf.getnframes())
-                        rate = wf.getframerate()
-                    if rate != SAMPLE_RATE:
-                        pcm = self._resample_22050_to_24000(pcm)
-                    ack_clips.append(pcm)
-                except Exception as e:
-                    print(f"Live session: Error loading ack clip {wav_path}: {e}", flush=True)
-            if ack_clips:
-                self._filler_clips["acknowledgment"] = ack_clips
-                self._last_filler["acknowledgment"] = -1
-                print(f"Live session: Loaded {len(ack_clips)} acknowledgment clips", flush=True)
 
     def _pick_filler(self, category: str) -> bytes | None:
         """Pick a random filler clip from category, avoiding consecutive repeats."""
@@ -575,10 +557,10 @@ class LiveSession:
         return clips[idx]
 
     async def _filler_manager(self, user_text: str, cancel_event: asyncio.Event):
-        """Play a non-verbal filler clip while waiting for LLM response."""
-        # Stage 1: Wait 300ms gate — skip filler if LLM responds fast
+        """Play an acknowledgment clip while waiting for LLM response."""
+        # Wait 500ms gate — skip if LLM responds fast
         try:
-            await asyncio.wait_for(cancel_event.wait(), timeout=0.3)
+            await asyncio.wait_for(cancel_event.wait(), timeout=0.5)
             return
         except asyncio.TimeoutError:
             pass
@@ -586,22 +568,10 @@ class LiveSession:
         if cancel_event.is_set():
             return
 
-        # Play a non-verbal clip
-        clip = self._pick_filler("nonverbal")
+        # Play an acknowledgment clip (verbal phrases sound natural, nonverbal don't)
+        clip = self._pick_filler("acknowledgment")
         if clip:
             await self._play_filler_audio(clip, cancel_event)
-
-        # Stage 2: If still waiting after 4s, play another clip
-        try:
-            await asyncio.wait_for(cancel_event.wait(), timeout=4.0)
-            return
-        except asyncio.TimeoutError:
-            pass
-
-        if not cancel_event.is_set():
-            clip = self._pick_filler("nonverbal")
-            if clip:
-                await self._play_filler_audio(clip, cancel_event)
 
     async def _tts_to_pcm(self, text: str) -> bytes | None:
         """Convert text to PCM audio via Piper. Returns resampled 24kHz bytes."""
@@ -649,22 +619,10 @@ class LiveSession:
         if cancel_event.is_set() or self.generation_id != gen_id:
             return
 
-        # Try acknowledgment clip first, fall back to nonverbal
-        clip = self._pick_filler("acknowledgment") or self._pick_filler("nonverbal")
+        # Play acknowledgment clip
+        clip = self._pick_filler("acknowledgment")
         if clip:
             await self._play_filler_audio(clip, cancel_event)
-
-        # If tool use continues for 4+ more seconds, play a nonverbal filler
-        try:
-            await asyncio.wait_for(cancel_event.wait(), timeout=4.0)
-            return
-        except asyncio.TimeoutError:
-            pass
-
-        if not cancel_event.is_set() and self.generation_id == gen_id:
-            clip = self._pick_filler("nonverbal")
-            if clip:
-                await self._play_filler_audio(clip, cancel_event)
 
     # ── VAD Barge-in ──────────────────────────────────────────────
 
