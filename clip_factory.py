@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Background clip factory daemon for non-verbal filler generation.
+Acknowledgment clip factory daemon.
 
-Generates, evaluates, and manages rotating pools of audio clips via Piper TTS:
-- Non-verbal fillers (hums, breaths) for thinking pauses
-- Acknowledgment phrases ("let me check that") for pre-tool feedback
+Generates, evaluates, and manages a rotating pool of acknowledgment phrase
+audio clips ("let me check that", "one sec", etc.) via Piper TTS for use as
+pre-response and pre-tool fillers in live voice sessions.
 
 Can run as a one-shot pool top-up or as a background daemon that periodically
-ensures the pools stay healthy.
+ensures the pool stays healthy.
 
 Usage:
-    python clip_factory.py              # One-shot: top up pools and exit
+    python clip_factory.py              # One-shot: top up pool and exit
     python clip_factory.py --daemon     # Daemon: top up every N seconds
     python clip_factory.py --daemon --interval 600
 """
@@ -33,16 +33,7 @@ import numpy as np
 PIPER_CMD = str(Path.home() / ".local" / "share" / "push-to-talk" / "venv" / "bin" / "piper")
 PIPER_MODEL = str(Path.home() / ".local" / "share" / "push-to-talk" / "piper-voices" / "en_US-lessac-medium.onnx")
 
-CLIP_DIR = Path(__file__).parent / "audio" / "fillers" / "nonverbal"
-POOL_META = Path(__file__).parent / "audio" / "fillers" / "pool.json"
-
-POOL_SIZE_CAP = 20   # Maximum clips in the pool
-MIN_POOL_SIZE = 10   # Generate until reaching this
 SAMPLE_RATE = 22050  # Piper native sample rate
-
-# Non-verbal prompts — must be real speakable words/phrases so Piper
-# doesn't spell them out letter-by-letter (e.g. "Hm" → "H-M")
-PROMPTS = ["um", "uh huh", "ah", "oh", "uh", "huh", "okay", "right"]
 
 # Acknowledgment clip pool
 ACK_CLIP_DIR = Path(__file__).parent / "audio" / "fillers" / "acknowledgment"
@@ -77,16 +68,6 @@ log = logging.getLogger("clip_factory")
 # ---------------------------------------------------------------------------
 # Synthesis parameter generation
 # ---------------------------------------------------------------------------
-
-def random_synthesis_params() -> dict:
-    """Return randomized Piper TTS parameters for nonverbal clip diversity."""
-    return {
-        "prompt": random.choice(PROMPTS),
-        "length_scale": round(random.uniform(0.7, 1.8), 2),
-        "noise_w_scale": round(random.uniform(0.3, 1.5), 2),
-        "noise_scale": round(random.uniform(0.4, 1.0), 2),
-    }
-
 
 def random_ack_params() -> dict:
     """Return randomized Piper TTS parameters for acknowledgment phrases."""
@@ -137,12 +118,10 @@ def generate_clip(prompt: str, length_scale: float, noise_w: float, noise_scale:
 # Quality evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_clip(pcm_data: bytes, category: str = "nonverbal") -> dict:
+def evaluate_clip(pcm_data: bytes, category: str = "acknowledgment") -> dict:
     """Evaluate audio quality of raw PCM data. Returns scores dict with pass/fail.
 
-    Category adjusts thresholds:
-    - "nonverbal": Short hums/breaths (0.2-2.0s, RMS > 300)
-    - "acknowledgment": Full phrases (0.3-4.0s, RMS > 200)
+    Thresholds tuned for acknowledgment phrases (0.3-4.0s, RMS > 200).
     """
     samples = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float64)
     n = len(samples)
@@ -163,20 +142,12 @@ def evaluate_clip(pcm_data: bytes, category: str = "nonverbal") -> dict:
     clipping_ratio = float(np.sum(np.abs(samples) >= 32000) / n)
     silence_ratio = float(np.sum(np.abs(samples) < 500) / n)
 
-    if category == "acknowledgment":
-        passes = (
-            0.3 <= duration <= 4.0    # Longer for full phrases
-            and rms > 200             # Slightly lower — phrases may be quieter
-            and clipping_ratio < 0.01
-            and silence_ratio < 0.5   # Less silence tolerance
-        )
-    else:
-        passes = (
-            0.2 <= duration <= 2.0
-            and rms > 300
-            and clipping_ratio < 0.01
-            and silence_ratio < 0.7
-        )
+    passes = (
+        0.3 <= duration <= 4.0    # Full phrases
+        and rms > 200             # Phrases may be quieter than hums
+        and clipping_ratio < 0.01
+        and silence_ratio < 0.5   # Less silence tolerance
+    )
 
     return {
         "duration": round(duration, 3),
@@ -216,11 +187,6 @@ def save_clip_to(pcm_data: bytes, filename: str, clip_dir: Path) -> Path:
     return filepath
 
 
-def save_clip(pcm_data: bytes, filename: str) -> Path:
-    """Write raw PCM data to a WAV file in the nonverbal directory. Returns the full path."""
-    return save_clip_to(pcm_data, filename, CLIP_DIR)
-
-
 # ---------------------------------------------------------------------------
 # Pool metadata persistence
 # ---------------------------------------------------------------------------
@@ -240,16 +206,6 @@ def _save_meta(meta: list[dict], meta_path: Path) -> None:
     """Write pool metadata to JSON file."""
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(meta, indent=2) + "\n")
-
-
-def load_pool_meta() -> list[dict]:
-    """Read pool.json. Returns empty list if file missing or corrupt."""
-    return _load_meta(POOL_META)
-
-
-def save_pool_meta(meta: list[dict]) -> None:
-    """Write pool metadata to pool.json."""
-    _save_meta(meta, POOL_META)
 
 
 # ---------------------------------------------------------------------------
@@ -272,11 +228,6 @@ def _rotate_pool(meta: list[dict], clip_dir: Path, size_cap: int) -> list[dict]:
             log.info("Rotated out: %s", oldest["filename"])
 
     return meta
-
-
-def rotate_pool(meta: list[dict]) -> list[dict]:
-    """Remove oldest clips when pool exceeds POOL_SIZE_CAP."""
-    return _rotate_pool(meta, CLIP_DIR, POOL_SIZE_CAP)
 
 
 # ---------------------------------------------------------------------------
@@ -359,12 +310,6 @@ def _top_up(clip_dir: Path, meta_path: Path, min_size: int, size_cap: int,
 # Public pool management functions
 # ---------------------------------------------------------------------------
 
-def top_up_pool() -> None:
-    """Generate nonverbal clips until the pool reaches MIN_POOL_SIZE."""
-    _top_up(CLIP_DIR, POOL_META, MIN_POOL_SIZE, POOL_SIZE_CAP,
-            random_synthesis_params, "nonverbal")
-
-
 def top_up_ack_pool() -> None:
     """Generate acknowledgment clips until the pool reaches ACK_MIN_POOL_SIZE."""
     _top_up(ACK_CLIP_DIR, ACK_POOL_META, ACK_MIN_POOL_SIZE, ACK_POOL_SIZE_CAP,
@@ -380,7 +325,6 @@ def daemon_mode(check_interval: int = 300) -> None:
     log.info("Daemon started (interval=%ds)", check_interval)
     while True:
         try:
-            top_up_pool()
             top_up_ack_pool()
         except Exception as e:
             log.error("Error during top-up: %s", e)
@@ -392,7 +336,7 @@ def daemon_mode(check_interval: int = 300) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Non-verbal filler clip factory")
+    parser = argparse.ArgumentParser(description="Acknowledgment clip factory")
     parser.add_argument("--daemon", action="store_true", help="Run in daemon mode (periodic top-up)")
     parser.add_argument("--interval", type=int, default=300, help="Daemon check interval in seconds (default: 300)")
     args = parser.parse_args()
@@ -409,7 +353,6 @@ def main() -> None:
         except KeyboardInterrupt:
             log.info("Daemon interrupted")
     else:
-        top_up_pool()
         top_up_ack_pool()
 
 

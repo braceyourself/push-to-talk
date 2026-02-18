@@ -49,7 +49,7 @@
 ### Filler System
 
 - [x] **FILL-01**: Remove Ollama smart filler generation entirely — no LLM-generated filler text
-- [x] **FILL-02**: Live session uses only non-verbal canned audio clips as fillers (breaths, hums, etc.)
+- [x] **FILL-02**: Live session uses only acknowledgment phrase audio clips as fillers (e.g., "let me check that", "one sec")
 - [x] **FILL-03**: Clip factory subprocess generates new non-verbal clips via Piper TTS
 - [x] **FILL-04**: Clip pool has a configurable size cap with rotation (phase out old, generate new)
 - [x] **FILL-05**: Clip factory evaluates naturalness of generated clips before adding to pool
