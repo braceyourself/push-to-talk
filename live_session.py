@@ -41,6 +41,15 @@ PIPER_CMD = str(Path.home() / ".local" / "share" / "push-to-talk" / "venv" / "bi
 PIPER_MODEL = str(Path.home() / ".local" / "share" / "push-to-talk" / "piper-voices" / "en_US-lessac-medium.onnx")
 PIPER_SAMPLE_RATE = 22050
 
+# Tool intent map: human-readable descriptions for overlay display during tool use
+TOOL_INTENT_MAP = {
+    "spawn_task": "Starting a task",
+    "list_tasks": "Checking tasks",
+    "get_task_status": "Checking task progress",
+    "get_task_result": "Getting task results",
+    "cancel_task": "Cancelling a task",
+}
+
 
 class CircuitBreaker:
     """Track consecutive failures per service and trip to fallback."""
@@ -133,6 +142,7 @@ class LiveSession:
         self._filler_clips = {}  # {category: [pcm_bytes, ...]}
         self._last_filler = {}   # {category: index} for no-repeat guard
         self._filler_cancel = None  # asyncio.Event to cancel filler playback
+        self._ack_cancel = None    # asyncio.Event to cancel acknowledgment playback
         if self.fillers_enabled:
             self._load_filler_clips()
 
@@ -469,8 +479,11 @@ class LiveSession:
 
     # ── Status and timers ──────────────────────────────────────────
 
-    def _set_status(self, status):
-        self.on_status(status)
+    def _set_status(self, status, metadata=None):
+        if metadata:
+            self.on_status(json.dumps({"status": status, **metadata}))
+        else:
+            self.on_status(status)
 
     def _reset_idle_timer(self):
         self._cancel_idle_timer()
@@ -527,6 +540,25 @@ class LiveSession:
         else:
             print("Live session: No filler clips loaded, fillers disabled", flush=True)
             self.fillers_enabled = False
+
+        # Load acknowledgment clips (verbal phrases like "let me check that")
+        ack_dir = Path(__file__).parent / "audio" / "fillers" / "acknowledgment"
+        if ack_dir.exists():
+            ack_clips = []
+            for wav_path in sorted(ack_dir.glob("*.wav")):
+                try:
+                    with wave.open(str(wav_path), 'rb') as wf:
+                        pcm = wf.readframes(wf.getnframes())
+                        rate = wf.getframerate()
+                    if rate != SAMPLE_RATE:
+                        pcm = self._resample_22050_to_24000(pcm)
+                    ack_clips.append(pcm)
+                except Exception as e:
+                    print(f"Live session: Error loading ack clip {wav_path}: {e}", flush=True)
+            if ack_clips:
+                self._filler_clips["acknowledgment"] = ack_clips
+                self._last_filler["acknowledgment"] = -1
+                print(f"Live session: Loaded {len(ack_clips)} acknowledgment clips", flush=True)
 
     def _pick_filler(self, category: str) -> bytes | None:
         """Pick a random filler clip from category, avoiding consecutive repeats."""
@@ -604,6 +636,35 @@ class LiveSession:
                 generation_id=gen_id,
                 data=chunk
             ))
+
+    async def _play_gated_ack(self, cancel_event: asyncio.Event, gen_id: int):
+        """Play an acknowledgment clip after 300ms gate. Skip if cancelled (fast tool)."""
+        # Gate: wait 300ms — if tool completes fast, skip acknowledgment
+        try:
+            await asyncio.wait_for(cancel_event.wait(), timeout=0.3)
+            return  # Tool completed fast, skip acknowledgment
+        except asyncio.TimeoutError:
+            pass
+
+        if cancel_event.is_set() or self.generation_id != gen_id:
+            return
+
+        # Try acknowledgment clip first, fall back to nonverbal
+        clip = self._pick_filler("acknowledgment") or self._pick_filler("nonverbal")
+        if clip:
+            await self._play_filler_audio(clip, cancel_event)
+
+        # If tool use continues for 4+ more seconds, play a nonverbal filler
+        try:
+            await asyncio.wait_for(cancel_event.wait(), timeout=4.0)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        if not cancel_event.is_set() and self.generation_id == gen_id:
+            clip = self._pick_filler("nonverbal")
+            if clip:
+                await self._play_filler_audio(clip, cancel_event)
 
     # ── VAD Barge-in ──────────────────────────────────────────────
 
@@ -1098,6 +1159,9 @@ class LiveSession:
                     if inner_type == "content_block_start":
                         content_block = event.get("content_block", {})
                         if content_block.get("type") == "tool_use":
+                            tool_name = content_block.get("name", "unknown")
+                            intent = TOOL_INTENT_MAP.get(tool_name, f"Using {tool_name.replace('_', ' ')}")
+
                             if not saw_tool_use:
                                 saw_tool_use = True
                                 # First tool call — drain any text already
@@ -1115,13 +1179,14 @@ class LiveSession:
                                             break
                                 if drained:
                                     print(f"  [tool] Drained {drained} pre-tool frames", flush=True)
-                                # Play a nonverbal filler clip
+
+                                # Play acknowledgment clip with 300ms gate
                                 if self.fillers_enabled:
-                                    clip = self._pick_filler("nonverbal")
-                                    if clip:
-                                        asyncio.create_task(
-                                            self._play_filler_audio(clip, asyncio.Event())
-                                        )
+                                    ack_cancel = asyncio.Event()
+                                    self._ack_cancel = ack_cancel
+                                    asyncio.create_task(
+                                        self._play_gated_ack(ack_cancel, gen_id)
+                                    )
 
                             # Discard any accumulated text (pre-tool or inter-tool narration)
                             if sentence_buffer.strip():
@@ -1131,7 +1196,7 @@ class LiveSession:
                             if post_tool_buffer.strip():
                                 print(f"  [tool] Suppressed inter-tool text: \"{post_tool_buffer.strip()[:60]}\"", flush=True)
                                 post_tool_buffer = ""
-                            self._set_status("tool_use")
+                            self._set_status("tool_use", {"intent": intent})
 
                     elif inner_type == "content_block_delta":
                         delta = event.get("delta", {})
@@ -1153,6 +1218,9 @@ class LiveSession:
                                 # Cancel filler on first text from LLM
                                 if self._filler_cancel and not self._filler_cancel.is_set():
                                     self._filler_cancel.set()
+                                # Cancel acknowledgment if still pending
+                                if self._ack_cancel and not self._ack_cancel.is_set():
+                                    self._ack_cancel.set()
 
                                 # Flush complete sentences to TTS
                                 while True:
@@ -1772,9 +1840,11 @@ class LiveSession:
                 except asyncio.QueueEmpty:
                     break
 
-        # 4. Cancel filler if running
+        # 4. Cancel filler and acknowledgment if running
         if self._filler_cancel and not self._filler_cancel.is_set():
             self._filler_cancel.set()
+        if self._ack_cancel and not self._ack_cancel.is_set():
+            self._ack_cancel.set()
 
         # 5. Set cooldown (1.5s)
         self._barge_in_cooldown_until = time.time() + 1.5
