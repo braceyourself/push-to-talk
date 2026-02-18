@@ -23,7 +23,7 @@ Requirements for v1.2 Adaptive Quick Responses milestone.
 ### Non-Speech Awareness
 
 - [ ] **NSPC-01**: System detects non-speech vocalizations (coughs, sighs, laughter) from STT rejection metadata and VAD signals
-- [ ] **NSPC-02**: Non-speech events trigger contextual responses (cough → "excuse you", sigh → empathetic acknowledgment)
+- [ ] **NSPC-02**: Non-speech events trigger contextual responses (cough -> "excuse you", sigh -> empathetic acknowledgment)
 - [ ] **NSPC-03**: Non-speech detection uses configurable confidence threshold to manage false positive rate
 
 ### Pipeline Integration
@@ -67,28 +67,28 @@ Deferred to future milestones.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CLAS-01 | — | Pending |
-| CLAS-02 | — | Pending |
-| CLAS-03 | — | Pending |
-| RLIB-01 | — | Pending |
-| RLIB-02 | — | Pending |
-| RLIB-03 | — | Pending |
-| RLIB-04 | — | Pending |
-| NSPC-01 | — | Pending |
-| NSPC-02 | — | Pending |
-| NSPC-03 | — | Pending |
-| PIPE-01 | — | Pending |
-| PIPE-02 | — | Pending |
-| PIPE-03 | — | Pending |
-| LMGT-01 | — | Pending |
-| LMGT-02 | — | Pending |
-| LMGT-03 | — | Pending |
+| CLAS-01 | Phase 8 | Pending |
+| CLAS-02 | Phase 9 | Pending |
+| CLAS-03 | Phase 9 | Pending |
+| RLIB-01 | Phase 8 | Pending |
+| RLIB-02 | Phase 8 | Pending |
+| RLIB-03 | Phase 8 | Pending |
+| RLIB-04 | Phase 8 | Pending |
+| NSPC-01 | Phase 11 | Pending |
+| NSPC-02 | Phase 11 | Pending |
+| NSPC-03 | Phase 11 | Pending |
+| PIPE-01 | Phase 8 | Pending |
+| PIPE-02 | Phase 9 | Pending |
+| PIPE-03 | Phase 9 | Pending |
+| LMGT-01 | Phase 10 | Pending |
+| LMGT-02 | Phase 10 | Pending |
+| LMGT-03 | Phase 10 | Pending |
 
 **Coverage:**
 - v1 requirements: 16 total
-- Mapped to phases: 0
-- Unmapped: 16 (awaiting roadmap)
+- Mapped to phases: 16
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-02-18*
-*Last updated: 2026-02-18 after initial definition*
+*Last updated: 2026-02-18 after roadmap creation*
