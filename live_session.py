@@ -760,16 +760,42 @@ class LiveSession:
                 condition_on_previous_text=False,  # Prevent hallucination loops
             )
 
-            # Filter out segments where Whisper thinks there's no speech
-            # (catches throat clearing, coughs, background noise)
+            # Multi-layer segment filtering: catches throat clearing, coughs,
+            # background noise, and Whisper hallucinations on non-speech audio.
             segments = result.get("segments", [])
             if segments:
-                kept = [s["text"] for s in segments if s.get("no_speech_prob", 0) < 0.6]
+                kept = []
+                for s in segments:
+                    no_speech = s.get("no_speech_prob", 0)
+                    avg_logprob = s.get("avg_logprob", 0)
+                    compression = s.get("compression_ratio", 0)
+                    text = s.get("text", "").strip()
+
+                    # Layer 1: no_speech_prob (high = Whisper thinks no speech)
+                    if no_speech >= 0.6:
+                        print(f"STT: Rejected (no_speech={no_speech:.2f}): \"{text[:40]}\"", flush=True)
+                        continue
+
+                    # Layer 2: low transcription confidence (catches coughs/clears
+                    # that have acoustic energy but produce gibberish text)
+                    if avg_logprob < -1.0:
+                        print(f"STT: Rejected (logprob={avg_logprob:.2f}): \"{text[:40]}\"", flush=True)
+                        continue
+
+                    # Layer 3: repetitive hallucination pattern (e.g. "thank you
+                    # thank you thank you" from sustained noise)
+                    if compression > 2.4:
+                        print(f"STT: Rejected (compression={compression:.2f}): \"{text[:40]}\"", flush=True)
+                        continue
+
+                    kept.append(text)
+
                 text = "".join(kept).strip()
                 if not kept and segments:
-                    rejected_text = "".join(s["text"] for s in segments).strip()
-                    probs = [f'{s.get("no_speech_prob", 0):.2f}' for s in segments]
-                    print(f"STT: Rejected non-speech (probs={probs}): \"{rejected_text}\"", flush=True)
+                    # All segments rejected — signal to overlay
+                    self._set_status("stt_rejected")
+                    rejected_text = "".join(s.get("text", "") for s in segments).strip()
+                    print(f"STT: All segments rejected: \"{rejected_text[:60]}\"", flush=True)
             else:
                 text = result.get("text", "").strip()
 
