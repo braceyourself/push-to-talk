@@ -1,0 +1,182 @@
+[
+  {
+    "filename": "checking_now_001.wav",
+    "created_at": 1771418989.2752018,
+    "params": {
+      "prompt": "Checking now.",
+      "length_scale": 1.12,
+      "noise_w_scale": 0.6,
+      "noise_scale": 0.58
+    },
+    "scores": {
+      "duration": 0.952,
+      "rms": 6917.0,
+      "peak": 32767,
+      "clipping_ratio": 0.0002,
+      "silence_ratio": 0.461,
+      "pass": true
+    }
+  },
+  {
+    "filename": "just_a_moment_001.wav",
+    "created_at": 1771418990.9675179,
+    "params": {
+      "prompt": "Just a moment.",
+      "length_scale": 1.08,
+      "noise_w_scale": 0.51,
+      "noise_scale": 0.42
+    },
+    "scores": {
+      "duration": 0.778,
+      "rms": 6448.2,
+      "peak": 32767,
+      "clipping_ratio": 0.0001,
+      "silence_ratio": 0.335,
+      "pass": true
+    }
+  },
+  {
+    "filename": "looking_into_that_001.wav",
+    "created_at": 1771418992.4894543,
+    "params": {
+      "prompt": "Looking into that.",
+      "length_scale": 1.15,
+      "noise_w_scale": 0.59,
+      "noise_scale": 0.6
+    },
+    "scores": {
+      "duration": 1.08,
+      "rms": 7197.9,
+      "peak": 32767,
+      "clipping_ratio": 0.0001,
+      "silence_ratio": 0.389,
+      "pass": true
+    }
+  },
+  {
+    "filename": "one_sec_001.wav",
+    "created_at": 1771418993.1723363,
+    "params": {
+      "prompt": "One sec.",
+      "length_scale": 1.11,
+      "noise_w_scale": 0.55,
+      "noise_scale": 0.6
+    },
+    "scores": {
+      "duration": 0.778,
+      "rms": 4721.2,
+      "peak": 32767,
+      "clipping_ratio": 0.0002,
+      "silence_ratio": 0.485,
+      "pass": true
+    }
+  },
+  {
+    "filename": "one_moment_001.wav",
+    "created_at": 1771418994.5622168,
+    "params": {
+      "prompt": "One moment.",
+      "length_scale": 0.91,
+      "noise_w_scale": 0.44,
+      "noise_scale": 0.65
+    },
+    "scores": {
+      "duration": 0.766,
+      "rms": 5529.8,
+      "peak": 32767,
+      "clipping_ratio": 0.0004,
+      "silence_ratio": 0.357,
+      "pass": true
+    }
+  },
+  {
+    "filename": "let_me_take_a_look_001.wav",
+    "created_at": 1771418995.7837121,
+    "params": {
+      "prompt": "Let me take a look.",
+      "length_scale": 0.93,
+      "noise_w_scale": 0.4,
+      "noise_scale": 0.46
+    },
+    "scores": {
+      "duration": 1.01,
+      "rms": 5599.1,
+      "peak": 32767,
+      "clipping_ratio": 0.0001,
+      "silence_ratio": 0.429,
+      "pass": true
+    }
+  },
+  {
+    "filename": "hang_on_001.wav",
+    "created_at": 1771418996.6368625,
+    "params": {
+      "prompt": "Hang on.",
+      "length_scale": 1.25,
+      "noise_w_scale": 0.38,
+      "noise_scale": 0.52
+    },
+    "scores": {
+      "duration": 0.987,
+      "rms": 6355.7,
+      "peak": 32767,
+      "clipping_ratio": 0.0,
+      "silence_ratio": 0.435,
+      "pass": true
+    }
+  },
+  {
+    "filename": "give_me_a_moment_001.wav",
+    "created_at": 1771418998.7339237,
+    "params": {
+      "prompt": "Give me a moment.",
+      "length_scale": 1.26,
+      "noise_w_scale": 0.75,
+      "noise_scale": 0.45
+    },
+    "scores": {
+      "duration": 1.231,
+      "rms": 7563.3,
+      "peak": 32767,
+      "clipping_ratio": 0.0003,
+      "silence_ratio": 0.369,
+      "pass": true
+    }
+  },
+  {
+    "filename": "let_me_see_001.wav",
+    "created_at": 1771419001.908653,
+    "params": {
+      "prompt": "Let me see.",
+      "length_scale": 1.19,
+      "noise_w_scale": 0.41,
+      "noise_scale": 0.67
+    },
+    "scores": {
+      "duration": 1.126,
+      "rms": 8140.4,
+      "peak": 32767,
+      "clipping_ratio": 0.0001,
+      "silence_ratio": 0.381,
+      "pass": true
+    }
+  },
+  {
+    "filename": "give_me_a_moment_002.wav",
+    "created_at": 1771419004.8317845,
+    "params": {
+      "prompt": "Give me a moment.",
+      "length_scale": 1.12,
+      "noise_w_scale": 0.38,
+      "noise_scale": 0.4
+    },
+    "scores": {
+      "duration": 1.01,
+      "rms": 7501.7,
+      "peak": 32767,
+      "clipping_ratio": 0.0001,
+      "silence_ratio": 0.354,
+      "pass": true
+    }
+  }
+]
