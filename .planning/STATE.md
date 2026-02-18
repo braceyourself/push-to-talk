@@ -11,18 +11,18 @@ See: .planning/PROJECT.md (updated 2026-02-17)
 
 Milestone: v1.1 Voice UX Polish
 Phase: 7 of 7 (Nonverbal System Cleanup)
-Plan: 0 of 1
-Status: Phase not yet planned
-Last activity: 2026-02-18 — Added gap closure Phase 7 from milestone audit
+Plan: 1 of 1
+Status: Milestone complete
+Last activity: 2026-02-18 — Completed 07-01-PLAN.md (nonverbal system cleanup)
 
-Progress: [████████████████████████████░░] 90% (9/10 v1.1 plans complete)
+Progress: [██████████████████████████████] 100% (10/10 v1.1 plans complete)
 
 ## Performance Metrics
 
-**v1.0 Velocity:**
-- Total plans completed: 9
-- Average duration: ~7 minutes
-- Total execution time: ~60 minutes
+**v1.1 Velocity:**
+- Total plans completed: 10
+- Average duration: ~6 minutes
+- Total execution time: ~63 minutes
 
 **By Phase:**
 
@@ -34,6 +34,7 @@ Progress: [███████████████████████
 | 04 | 2/2 | ~7.5min | ~3.75min |
 | 05 | 2/2 | ~5.5min | ~2.75min |
 | 06 | 3/3 | ~20min | ~6.5min |
+| 07 | 1/1 | ~3min | ~3min |
 
 *Updated after each plan completion*
 
@@ -48,16 +49,16 @@ Carried forward from v1.0:
 - Claude CLI via stream-json protocol, not OpenAI Realtime API
 - Local Whisper STT + Piper TTS (zero cloud latency dependency)
 - Overlay communicates with session via signal files
-- Filler system overhauled: non-verbal clips only, no more Ollama/LLM smart fillers
+- Filler system overhauled: acknowledgment phrase clips only, no more Ollama/LLM smart fillers
 - Barge-in: gate STT instead of mic mute (mic must stay live for VAD)
-- Clip factory: single nonverbal/ category, synchronous subprocess, numpy quality evaluation
-- Non-verbal clip quality gate: duration 0.2-2.0s, RMS > 300, clipping < 1%, silence < 70%
+- Clip factory: acknowledgment-only, synchronous subprocess, numpy quality evaluation
+- Acknowledgment clip quality gate: duration 0.3-4.0s, RMS > 200, clipping < 1%, silence < 50%
 
 Phase 5 additions:
 - VAD runs inline in STT stage (Branch 2) rather than separate monitor stage
 - 6 consecutive VAD-positive chunks (~0.5s) threshold for barge-in trigger
 - 1.5s cooldown after barge-in prevents rapid-fire re-triggers
-- Trailing filler: 150ms nonverbal clip with 0.8->0.0 linear fade for natural cutoff
+- Trailing filler: 150ms acknowledgment clip with 0.8->0.0 linear fade for natural cutoff
 - Three-branch audio processing in _stt_stage: muted / gated (VAD) / normal
 - Sentence tracking at 3 flush sites for spoken/unspoken annotation on barge-in
 - Annotation prepended to next user message (not separate turn) so AI knows it was cut off
@@ -76,6 +77,12 @@ Phase 6 additions:
 - _set_status accepts optional metadata dict, serialized as JSON through existing callback chain
 - Overlay parses JSON status for tool intent display, coalesces consecutive tool_use history entries
 
+Phase 7 additions:
+- Barge-in trailing filler fixed: uses acknowledgment clips instead of broken nonverbal lookup
+- All nonverbal code removed from clip_factory.py (constants, functions, evaluate_clip else-branch)
+- Nonverbal WAV files and pool.json cleaned from disk and git
+- FILL-02 requirement updated to describe acknowledgment phrase behavior
+
 ### Pending Todos
 
 None.
@@ -86,6 +93,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-02-18T20:30:00Z
-Stopped at: Phase 7 added, needs planning
+Last session: 2026-02-18T19:38:00Z
+Stopped at: Completed 07-01-PLAN.md — v1.1 milestone complete
 Resume file: None
