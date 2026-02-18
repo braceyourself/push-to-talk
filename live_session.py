@@ -1160,7 +1160,9 @@ class LiveSession:
                         content_block = event.get("content_block", {})
                         if content_block.get("type") == "tool_use":
                             tool_name = content_block.get("name", "unknown")
-                            intent = TOOL_INTENT_MAP.get(tool_name, f"Using {tool_name.replace('_', ' ')}")
+                            # Strip MCP prefix (e.g. "mcp__ptt-task-tools__spawn_task" -> "spawn_task")
+                            bare_name = tool_name.rsplit("__", 1)[-1] if "__" in tool_name else tool_name
+                            intent = TOOL_INTENT_MAP.get(bare_name, bare_name.replace('_', ' ').title())
 
                             if not saw_tool_use:
                                 saw_tool_use = True
