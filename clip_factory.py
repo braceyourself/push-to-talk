@@ -40,8 +40,9 @@ POOL_SIZE_CAP = 20   # Maximum clips in the pool
 MIN_POOL_SIZE = 10   # Generate until reaching this
 SAMPLE_RATE = 22050  # Piper native sample rate
 
-# Non-verbal prompts that Piper can synthesize
-PROMPTS = ["Hmm", "Mmm", "Mhm", "Hm", "Mmhmm", "Hmmm", "Ahh", "Uhh"]
+# Non-verbal prompts — must be real speakable words/phrases so Piper
+# doesn't spell them out letter-by-letter (e.g. "Hm" → "H-M")
+PROMPTS = ["hum", "um", "uh huh", "ah", "mm hm", "oh", "uh", "huh"]
 
 # Acknowledgment clip pool
 ACK_CLIP_DIR = Path(__file__).parent / "audio" / "fillers" / "acknowledgment"
