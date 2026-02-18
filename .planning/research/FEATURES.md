@@ -1,205 +1,218 @@
-# Feature Research
+# Feature Research: Adaptive Quick Responses
 
-**Domain:** Voice-controlled async AI task orchestrator (live mode for push-to-talk)
-**Researched:** 2026-02-13
-**Confidence:** MEDIUM-HIGH (strong codebase understanding + ecosystem research; novel domain means fewer direct precedents)
+**Domain:** Context-aware acknowledgment/backchannel system for voice AI assistant
+**Researched:** 2026-02-18
+**Confidence:** MEDIUM-HIGH (well-researched domain in voice UX; novel for local desktop assistant context)
+
+## Current State
+
+The existing system has a single-category filler pool: 10-15 pre-generated Piper TTS clips of task-oriented phrases ("let me check that", "one sec", "looking into that"). Selection is random with no-repeat guard. A 500ms gate skips the filler if the LLM responds fast. A 300ms gate exists for tool-use acknowledgments.
+
+**The problem:** Every filler sounds task-oriented. "Let me take a look" plays even when the user asks "how are you?" or coughs into the mic. The system has no awareness of *what* the user said or *why* the processing gap exists.
 
 ## Feature Landscape
 
-### Table Stakes (Users Expect These)
+### Table Stakes (Must Have)
 
-Features users assume exist. Missing these = product feels broken on first use.
+Features required for adaptive responses to feel correct. Without these, the system is worse than random selection because users notice *wrong* responses more than *generic* ones.
 
-#### Task Lifecycle
+| Feature | Why Required | Complexity | Dependencies |
+|---------|------------|------------|--------------|
+| **Intent-based category routing** | Core mechanic: classify user input into categories (question, command, conversational, emotional) and pick fillers from the matching category | MEDIUM | Requires transcript text (already available from STT stage). Needs a classifier. |
+| **Multi-category clip pools** | Separate clip sets for different response types: task-oriented ("on it"), conversational ("hmm, good question"), emotional ("oh wow"), etc. | LOW | Extends existing `clip_factory.py` with per-category prompts and directories. |
+| **Graceful fallback to random** | If classification fails or takes too long, fall back to current random behavior rather than silence | LOW | None -- this is the existing behavior, just needs to be preserved as fallback. |
+| **Classification speed < 200ms** | Filler must play within the 500ms gate window. If classification takes longer than the gate, the user hears silence then a filler -- worse than random. Budget: 200ms for classification, leaving 300ms headroom. | CRITICAL | Constrains classifier choice. Rules out API calls or large models. |
+| **Clip variety within categories** | Each category needs 8-15 clips to avoid repetition fatigue. Users notice patterns fast in audio. | LOW | Extends clip_factory.py per-category generation. More prompt templates. |
 
-| Feature | Why Expected | Complexity | Notes |
-|---------|--------------|------------|-------|
-| Spawn task by voice | Core premise -- "ask Claude to do X" must work on first try | MEDIUM | Already have `ask_claude` tool in `openai_realtime.py` but it blocks synchronously (120s timeout). Must become async with `subprocess.Popen` or `asyncio.create_subprocess_exec` instead of `subprocess.run`. Each task needs a name/ID for reference. |
-| Task completion notification | Users need to know when background work finishes | LOW | Audio chime + brief spoken summary ("Your auth refactor is done"). Without this, users have no idea tasks finished and the whole async model falls apart. |
-| Task failure notification | Errors can't be silent -- users must hear about them | LOW | Distinct audio cue (different tone from success) + spoken error summary. Claude CLI exit code != 0 or stderr output triggers this. |
-| Ask for task status | "What's happening with my tasks?" must return a useful answer | LOW | Expose a `get_task_status` tool to the Realtime API. Returns list of tasks with state (running/completed/failed), elapsed time, and last output line. The AI then speaks a summary. |
-| Cancel a running task | Users must be able to stop work they no longer want | LOW | `process.terminate()` or `process.kill()` on the subprocess. Expose as `cancel_task` tool. Must handle cleanup (temp files, partial git changes). |
-| Task result retrieval | "What did Claude say about the auth module?" | LOW | Store stdout/stderr in memory or temp file per task. Expose as `get_task_result` tool. Truncate to reasonable size for voice summary (last N lines or AI-summarized). |
-| Session start/stop | Clear boundary for when live mode is active | LOW | Already have `start_realtime_session()` / `stop_realtime_session()`. Extend to initialize task registry and clean up on stop. |
-| Persistent conversation context | AI remembers what was discussed within a session | LOW | OpenAI Realtime API maintains conversation history across turns within a WebSocket session. Already works. Need to ensure task context (what was spawned, results) persists in the conversation. |
+**Research basis:** Voice UX research consistently shows that awkward or mismatched acknowledgments are worse than no acknowledgment at all. Users have a ~200ms perception threshold for conversational timing (Source: [AssemblyAI latency research](https://www.assemblyai.com/blog/low-latency-voice-ai), [Sierra voice latency](https://sierra.ai/blog/voice-latency)). Google Duplex specifically found that contextually appropriate fillers ("so" to signal information coming, "umm" for hesitation) are perceived as meaningfully different from random insertion (Source: [Google Duplex research blog](https://research.google/blog/google-duplex-an-ai-system-for-accomplishing-real-world-tasks-over-the-phone/)).
 
-#### Voice UX
+### Differentiators (What Makes This Feel Special)
 
-| Feature | Why Expected | Complexity | Notes |
-|---------|--------------|------------|-------|
-| Non-blocking conversation during tasks | Must be able to keep talking while Claude works in background | MEDIUM | Current `ask_claude` blocks the event loop for up to 120s. Must run Claude CLI as a background subprocess with async monitoring. The Realtime WebSocket session must stay responsive. |
-| Interrupt AI speech | Press Escape or start talking to stop current response | LOW | Already implemented via `_interrupt_requested` and `input_audio_buffer.speech_started` handling in `openai_realtime.py`. |
-| Clear status indicator | Visual indicator showing what mode is active and task counts | LOW | Extend existing status dot system. Add task count to status file or indicator tooltip. Color already encodes state (red=recording, purple=speaking, blue=listening). |
+Features that elevate the experience from "functional" to "this assistant gets me." Not strictly required, but these are what make users prefer this over alternatives.
 
-### Differentiators (Competitive Advantage)
+| Feature | Value Proposition | Complexity | Dependencies |
+|---------|-------------------|------------|--------------|
+| **Non-speech event responses** | Detect coughs, sighs, laughter via STT rejection metadata and respond playfully ("excuse you", "you okay?", sympathetic acknowledgment) | MEDIUM | Leverages existing multi-layer STT filtering (no_speech_prob, logprob thresholds). Currently these events are silently rejected -- instead, classify the rejection reason and play appropriate audio. |
+| **Emotional tone matching** | Detect excitement, frustration, or seriousness in user text and match filler energy ("oh awesome!", calm "I see", measured "let me look into that") | MEDIUM | Needs sentiment analysis on transcript. Could be a lightweight step in the classifier or a separate heuristic (exclamation marks, keywords like "amazing"/"frustrated"/"help"). |
+| **Barge-in trailing fillers by context** | Current barge-in plays a random acknowledgment after interruption. Context-aware version: if user interrupted to correct, play "oh right" / "got it"; if user interrupted because bored, play "sure" / shorter response | LOW-MEDIUM | Barge-in annotation already captures what the AI was saying when interrupted and what the user said. Classification of the interruption reason. |
+| **Conversational vs. task mode detection** | "What's your name?" gets "hmm" not "checking now". "Refactor the auth module" gets "on it" not "interesting question" | LOW | This is a natural output of intent classification. The categories themselves encode this. |
+| **Learned response preferences** | Track which fillers get interrupted (user talks over them = too long/annoying) and which flow smoothly. Down-weight frequently-interrupted clips. | MEDIUM | Needs to log: which clip played, whether it was cancelled early by barge-in or LLM response. Simple frequency tracking over sessions. |
+| **Dynamic TTS fillers** | Instead of only pre-generated clips, occasionally generate a contextual filler on-the-fly: "hmm, let me think about [topic keyword]..." | HIGH | Piper TTS latency (~200-400ms) may blow the timing budget. Would need to fire speculatively before classification completes, or only use for responses where higher latency is acceptable (complex questions). |
+| **Silence as a valid response** | For very short inputs ("yes", "no", "ok"), no filler at all -- just fast processing. The 500ms gate partially handles this, but explicit classification of "no-filler-needed" inputs is better. | LOW | Intent classifier outputs a "minimal" category that maps to no filler. |
 
-Features that set this apart from Serenade, Copilot Voice, SystemPrompt, or just using Claude CLI directly.
+**Research basis:** Backchanneling research shows that generic vs. specific acknowledgments are perceived differently. "Mm-hm" is generic backchannel; "oh wow" requires surprising content to feel appropriate (Source: [Retell AI on backchanneling](https://www.retellai.com/blog/how-backchanneling-improves-user-experience-in-ai-powered-voice-agents), [Wikipedia: Backchannel (linguistics)](https://en.wikipedia.org/wiki/Backchannel_(linguistics))). NVIDIA PersonaPlex trains on 7,303 real conversations to learn contextual backchannel timing and content (Source: [NVIDIA PersonaPlex](https://research.nvidia.com/labs/adlr/personaplex/)). Non-speech event detection is well-supported by models like SenseVoice which detect coughing, sneezing, laughter alongside speech (Source: [FunAudioLLM/SenseVoice](https://github.com/FunAudioLLM/SenseVoice)).
 
-| Feature | Value Proposition | Complexity | Notes |
-|---------|-------------------|------------|-------|
-| Named task context switching | "Switch to the database task" / "What's the auth task doing?" -- refer to tasks by natural name, not ID | MEDIUM | The AI assigns human-readable names based on the task description. Internal registry maps names to process handles. This is what makes voice orchestration usable -- you can't read a task ID aloud comfortably. |
-| Proactive status announcements | AI volunteers updates: "Hey, your refactor just finished" during natural conversation pauses | HIGH | Monitor task completion in background. When a task finishes and the AI is not speaking/listening, inject a conversation item with the result summary. Tricky timing -- must not interrupt user mid-sentence. Use `input_audio_buffer.speech_started` / `speech_stopped` events to find safe windows. |
-| Context-isolated concurrent tasks | Multiple Claude CLI tasks run simultaneously without bleeding context | MEDIUM | Each task gets its own working directory or worktree. Prevent one task from seeing another's partial changes. Claude CLI already supports `--add-dir` for context scoping. Could use git worktrees for true isolation on same-repo tasks. |
-| Voice-driven task composition | "Take the output from the API task and feed it into the frontend task" | HIGH | Chain task results as input to new tasks. Requires the AI to understand task dependency graphs. Defer to v2 -- complex and rarely needed in v1. |
-| Smart result summarization | AI reads full Claude CLI output but speaks a concise 2-3 sentence summary | MEDIUM | Claude CLI can produce hundreds of lines of output. The Realtime API AI must condense this for voice. Could either (a) truncate to last N lines and let the AI summarize, or (b) run a quick summarization pass. Option (a) is simpler and leverages the AI's native capability. |
-| Ambient task awareness | AI automatically knows about running/completed tasks without being asked | LOW | Inject task registry state into the system prompt or as a periodic context update. When user asks "can you also fix the tests?" the AI knows what's already running and avoids duplicate work. |
-| Audio notification differentiation | Different sounds for: task started, task completed, task failed, task needs attention | LOW | Simple audio cues (short wav files) played via `aplay`. Provides eyes-free awareness. Users learn the sounds and know what happened without the AI speaking. |
-| Session persistence across reconnects | If WebSocket drops, reconnect and preserve task state | MEDIUM | Tasks run as OS processes independent of the WebSocket. Task registry persists to disk. On reconnect, re-inject task state into the new session's context. WebSocket drops shouldn't kill background tasks. |
+### Anti-Features (Do NOT Build)
 
-### Anti-Features (Commonly Requested, Often Problematic)
+Features that seem appealing but create over-engineering problems or degrade the experience.
 
-Features that seem good but create problems in a voice-controlled context.
+| Anti-Feature | Why It Seems Good | Why Problematic | Do This Instead |
+|--------------|-------------------|-----------------|-----------------|
+| **Full NLU pipeline for classification** | "Proper" intent detection with entity extraction, slot filling, multi-intent support | Massive over-engineering for filler selection. You are not building a dialogue manager -- you are picking from ~6 audio categories. A BERT model or NLU framework adds dependency weight, GPU requirements, and maintenance burden for a problem that needs 5 categories. | Simple heuristic classifier: keyword matching + regex patterns + optional lightweight LLM call as tiebreaker. Google Duplex uses separate small models for different aspects -- don't build one monolithic NLU. |
+| **User-configurable response categories** | Let users define their own filler categories and prompts | UI complexity explosion. Users don't think in categories -- they think "make it sound more natural." Configuration surface area that nobody touches after day one. | Opinionated defaults that work well. One toggle: fillers on/off (already exists). Maybe one preference: "personality" slider (formal/casual). |
+| **Real-time prosodic/pitch analysis** | Analyze audio features (pitch contour, speaking rate, energy) for emotion detection | Requires audio feature extraction pipeline before STT, adding latency. The transcript text plus STT metadata (confidence, no_speech_prob) already carry sufficient signal. Prosodic analysis is research-grade complexity for marginal gain over text-based heuristics. | Use STT metadata (confidence scores, no_speech_prob) as proxy for audio quality/speech type. Use text-based sentiment heuristics. |
+| **Per-user response style profiles** | Learn that "Ethan prefers casual acknowledgments" vs formal | Single-user desktop app. There is one user. Personalization infrastructure for one person is configuration, not ML. | Hardcode the personality in the prompt templates. If the user wants to change it, they edit the personality file (already exists in `personality/`). |
+| **A/B testing framework for fillers** | Systematically test which fillers users prefer | You are the only user. Ask yourself. A/B testing a single-user app is absurd overhead. | Manual tuning: listen to sessions, remove clips that sound bad, add ones that sound good. The clip factory already supports pool rotation. |
+| **Streaming audio classification** | Classify the audio itself (not transcript) to detect paralinguistic events in real-time | Adds a parallel processing path before STT, duplicating audio handling. The existing Whisper/Deepgram pipeline already extracts the signals needed (no_speech_prob, rejected segments). Building a second audio classifier is redundant. | Classify the STT output and metadata. For non-speech events, use the existing rejection pipeline's metadata (what was rejected and why). |
+| **Multi-turn context for filler selection** | Track conversation history to pick fillers based on conversation flow (e.g., "we've been technical for 5 turns, use technical fillers") | The filler plays for 0.5-2 seconds. Nobody notices or cares whether the acknowledgment tracks multi-turn context. The LLM response itself handles conversational context. Over-investing intelligence in a throwaway audio clip. | Single-turn classification is sufficient. The user's most recent utterance is the only context that matters for filler selection. |
+| **Cloud API for classification** | Use Claude/GPT API to classify intent for highest accuracy | Adds network latency (200-500ms minimum), API cost per utterance, and a failure mode (API down = no fillers). Classification needs to complete in <200ms. Cloud round-trip alone may exceed this. | Local-only classification. Keyword heuristics, regex, or a tiny local model. Zero network dependency for filler selection. |
 
-| Feature | Why Requested | Why Problematic | Alternative |
-|---------|---------------|-----------------|-------------|
-| Interactive Claude CLI steering by voice | "Now tell that Claude to also check the tests" -- sending follow-up prompts to a running task | Running Claude CLI sessions don't accept stdin mid-execution. Would require a fundamentally different architecture (MCP server, agent teams protocol). Massive complexity for marginal value. | Spawn a new task with the refined prompt. Tasks are cheap. Let the user say "also do X" and spawn a fresh Claude with the additional context. |
-| Real-time streaming of Claude CLI output | Show/speak every line as Claude works | Claude CLI produces verbose tool-use output (file reads, diffs, thinking). Speaking this aloud would be overwhelming and unusable. Visual streaming in a terminal is fine; audio streaming is not. | Store output silently, summarize on completion. User can ask "what's the auth task doing?" for a status check at any time. |
-| Arbitrary shell command execution in live mode | "Run npm test" / "Deploy to staging" | Already exists as `run_command` tool but is dangerous without guardrails. In a voice context, misheard commands could be destructive. "Delete the logs" could become "delete the docs." | Keep `run_command` for read-only queries (git status, ls, date). Route destructive operations through Claude CLI which has its own permission model and confirmation flow. |
-| Always-on listening (no PTT) | Hands-free convenience | Accidental activation, privacy concerns, battery/CPU drain from continuous STT, false positives triggering task spawns. The existing Realtime API uses server VAD which already provides continuous listening within a session. | Server VAD within the Realtime session handles the "always listening while session is active" need. The PTT key starts/stops the session, not individual utterances. This is already the design. |
-| Visual task dashboard / TUI | Terminal-based task monitoring with live output | Defeats the purpose of voice-first interaction. If you're looking at a terminal, just use Claude CLI directly. The whole point is hands-free/eyes-free operation. | Status indicator dot with tooltip showing task count. Voice-queryable status ("what's running?"). Desktop notifications for completions. |
-| Persistent tasks across sessions | Tasks survive session end and resume on next session start | Scope creep into job scheduler territory. Claude CLI processes are tied to their execution context. Resuming a Claude mid-thought is not possible. | Each session starts fresh. Completed results could persist to disk for reference, but running tasks end when the session ends. Warn user of running tasks on session stop. |
-| Multi-user / shared task orchestration | Multiple people controlling the same task pool | Single-user desktop app. Adding multi-user adds auth, conflict resolution, permission models. Zero users have asked for this. | Not applicable -- this is a personal productivity tool. |
+## Recommended Categories
+
+Based on research into backchannel linguistics and the existing codebase's needs, here are the recommended filler categories.
+
+### Category Taxonomy
+
+| Category | Trigger | Example Clips | Count Target |
+|----------|---------|---------------|--------------|
+| **task** | Commands, requests to do something ("refactor this", "run the tests", "find the file") | "On it.", "Working on it.", "Let me take a look.", "Checking now." | 10-12 clips |
+| **question** | Questions seeking information ("what is...", "how does...", "why did...") | "Hmm, good question.", "Let me think about that.", "Hmm.", "Oh, interesting." | 10-12 clips |
+| **conversational** | Greetings, small talk, opinions ("how are you", "what do you think about", "tell me about yourself") | "Hmm.", "Well...", "Oh.", "Let's see..." | 8-10 clips |
+| **emotional** | Excitement, frustration, sharing news ("I just got promoted!", "this is so frustrating", "I love this") | "Oh!", "Oh wow.", "Hmm.", "Ah." | 8-10 clips |
+| **acknowledgment** | Confirmations, agreements, "yes/no" responses, short inputs | *No filler* (silence -- input is too simple to warrant acknowledgment, LLM responds fast) | 0 (gate handles this) |
+| **non-speech** | Coughs, sighs, throat clears, laughter (detected via STT rejection) | "Excuse you.", "You okay?", "Ha.", *sympathetic hum* | 4-6 clips |
+
+### Classification Strategy
+
+**Recommended approach: Tiered heuristic classifier (no ML required)**
+
+The classification problem is small enough (5-6 categories, single sentence input) that a rule-based approach with keyword matching handles 90%+ of cases. This runs in <1ms, has zero dependencies, and is trivially debuggable.
+
+```
+Tier 1: Pattern matching (~0ms, handles 80% of inputs)
+  - Starts with question word (what/how/why/when/where/who/can/could/would/is/are/do/does) → question
+  - Contains action verbs (refactor/run/find/fix/check/build/deploy/create/update/delete) → task
+  - Greeting patterns (hi/hello/hey/good morning/how are you) → conversational
+  - Emotional markers (!/amazing/love/hate/frustrated/excited/happy/sad/ugh) → emotional
+  - Very short (<3 words, no question mark) → acknowledgment (no filler)
+
+Tier 2: Structural analysis (~0ms, handles 15% more)
+  - Ends with "?" → question
+  - Imperative sentence structure (starts with verb) → task
+  - First/second person + opinion verb (I think/I feel/you should) → conversational
+
+Tier 3: Fallback → task (current behavior, safe default)
+```
+
+**Why not ML:** The categories are coarse-grained and the input is a single spoken sentence. Keyword heuristics achieve sufficient accuracy. The risk of misclassification is low-consequence (wrong filler category is mildly awkward, not system-breaking). ML adds latency, dependencies, and maintenance burden for marginal improvement.
+
+**Future upgrade path:** If heuristics prove insufficient, the classifier interface can be swapped to use a local embedding model (sentence-transformers + cosine similarity, <1ms per classification per [this approach](https://medium.com/@durgeshrathod.777/intent-classification-in-1ms-how-we-built-a-lightning-fast-classifier-with-embeddings-db76bfb6d964)) without changing the rest of the system.
 
 ## Feature Dependencies
 
 ```
-[Session Management (start/stop live mode)]
-    |
-    +---> [Task Registry (in-memory task tracking)]
-    |         |
-    |         +---> [Spawn Task (async Claude CLI)]
-    |         |         |
-    |         |         +---> [Task Completion Notification]
-    |         |         +---> [Task Failure Notification]
-    |         |         +---> [Task Result Storage]
-    |         |
-    |         +---> [Ask Task Status]
-    |         +---> [Cancel Task]
-    |         +---> [Get Task Result]
-    |         +---> [Named Context Switching]
-    |
-    +---> [Non-blocking Conversation]
-              |
-              +---> [Proactive Status Announcements]
-              +---> [Ambient Task Awareness]
-
-[Context Isolation]
-    +---> independent of task registry, but enhances [Spawn Task]
-    +---> requires decision: subdirectory vs git worktree vs temp dir
-
-[Audio Notification Differentiation]
-    +---> independent, enhances [Task Completion/Failure Notification]
-
-[Session Persistence Across Reconnects]
-    +---> requires [Task Registry] to persist to disk
-    +---> enhances [Session Management]
+Existing Features (already built)
+  |
+  +-- STT transcript text ──────────> Intent classifier (NEW)
+  |                                      |
+  +-- STT rejection metadata ──────> Non-speech detector (NEW)
+  |                                      |
+  +-- clip_factory.py ──────────────> Multi-category clip pools (NEW)
+  |                                      |
+  +-- _filler_manager() ───────────> Category-aware filler selection (NEW)
+  |                                      |
+  +-- _pick_filler(category) ──────> Already supports categories (EXTEND)
+  |                                      |
+  +-- barge-in annotation ─────────> Context-aware trailing filler (NEW)
 ```
 
-### Dependency Notes
+Key dependency chain:
+1. Multi-category clip pools must exist before category routing works
+2. Intent classifier must be fast enough to fit within the 500ms filler gate
+3. Non-speech detection hooks into the existing STT rejection path
+4. Barge-in context fillers hook into the existing barge-in annotation system
 
-- **Spawn Task requires Task Registry:** Can't manage what you can't track. The registry must exist before any task spawning.
-- **Named Context Switching requires Task Registry:** Names are just a lookup key into the registry.
-- **Proactive Status Announcements require Non-blocking Conversation:** Can't announce anything if the conversation loop is blocked waiting for a task.
-- **Ambient Task Awareness enhances Spawn Task:** The AI needs registry access in its tool set to avoid spawning duplicate tasks.
-- **Context Isolation is independent:** Can be added at any phase. Starts as simple (separate working dirs) and evolves (git worktrees) based on need.
-- **Session Persistence requires disk-backed Task Registry:** In-memory registry is lost on crash. Persisting to disk enables reconnect recovery.
+## MVP Recommendation
 
-## MVP Definition
+**Phase 1 (Core):** Build the minimum to make fillers context-appropriate.
 
-### Launch With (v1)
+1. **Intent classifier** -- Tiered heuristic (keyword + pattern matching), <1ms
+2. **Multi-category clip pools** -- Extend clip_factory.py with category-specific prompts and directories (task, question, conversational)
+3. **Category-aware filler selection** -- Modify `_filler_manager()` to classify transcript, then call `_pick_filler(category)`
+4. **Clip generation** -- Generate initial pools for each category (10+ clips each)
 
-Minimum viable product -- what's needed to validate that voice-controlled task orchestration is useful.
+This addresses the core problem: task-oriented fillers no longer play for conversational questions.
 
-- [ ] **Async task spawning** -- "Ask Claude to refactor the auth module" spawns a background Claude CLI process and immediately returns control to the conversation
-- [ ] **Task registry** -- In-memory dict mapping task_id to {name, process, status, start_time, stdout, stderr}
-- [ ] **Task completion/failure notification** -- Audio chime + spoken summary when a task finishes or fails
-- [ ] **Status query** -- "What are my tasks doing?" returns spoken summary of all task states
-- [ ] **Task cancellation** -- "Cancel the auth task" kills the subprocess
-- [ ] **Task result retrieval** -- "What did the database task produce?" speaks a summary of stored output
-- [ ] **Non-blocking conversation** -- User can keep talking while tasks run in background
+**Phase 2 (Polish):** Add the features that make it feel alive.
 
-### Add After Validation (v1.x)
+5. **Non-speech event responses** -- Hook into STT rejection path, play playful/empathetic clips
+6. **Emotional tone matching** -- Add sentiment heuristics to classifier
+7. **Silence-as-response** -- Explicit "no filler" for very short/simple inputs
+8. **Barge-in context fillers** -- Classify interruption type for trailing filler selection
 
-Features to add once the core async loop is proven useful.
+**Defer to post-milestone:**
+- Dynamic TTS fillers (high complexity, marginal value given pre-generated pools work well)
+- Learned response preferences (needs session logging infrastructure, premature optimization)
+- Multi-turn context (over-engineering for a 1-second audio clip)
 
-- [ ] **Named context switching** -- Refer to tasks by descriptive name instead of requiring exact wording. Trigger: users struggle to reference tasks.
-- [ ] **Audio notification differentiation** -- Different sounds for start/complete/fail. Trigger: users want faster awareness without waiting for AI to speak.
-- [ ] **Ambient task awareness in system prompt** -- AI automatically knows running tasks. Trigger: users repeatedly spawn duplicate tasks because AI doesn't know what's already running.
-- [ ] **Context isolation via separate directories** -- Each task gets its own working directory. Trigger: concurrent tasks on same repo cause conflicts.
-- [ ] **Smart result summarization** -- AI-powered condensation of long outputs. Trigger: Claude CLI output is too long for comfortable voice delivery.
+## UX Expectations: What Makes Quick Responses Feel Natural
 
-### Future Consideration (v2+)
+Research synthesis of what users perceive as "natural" vs "robotic" in voice AI acknowledgments.
 
-Features to defer until the core model is proven.
+### Natural Feels Like
 
-- [ ] **Proactive status announcements** -- AI volunteers updates during conversation pauses. Defer: complex timing logic, risk of interrupting user.
-- [ ] **Session persistence across reconnects** -- Disk-backed registry survives WebSocket drops. Defer: adds persistence layer complexity, v1 sessions are short enough that reconnect is rarely needed.
-- [ ] **Voice-driven task composition** -- Chain task outputs. Defer: requires dependency graph management, rare use case.
-- [ ] **Git worktree isolation** -- True parallel branches for concurrent same-repo tasks. Defer: heavy infrastructure for an edge case in v1.
+| Quality | How to Achieve | Source |
+|---------|---------------|--------|
+| **Timing matches human conversation** | 200-500ms response window. Filler plays within 500ms of user finishing. Current 500ms gate is well-calibrated. | [AssemblyAI](https://www.assemblyai.com/blog/low-latency-voice-ai) |
+| **Variety without randomness** | Same category, different clips. Not the same "let me check" every time, but also not wildly different energy levels between turns. | Voice UX design principles |
+| **Appropriate energy level** | Excited input gets excited acknowledgment. Calm input gets calm acknowledgment. Mismatched energy is jarring ("OH WOW" in response to "what time is it"). | [Retell AI](https://www.retellai.com/blog/how-backchanneling-improves-user-experience-in-ai-powered-voice-agents) |
+| **Brevity for simple inputs** | "Yes" doesn't need a 2-second "let me think about that." Short inputs get short/no fillers. | [ACM study](https://dl.acm.org/doi/fullHtml/10.1145/3491102.3517684) |
+| **Fillers convey meaning** | "So" signals information is coming. "Hmm" signals thinking. "On it" signals action. Not just noise -- each filler sets expectations for what comes next. | [Google Duplex](https://research.google/blog/google-duplex-an-ai-system-for-accomplishing-real-world-tasks-over-the-phone/) |
 
-## Feature Prioritization Matrix
+### Robotic Feels Like
 
-| Feature | User Value | Implementation Cost | Priority |
-|---------|------------|---------------------|----------|
-| Async task spawning | HIGH | MEDIUM | P1 |
-| Task registry | HIGH | LOW | P1 |
-| Completion/failure notification | HIGH | LOW | P1 |
-| Status query tool | HIGH | LOW | P1 |
-| Task cancellation | HIGH | LOW | P1 |
-| Task result retrieval | HIGH | LOW | P1 |
-| Non-blocking conversation | HIGH | MEDIUM | P1 |
-| Named context switching | MEDIUM | MEDIUM | P2 |
-| Audio notification sounds | MEDIUM | LOW | P2 |
-| Ambient task awareness | MEDIUM | LOW | P2 |
-| Context isolation (directories) | MEDIUM | MEDIUM | P2 |
-| Smart result summarization | MEDIUM | LOW | P2 |
-| Proactive announcements | MEDIUM | HIGH | P3 |
-| Session persistence / reconnect | LOW | MEDIUM | P3 |
-| Task composition / chaining | LOW | HIGH | P3 |
-| Git worktree isolation | LOW | HIGH | P3 |
+| Quality | What Goes Wrong | Prevention |
+|---------|----------------|------------|
+| **Wrong context** | "Let me take a look" when user said "how are you" | Intent classification (core feature) |
+| **Same clip twice in a row** | User notices the pattern immediately | No-repeat guard (already implemented) |
+| **Filler longer than the response** | 3-second filler clip, then 1-second LLM answer | Keep clips short (0.5-2s). The clip_factory already enforces 0.3-4s duration. |
+| **Filler that contradicts the response** | "Let me check" then "I don't know" (didn't actually check anything) | Use vague fillers for uncertain categories. "Hmm" is always safe. |
+| **Filler after immediate response** | LLM responds in 200ms but filler still plays | 500ms gate (already implemented). Filler cancellation on first LLM text (already implemented). |
 
-**Priority key:**
-- P1: Must have for launch -- the async orchestration loop does not work without these
-- P2: Should have -- significantly improves usability, add as soon as core is stable
-- P3: Nice to have -- defer until usage patterns emerge
+## Latency Budget Analysis
 
-## Competitor Feature Analysis
+Current pipeline timing from user speech end to first audio:
 
-| Feature | SystemPrompt Code Orchestrator | Claude Code Agent Teams | Serenade / Talon Voice | Conversation Mode (existing) | Our Live Mode Approach |
-|---------|-------------------------------|------------------------|----------------------|------------------------------|----------------------|
-| Voice input | Yes (mobile app, experimental v0.01) | No (terminal-only) | Yes (speech-to-code, not task orchestration) | Yes (PTT + Whisper) | Yes (PTT + OpenAI Realtime API, low-latency) |
-| Async task management | Yes (MCP-based agent manager) | Yes (shared task list, teammate spawning) | No (synchronous commands) | No (blocks on Claude CLI) | Yes (async subprocess with registry) |
-| Multiple concurrent tasks | Yes (multiple agent sessions) | Yes (multiple teammates, file-lock coordination) | No | No | Yes (process pool with named tasks) |
-| Context isolation | Partial (Docker containers) | Yes (each teammate has own context window) | N/A | N/A | Yes (separate working directories, optionally git worktrees) |
-| Task status monitoring | Via MCP protocol | Shared task list (pending/in-progress/completed) | N/A | N/A | Voice-queryable status + audio cues |
-| Error handling | MCP error responses | Teammates can stop on errors; lead can spawn replacements | Voice feedback for parse errors | Desktop notification | Audio cue + spoken error summary |
-| Task cancellation | Kill agent session | Graceful shutdown request to teammates | N/A | N/A | Process termination with cleanup |
-| Inter-task communication | Via MCP server | Direct messaging between teammates | N/A | N/A | Not in v1 (tasks are independent) |
-| Voice-to-voice conversation | Experimental (mobile) | No | No (speech-to-text only) | TTS responses (not real-time) | Yes (OpenAI Realtime API, sub-second latency) |
-| Platform | Desktop + mobile (via tunnel) | Terminal (any OS) | Desktop (Windows/Mac/Linux) | Linux only | Linux only |
+```
+User stops speaking
+  |
+  +-- STT processing: ~100-300ms (Deepgram streaming)
+  |
+  +-- [NEW: Intent classification]: ~1ms (heuristic) or ~5-50ms (embedding model)
+  |
+  +-- Filler gate: 500ms wait
+  |     |
+  |     +-- If LLM responds within 500ms: no filler (skip)
+  |     +-- If LLM still processing: play category-appropriate filler
+  |
+  +-- Filler audio playback: ~500-2000ms
+  |
+  +-- LLM first token: ~800-2000ms (Claude CLI)
+  |
+  +-- Filler cancellation on first LLM text
+  |
+  +-- TTS + playback of actual response
+```
 
-### Key Competitive Insights
-
-1. **No one does voice + async task orchestration well yet.** SystemPrompt is closest but is experimental (v0.01) and mobile-focused. Claude Code Agent Teams is powerful but terminal-only with no voice interface. This is genuinely novel territory.
-
-2. **Claude Code Agent Teams sets the bar for task coordination features** -- shared task lists, named tasks, dependency management, inter-agent messaging. We should study their patterns but adapt for voice (no file browsing, no split panes -- everything must be speakable).
-
-3. **The voice advantage is real-time awareness.** Terminal users have to actively check task status. Voice users get proactive notifications. This is the core differentiator over Agent Teams.
-
-4. **Serenade/Talon solve voice-to-code, not voice-to-orchestration.** They translate speech into code edits. We translate speech into task management commands. Different problem entirely.
+The intent classification step must complete before the filler gate opens. With heuristic classification at ~1ms, this adds zero perceptible latency. Even an embedding-based classifier at 50ms fits comfortably.
 
 ## Sources
 
-- [Claude Code Agent Teams documentation](https://code.claude.com/docs/en/agent-teams) -- HIGH confidence, official Anthropic docs
-- [Claude Code background tasks patterns](https://apidog.com/blog/claude-code-background-tasks/) -- MEDIUM confidence, third-party analysis
-- [SystemPrompt Code Orchestrator](https://github.com/systempromptio/systemprompt-code-orchestrator) -- MEDIUM confidence, GitHub project docs
-- [Pipecat voice agent framework](https://github.com/pipecat-ai/pipecat) -- MEDIUM confidence, framework for voice agent patterns
-- [VUI Design Principles](https://www.parallelhq.com/blog/voice-user-interface-vui-design-principles) -- MEDIUM confidence, general VUI best practices
-- [Voice AI stack 2026](https://www.assemblyai.com/blog/the-voice-ai-stack-for-building-agents) -- MEDIUM confidence, ecosystem overview
-- [Serenade voice coding](https://serenade.ai/) -- HIGH confidence, official product
-- [Google VUI Design](https://design.google/library/speaking-the-same-language-vui) -- HIGH confidence, Google design guidelines
-- Existing codebase analysis (`openai_realtime.py`, `push-to-talk.py`) -- HIGH confidence, direct code review
+### High Confidence (Official Documentation, Research)
+- [Google Duplex Research Blog](https://research.google/blog/google-duplex-an-ai-system-for-accomplishing-real-world-tasks-over-the-phone/) -- Filler design, latency management, context-aware disfluencies
+- [NVIDIA PersonaPlex](https://research.nvidia.com/labs/adlr/personaplex/) -- Backchannel training on 7,303 real conversations
+- [Wikipedia: Backchannel (linguistics)](https://en.wikipedia.org/wiki/Backchannel_(linguistics)) -- Linguistic framework for generic vs. specific backchannels
+- [FunAudioLLM/SenseVoice](https://github.com/FunAudioLLM/SenseVoice) -- Non-speech event detection (cough, laugh, sneeze)
+- [Deepgram Audio Intelligence](https://deepgram.com/product/audio-intelligence) -- STT-level sentiment, intent, filler word detection
 
----
-*Feature research for: Voice-controlled async AI task orchestrator (push-to-talk live mode)*
-*Researched: 2026-02-13*
+### Medium Confidence (Industry Analysis, Multiple Sources Agree)
+- [AssemblyAI: The 300ms Rule](https://www.assemblyai.com/blog/low-latency-voice-ai) -- Latency perception thresholds
+- [Sierra: Engineering Low-Latency Voice Agents](https://sierra.ai/blog/voice-latency) -- Filler audio as latency masking
+- [Retell AI: Backchanneling](https://www.retellai.com/blog/how-backchanneling-improves-user-experience-in-ai-powered-voice-agents) -- Context-aware acknowledgment selection
+- [ACM: Voice Assistant Response Behavior](https://dl.acm.org/doi/fullHtml/10.1145/3491102.3517684) -- User preference for short responses to commands
+- [Vaanix: Backchanneling in AI Voice Agents](https://vaanix.ai/blog/what-is-backchanneling-in-ai-voice-agents) -- Technical challenges
+- [Intent Classification in <1ms](https://medium.com/@durgeshrathod.777/intent-classification-in-1ms-how-we-built-a-lightning-fast-classifier-with-embeddings-db76bfb6d964) -- Embedding-based fast classification
+
+### Low Confidence (Single Source, Needs Validation)
+- [LIDSNet: Lightweight On-Device Intent Detection](https://arxiv.org/pdf/2110.15717) -- Siamese network approach, not verified for this use case
+- [Trillet: The High Cost of Silence](https://www.trillet.ai/blogs/high-cost-of-latency) -- Business impact claims (call center context, not desktop app)

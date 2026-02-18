@@ -1,311 +1,247 @@
-# Project Research Summary
+# Research Summary: Adaptive Quick Responses (v1.2)
 
-**Project:** Voice-Controlled Async Task Orchestrator (Live Mode)
-**Domain:** Voice-controlled async task orchestration for Claude CLI
-**Researched:** 2026-02-13
+**Project:** Push-to-Talk Voice Assistant - v1.2 Adaptive Quick Response Library
+**Domain:** Context-aware quick response system for existing voice AI assistant
+**Researched:** 2026-02-18
 **Confidence:** HIGH
 
 ## Executive Summary
 
-This project adds a "Live Mode" to the existing push-to-talk application, enabling voice-controlled orchestration of multiple concurrent Claude CLI tasks. The core insight: the app already runs an asyncio event loop for the OpenAI Realtime WebSocket session, so the orchestrator lives inside that same loop using `asyncio.create_subprocess_exec()` for Claude CLI processes. No new frameworks are needed—just stdlib asyncio plus one library (`janus`) for thread-to-async bridging.
+The v1.2 milestone replaces the current random acknowledgment system with context-aware quick responses. Research confirms this is a surgically scoped enhancement to the existing 5-stage pipeline — not a major architectural change. The integration point is narrow: modify the `_filler_manager()` method in `live_session.py` to classify user input and select appropriate responses from a categorized library.
 
-The architecture is cleanly layered: LiveSession owns both a RealtimeSession (voice) and TaskManager (orchestration). The TaskManager spawns isolated ClaudeTask instances, each running a separate Claude CLI subprocess in its own working directory. The OpenAI Realtime API's GA model (`gpt-realtime`) supports async function calling, meaning the AI can acknowledge task spawning immediately ("On it, task started") and continue conversation while work happens in background. Task completion notifications inject results back into the conversation stream.
+The recommended approach uses **pattern-matching classification** (not ML) for sub-millisecond response selection, **model2vec** for semantic similarity when exact matches fail, and a **JSON-based response library** that grows organically via a post-session curator daemon (following the same pattern as `learner.py`). The existing Whisper STT, Piper TTS, and clip factory infrastructure provide everything needed — only two small additions are required: model2vec (8MB, numpy-only dependency) for semantic matching, and a curator daemon for library growth.
 
-The critical risk is blocking the asyncio event loop with synchronous subprocess calls—this kills the WebSocket connection within 20 seconds. Prevention: use `asyncio.create_subprocess_exec()` exclusively, never `subprocess.run()`. Secondary risks include task garbage collection (solved with strong reference tracking), session expiry/reconnection (mitigated with local task registry persistence), and zombie process accumulation (prevented with PID tracking and cleanup handlers).
+The critical risk is **timing**: classification must complete in under 50ms to fit within the existing 500ms filler gate. Using keyword/pattern matching for primary classification (1ms) with model2vec as fallback (5-10ms) keeps total latency under 20ms. Secondary risks include audio quality discontinuity between pre-generated clips and live TTS (solved by parameter normalization), and classification accuracy degradation with too many categories (solved by starting with 5-7 broad categories and expanding only with data).
 
 ## Key Findings
 
 ### Recommended Stack
 
-The existing asyncio foundation supports the orchestrator without new dependencies. Python 3.12 stdlib provides everything needed: `asyncio` for subprocess management, `dataclasses` for task state modeling, `StrEnum` for lifecycle states, `uuid` for task IDs. The Claude CLI is already installed and supports all necessary flags (`-p`, `--output-format stream-json`, `--permission-mode`, `--max-turns`, `--no-session-persistence`). The only new dependency is `janus` (thread-safe asyncio queue) to bridge pynput hotkey events from the keyboard thread into the asyncio loop.
+The existing stack (Piper TTS, Whisper STT, asyncio pipeline) already provides nearly everything needed. Only two additions are recommended:
 
 **Core technologies:**
-- Python `asyncio` (stdlib): Async subprocess spawning with `create_subprocess_exec()`, non-blocking I/O
-- Python `dataclasses` (stdlib): Task state modeling (TaskRecord with slots=True for efficiency)
-- Python `StrEnum` (stdlib): Task lifecycle states (PENDING, RUNNING, COMPLETED, FAILED, CANCELLED)
-- `janus` 2.0.0: Thread-safe bridge between pynput (sync thread) and asyncio event loop
-- Claude CLI 2.1.41: Background execution engine with stream-json output for progress monitoring
-- OpenAI Realtime API `gpt-realtime`: GA model with native async function calling support
+- **model2vec** (potion-base-8M, 8MB): Ultra-fast semantic similarity matching (20,000+ sentences/sec on CPU) for when keyword patterns don't match — only dependency is numpy (already installed)
+- **Python sqlite3** (stdlib): Response library metadata storage — considered but JSON is actually better for this scale (50-200 entries); JSON keeps backward compatibility with existing `ack_pool.json` pattern
+- **Piper TTS** (existing): Pre-generate response clips using the same `clip_factory.py` infrastructure — identical pattern to existing acknowledgment pool
 
-**Key decision:** Avoid external task queue frameworks (Celery, Dramatiq) and state machines—this is a single-user desktop app with a simple linear task lifecycle. Stdlib is sufficient and eliminates dependencies.
+**What NOT to add:**
+- **No PyTorch/sentence-transformers**: model2vec uses numpy only; sentence-transformers would add 2GB dependency for marginal accuracy improvement
+- **No cloud APIs**: Classification must happen in <50ms; any HTTP call exceeds the budget
+- **No separate audio classifier**: Whisper already produces non-speech detection signals via `no_speech_prob`, `avg_logprob`, and bracketed annotations like `[Laughter]`
 
 ### Expected Features
 
-Research identified a clear MVP scope and v2 deferral strategy. The core insight from competitors (Claude Code Agent Teams, SystemPrompt) is that no one does voice + async task orchestration well yet—this is genuinely novel territory.
-
 **Must have (table stakes):**
-- Async task spawning with immediate voice acknowledgment
-- Non-blocking conversation while tasks run in background
-- Task completion/failure notifications (audio + spoken summary)
-- Status query ("What are my tasks doing?")
-- Task cancellation ("Cancel the auth task")
-- Task result retrieval with summarization
-- In-memory task registry mapping task_id to state
+- **Intent-based category routing** — classify user input (question/command/conversational/emotional) and pick fillers from matching category; without this, the system is worse than random because users notice wrong responses
+- **Multi-category clip pools** — separate pools for different situations (task-oriented "on it", conversational "hmm", social "hey"); LOW complexity, extends existing clip_factory
+- **Classification speed <200ms** — must fit within the 500ms filler gate; this constraint rules out API calls and large models
+- **Graceful fallback to random** — if classification fails or takes too long, use existing acknowledgment pool rather than silence
+- **Clip variety within categories** — 5-8 clips per category minimum to avoid repetition fatigue
 
-**Should have (competitive differentiators):**
-- Named task context switching (refer to tasks by description, not ID)
-- Proactive status announcements (AI volunteers updates during pauses)
-- Audio notification differentiation (distinct sounds for start/complete/fail)
-- Context isolation (separate working directories per task)
-- Ambient task awareness (AI knows running tasks without being asked)
-- Smart result summarization (condense Claude CLI output for voice delivery)
+**Should have (differentiators):**
+- **Non-speech event responses** — detect coughs/sighs/laughter via STT rejection metadata and respond playfully ("excuse you", sympathetic acknowledgment); leverages existing multi-layer filtering
+- **Emotional tone matching** — detect excitement/frustration in text and match filler energy (exclamation marks, sentiment keywords)
+- **Conversational vs. task mode detection** — "What's your name?" gets "hmm" not "checking now"; falls naturally out of category taxonomy
+- **Silence as valid response** — for very short inputs ("yes", "ok"), no filler at all; explicit classification of "no-filler-needed" inputs
 
 **Defer (v2+):**
-- Session persistence across WebSocket reconnects (disk-backed registry)
-- Voice-driven task composition (chain task outputs)
-- Git worktree isolation (parallel branches for same-repo tasks)
-- Real-time streaming of Claude CLI output (too verbose for voice)
-
-**Anti-features to avoid:**
-- Interactive mid-task steering (Claude CLI doesn't support stdin mid-execution; spawn new tasks instead)
-- Visual task dashboard (defeats the voice-first premise)
-- Always-on listening without PTT (Server VAD within sessions already handles this)
+- **Dynamic TTS fillers** — on-the-fly generation with contextual text ("hmm, let me think about [topic]"); Piper latency (200-400ms) may blow timing budget
+- **Learned response preferences** — track which fillers get interrupted and down-weight them; needs session logging infrastructure
+- **Multi-turn context** — track conversation history to pick fillers based on flow; over-engineering for a 1-second audio clip
 
 ### Architecture Approach
 
-The architecture extends the existing codebase cleanly without disruptive refactoring. LiveSession becomes the glue layer between voice (RealtimeSession) and orchestration (TaskManager). Each ClaudeTask is an isolated worker with its own subprocess and working directory.
+The architecture adds three new components while modifying only two existing ones. The key insight: the integration point is surgically narrow — `_filler_manager()` is the only method in the hot path that changes. Library growth happens entirely outside the pipeline via a post-session curator daemon.
 
 **Major components:**
-1. **LiveSession** — Owns both RealtimeSession and TaskManager, configures tools, routes tool calls to task operations
-2. **TaskManager** — Registry tracking all spawned tasks, provides spawn/query/cancel interfaces, monitors completion
-3. **ClaudeTask** — Single Claude CLI subprocess with isolated context (own cwd, unique session, output buffer)
-4. **RealtimeSession (modified)** — Pluggable tool handler instead of hardcoded execution, supports async tool callbacks
-5. **Task Notification System** — Injects completion events into Realtime conversation via `conversation.item.create`
 
-**Key patterns:**
-- **Async subprocess management:** Use `asyncio.create_subprocess_exec()` exclusively, never `subprocess.run()`
-- **Fire-and-acknowledge for long tasks:** Return immediate acknowledgment ("task started"), deliver results later via conversation injection
-- **Context isolation via working directory:** Each task gets own `cwd`, no shared Claude session state
-- **Pluggable tool handler:** RealtimeSession accepts a `tool_handler` callback, making it reusable across modes
+1. **InputClassifier** (new, in-process) — Pattern matching + optional model2vec fallback for semantic similarity; produces ClassifiedInput with category/confidence in <50ms; purely synchronous, no async complexity
 
-**Data flow:** User speaks → Realtime API transcribes + generates function_call → LiveSession routes to TaskManager → TaskManager spawns ClaudeTask subprocess → Returns immediately with task_id → AI acknowledges → Task runs in background → On completion, notification injected into conversation → AI speaks result
+2. **ResponseLibrary** (new, in-process) — JSON-based lookup table mapping categories to pre-loaded PCM clips; O(1) lookup via dict index, entire library loads at startup (same pattern as `_load_filler_clips()`); tracks usage for post-session analysis
+
+3. **LibraryCurator** (new, daemon) — Post-session subprocess (like `learner.py`) that reads conversation log, identifies response gaps via Claude, generates new clips via Piper, and prunes low-quality entries; writes to `library.json`, next session picks up changes
+
+4. **Modified: `_filler_manager()`** — Classify input → lookup response → wait gate → play clip or fallback; classification happens before gate (consumes negligible time from 500ms budget); falls back to existing random acknowledgment if no match
+
+5. **Modified: STT stage** — Forward non-speech events (currently rejected silently) as new `NON_SPEECH` frame type carrying rejection metadata (`no_speech_prob`, `avg_logprob`) for playful responses
+
+**Data flow:**
+- User speaks → Whisper transcribes → Classify input → Lookup clip → Wait 500ms gate → Play if LLM hasn't responded → Cancel on first LLM text
+- Non-speech (cough/sigh) → Whisper rejects → Emit NON_SPEECH frame → Classify event → Play appropriate response (no LLM call)
+- Session ends → Curator analyzes gaps → Generates new clips via Piper → Updates library.json
 
 ### Critical Pitfalls
 
-Research identified six critical pitfalls that will break the system if not addressed from day one.
+1. **Classification latency exceeds filler window** — If classification takes 200ms+, the filler arrives too late or collides with LLM response. Industry benchmarks: 200-300ms is the human-perceivable response window. **Mitigation:** Use pattern matching (<1ms) with model2vec fallback (5-10ms). Never use LLM or API calls for classification.
 
-1. **Blocking the asyncio event loop with synchronous subprocess.run()** — Using `subprocess.run()` from async code freezes the entire WebSocket session, killing the connection after 20s (keepalive timeout). Prevention: use `asyncio.create_subprocess_exec()` exclusively. Phase 1 foundation.
+2. **Quick response collides with LLM's first audio** — Clip starts playing but LLM responds faster than expected; tail of clip overlaps with TTS. **Mitigation:** Two-layer cancellation: source-side stops pushing new chunks (existing), sink-side drains pending FILLER frames from queue when cancel fires (add to playback stage).
 
-2. **Fire-and-forget asyncio tasks getting garbage collected** — Python's event loop uses WeakSet for tasks; without strong references, background tasks silently vanish mid-execution. Prevention: maintain a strong reference set with done callbacks. Phase 1 lifecycle management.
+3. **Over-classifying intent creates brittle taxonomy** — 30+ categories degrades accuracy; 60% accuracy means 40% of responses feel wrong (worse than generic). **Mitigation:** Start with 5-7 broad categories maximum. Use "acknowledgment" as fallback for low-confidence classifications. Add categories only with data-driven evidence.
 
-3. **OpenAI Realtime API session expiry and reconnection state loss** — Sessions expire after 15-30 minutes; WebSocket drops lose all conversation context including task awareness. Prevention: persist task registry to disk, inject state summary on reconnect. Phase 2 resilience.
+4. **Non-speech detection misclassifies speech** — Cough detector triggers on breathy speech, laugh detector on mid-sentence chuckle. Whisper's `no_speech_prob` has 40.3% hallucination rate on non-speech audio. **Mitigation:** Defer non-speech detection to Phase 3+. Require very high confidence (≥0.85) when implemented. Make responses safe even if detection is wrong.
 
-4. **Concurrent state mutation in task registry** — Multiple async handlers mutate shared task dict simultaneously, causing race conditions. Prevention: use `asyncio.Lock` for registry access or event-sourced state pattern. Phase 1 registry design.
-
-5. **Claude CLI process zombie accumulation** — Failing to `await process.wait()` creates zombies; crashes leave orphaned Claude processes running. Prevention: track PIDs in file, cleanup on startup, use atexit handlers. Phase 1 process lifecycle.
-
-6. **Realtime API function call response ordering bugs** — Model may hallucinate results if function calls take too long without response. Prevention: immediate acknowledgment pattern, always return something within seconds. Phase 1 tool integration.
+5. **Uncanny valley — contextually correct but emotionally wrong** — Classifier picks "I'm sorry to hear that" for sad news but Piper TTS sounds robotic, creating intelligence/voice quality mismatch. **Mitigation:** Avoid emotionally loaded categories. Stick to neutral/functional (acknowledgments, greetings, reactions). Normalize Piper parameters between clips and live TTS.
 
 ## Implications for Roadmap
 
-Based on research, the roadmap should follow this phase structure. The dependency chain is clear: foundation → capability → integration → polish.
+Based on research, suggested phase structure:
 
-### Phase 1: Async Infrastructure Foundation
-
-**Rationale:** The entire async task system depends on non-blocking subprocess management and pluggable tool handlers. Without this foundation, everything else fails. This phase refactors existing code to support async patterns without adding new features.
-
-**Delivers:**
-- RealtimeSession with pluggable `tool_handler` callback and configurable `tools` list
-- Upgrade to `gpt-realtime` GA model for native async function calling
-- Async-aware tool execution pattern (handlers can be async)
-- Proof that existing functionality (current tools) still works
-
-**Avoids:**
-- Pitfall 1: Blocking event loop (replaced `subprocess.run()` with async subprocess)
-- Pitfall 6: Function call ordering bugs (immediate acknowledgment pattern established)
-
-**Research flag:** Standard patterns—asyncio subprocess is well-documented. Skip `/gsd:research-phase`.
-
----
-
-### Phase 2: Task Orchestration Core
-
-**Rationale:** With async infrastructure in place, build the task management capability in isolation. This phase is testable without voice integration—TaskManager and ClaudeTask can be unit-tested via direct API calls.
+### Phase 1: Core Classification + Playback
+**Rationale:** Establishes the foundation — classification and response library — before adding complexity. Pattern-matching classification is simple enough to build and test independently before integration. This phase addresses the core user complaint: task-oriented fillers playing for non-task inputs.
 
 **Delivers:**
-- TaskManager class (spawn, track, query, cancel operations)
-- ClaudeTask class (async subprocess wrapper with output capture and timeout)
-- Task state modeling (dataclasses: TaskRecord, TaskState enum)
-- Strong reference tracking to prevent task garbage collection
-- PID file for orphan cleanup
-- Basic unit tests for task lifecycle
+- InputClassifier with pattern/keyword matching (<1ms classification)
+- ResponseLibrary JSON schema and in-memory index
+- Modified `_filler_manager()` using classifier + library
+- Seed library with 5 categories: task, question, conversational, social, acknowledgment
+- 5-8 clips per category (30-40 clips total)
+- Graceful fallback to existing acknowledgment pool
 
-**Uses:**
-- `asyncio.create_subprocess_exec()` for Claude CLI spawning
-- `dataclasses` for task state
-- `StrEnum` for lifecycle states
-- `janus` for thread-to-async bridge (hotkey events)
+**Addresses features:**
+- Intent-based category routing (must-have)
+- Multi-category clip pools (must-have)
+- Classification speed <200ms (must-have)
+- Graceful fallback (must-have)
 
-**Avoids:**
-- Pitfall 2: Task garbage collection (strong reference set with done callbacks)
-- Pitfall 4: State race conditions (asyncio.Lock on registry)
-- Pitfall 5: Zombie processes (PID tracking, cleanup handlers)
+**Avoids pitfalls:**
+- #1 (classification latency) — pattern matching guarantees <1ms
+- #3 (over-classification) — only 5 categories initially
+- #7 (cold start) — seed library ships with repo
 
-**Research flag:** Standard patterns—asyncio subprocess management is well-understood. Skip `/gsd:research-phase`.
+**Research flags:** Standard pattern matching and JSON storage — no research needed.
 
----
-
-### Phase 3: Voice Integration (Live Mode Assembly)
-
-**Rationale:** With foundation (Phase 1) and capability (Phase 2) complete, wire them together. LiveSession connects RealtimeSession to TaskManager. This phase makes the orchestrator voice-controllable.
+### Phase 2: Semantic Matching + Barge-in Polish
+**Rationale:** Adds model2vec for semantic similarity when keyword patterns don't match. This improves classification accuracy without adding latency. Barge-in integration addresses edge cases where quick responses are interrupted.
 
 **Delivers:**
-- LiveSession class (owns RealtimeSession + TaskManager pair)
-- Task-oriented tool definitions (start_task, check_tasks, get_task_result, cancel_task)
-- Tool handler routing to TaskManager operations
-- Proactive task completion notifications via `conversation.item.create`
-- Integration into PushToTalk mode routing
-- Hotkey handling for live mode toggle
+- model2vec integration as classification fallback
+- Semantic similarity matching (embed user text, cosine similarity to category exemplars)
+- Barge-in tracking for quick response clips (don't include in LLM annotation)
+- Custom barge-in behavior: skip trailing acknowledgment when quick response is interrupted
+- Silence-as-response for very short inputs (<3 words)
 
-**Implements:**
-- Fire-and-acknowledge pattern: tools return immediately, results delivered later
-- Context isolation: each task gets own working directory
-- Notification injection: TaskManager callbacks push completion events into conversation
+**Addresses features:**
+- Emotional tone matching (should-have) — semantic matching catches sentiment
+- Conversational vs. task mode (should-have) — better discrimination
+- Silence as valid response (should-have)
 
-**Addresses:**
-- Must-have features: async spawning, status query, cancellation, result retrieval, non-blocking conversation
-- Competitive feature: ambient task awareness (AI knows running tasks via tool access)
+**Avoids pitfalls:**
+- #9 (barge-in confusion) — track quick response state separately from LLM state
+- #13 (unnecessary quick responses) — suppress for short utterances
 
-**Avoids:**
-- Pitfall 1: Non-blocking during task execution (voice conversation continues)
-- Pitfall 6: Immediate tool acknowledgment prevents hallucinated results
+**Research flags:** model2vec API is verified, integration is straightforward — no research needed.
 
-**Research flag:** Moderate complexity—OpenAI Realtime API function calling has known quirks. Consider `/gsd:research-phase` if function call ordering causes issues.
-
----
-
-### Phase 4: Resilience and UX Polish
-
-**Rationale:** Core functionality works, now make it production-ready. Address WebSocket reconnection, session persistence, audio notifications, and error handling.
+### Phase 3: Library Growth + Pruning
+**Rationale:** Once the system works with a static library, add organic growth via the curator daemon. This follows the exact pattern as `learner.py`, reducing implementation risk.
 
 **Delivers:**
-- WebSocket reconnection with task state recovery
-- Disk-backed task registry for session persistence
-- Audio notification sounds (start/complete/fail cues)
-- Task result summarization (truncate/condense for voice)
-- Named task context switching (refer by description)
-- Cost tracking and warnings (max concurrent tasks, API budget)
+- LibraryCurator daemon (subprocess spawned at session start)
+- Post-session gap analysis via `claude -p`
+- Automated clip generation via Piper (reuses `clip_factory.py` functions)
+- Quality pruning (remove frequently-interrupted clips)
+- Usage logging (which clips played, barge-in events)
 
-**Addresses:**
-- Should-have features: proactive announcements, audio differentiation, smart summarization, named tasks
-- UX pitfalls: silent processing, verbose updates, ambiguous references, context overload
+**Addresses features:**
+- Learned response preferences (should-have)
+- Library expansion based on actual usage patterns
 
-**Avoids:**
-- Pitfall 3: Session expiry (proactive reconnection, state restoration)
-- UX pitfalls: no feedback, interruption during flow, latency in notifications
+**Avoids pitfalls:**
+- #6 (library bloat) — cap at 7 clips per category, prune low-effectiveness entries
+- #11 (personality drift) — include personality prompt in generation context
 
-**Research flag:** Reconnection state management is moderately complex. Consider `/gsd:research-phase` for WebSocket reconnection patterns.
+**Research flags:** Standard daemon pattern from `learner.py` — no research needed.
 
----
-
-### Phase 5: Mode Rename and Documentation
-
-**Rationale:** With live mode complete, update all user-facing elements to reflect the new mode structure. Rename "live" dictation mode to "dictate" and "realtime" to "live" across codebase and UI.
+### Phase 4: Non-Speech Event Detection (Optional)
+**Rationale:** Defer to last because of high false-positive risk. Only implement if Phases 1-3 demonstrate that text-based classification leaves coverage gaps.
 
 **Delivers:**
-- Config migration (dictation_mode: "live" → "dictate", ai_mode: "realtime" → "live")
-- Indicator UI updates (new mode names, task count display)
-- Settings tab for live mode configuration (max tasks, default working dir)
-- Documentation updates (README, CLAUDE.md, website)
+- NON_SPEECH frame type in pipeline
+- STT stage forwarding of rejected segments with metadata
+- Non-speech event classification (cough/sigh/laugh)
+- Playful responses for detected events ("excuse you", empathetic acknowledgment)
 
-**Addresses:**
-- User-facing clarity (distinct mode names)
-- Discoverability (settings UI for configuration)
+**Addresses features:**
+- Non-speech event responses (should-have)
 
-**Research flag:** UI/config work—no research needed. Skip `/gsd:research-phase`.
+**Avoids pitfalls:**
+- #4 (misclassification) — require high confidence, make responses safe
 
----
+**Research flags:** May need `/gsd:research-phase` for non-speech classification accuracy tuning if Whisper's existing signals prove insufficient.
 
 ### Phase Ordering Rationale
 
-**Dependency chain enforces this order:**
-- Phase 1 must come first: pluggable tool handler is required for Phase 3 integration; async subprocess patterns are required for Phase 2 task execution
-- Phase 2 depends on Phase 1: TaskManager uses async subprocess APIs established in Phase 1
-- Phase 3 depends on Phase 1 + 2: LiveSession wires together the refactored RealtimeSession (Phase 1) and TaskManager (Phase 2)
-- Phase 4 can only be validated after Phase 3 works: reconnection/persistence need a working live mode to test against
-- Phase 5 is last: can't rename modes until live mode exists
+- **Phase 1 first** because classification and library are dependencies for everything else; they can be built and tested independently before pipeline integration
+- **Phase 2 before Phase 3** because semantic matching improves classification quality, which helps the curator learn what "good" responses look like
+- **Phase 3 before Phase 4** because library growth establishes the curator infrastructure; non-speech detection can reuse this for generating event-specific clips
+- **Phase 4 last** (and optional) because non-speech detection has the highest false-positive risk and may not be needed if text-based classification covers 95%+ of cases
 
-**Pitfall mitigation drives this structure:**
-- Critical pitfalls (1, 2, 4, 5, 6) are all addressed in Phases 1-2, before voice integration
-- This means the orchestration core is solid before adding the complexity of WebSocket + voice + conversation context
-- Phase 3 risks are lower because the hard async problems are already solved
-- Phase 4 addresses the one deferred pitfall (session expiry) after core functionality proves stable
+**Grouping by architectural layer:**
+- Phase 1: Data layer (library) + decision layer (classifier)
+- Phase 2: Decision quality (semantic matching) + interaction layer (barge-in)
+- Phase 3: Growth layer (curator)
+- Phase 4: Input layer (non-speech events)
 
-**Incremental validation:**
-- Phase 1: existing features still work (regression testing)
-- Phase 2: task lifecycle works via unit tests (no voice needed)
-- Phase 3: full voice-controlled task orchestration (integration testing)
-- Phase 4: resilience under network failures, long sessions (stress testing)
-- Phase 5: user-facing polish (acceptance testing)
+This ordering minimizes rework — each phase builds on verified infrastructure from previous phases.
 
 ### Research Flags
 
-**Phases needing deeper research during planning:**
-- **Phase 3:** OpenAI Realtime API async function calling has known quirks (model version differences, response ordering bugs). If issues arise, use `/gsd:research-phase` to investigate model-specific behavior and workarounds.
-- **Phase 4:** WebSocket reconnection state management may need research for edge cases (reconnect during task completion, multiple reconnects in sequence). Consider `/gsd:research-phase` if complexity exceeds expectations.
-
 **Phases with standard patterns (skip research-phase):**
-- **Phase 1:** Asyncio subprocess management and callback patterns are well-documented in Python stdlib docs
-- **Phase 2:** Task registry and subprocess lifecycle are straightforward asyncio patterns
-- **Phase 5:** Config migration and UI updates are mechanical—no novel patterns
+- **Phase 1:** Pattern matching is simple; JSON storage follows `ack_pool.json` pattern; pipeline integration point is well-understood from codebase reading
+- **Phase 2:** model2vec API is verified; barge-in logic already exists (just needs extension)
+- **Phase 3:** Curator daemon follows `learner.py` pattern exactly; clip generation reuses `clip_factory.py` functions
+
+**Phases likely needing deeper research:**
+- **Phase 4:** Non-speech detection accuracy may need experimentation; if Whisper's existing signals (`no_speech_prob`, bracketed annotations) prove insufficient, may need to research dedicated audio classifiers (Whisper-AT, SenseVoice) — but defer this research until Phase 4 is prioritized
 
 ## Confidence Assessment
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | All core technologies verified against Python 3.12 docs and existing codebase. Janus is production-stable (aio-libs, 2.0.0 released Dec 2024). Claude CLI flags confirmed in official docs. |
-| Features | MEDIUM-HIGH | Strong codebase understanding + ecosystem research. Domain is novel (no direct competitors doing voice + async task orchestration), so fewer precedents. Feature prioritization is inference-based but grounded in VUI best practices. |
-| Architecture | HIGH | Existing codebase well-understood. Component boundaries are clean extensions of current architecture. Async subprocess patterns are proven. Critical paths (event loop, WebSocket lifecycle, tool execution) directly analyzed. |
-| Pitfalls | HIGH | All critical pitfalls verified against official docs (Python asyncio, OpenAI Realtime API) and community reports. Process lifecycle, GC behavior, WebSocket keepalive are documented behaviors. Function call ordering bugs confirmed in OpenAI community posts. |
+| Stack | HIGH | Verified via GitHub docs (model2vec), codebase reading (existing Piper/Whisper integration), stdlib availability (sqlite3/JSON); only 1 new external dependency (model2vec, 8MB, numpy-only) |
+| Features | HIGH | Well-researched domain (backchannel linguistics, Google Duplex research, NVIDIA PersonaPlex, industry latency benchmarks); clear distinction between table stakes and differentiators |
+| Architecture | HIGH | Complete codebase reading of `live_session.py`, `clip_factory.py`, `learner.py`; integration points verified in source code; proposed changes are surgical (only `_filler_manager()` in hot path) |
+| Pitfalls | HIGH | Verified against academic research (arXiv papers on Whisper hallucination), industry analysis (AssemblyAI/Sierra latency benchmarks), and existing codebase patterns (timing constraints, audio pipeline) |
 
 **Overall confidence:** HIGH
 
+The research is based on complete source code reading (not API assumptions), verified third-party libraries (model2vec confirmed on GitHub/PyPI), and well-documented voice UX domain knowledge (Google Duplex research, backchannel linguistics). The only area with lower confidence is non-speech detection accuracy (40.3% hallucination rate from research), which is why Phase 4 is deferred and optional.
+
 ### Gaps to Address
 
-While research is thorough, these areas need validation during implementation:
+- **Non-speech detection accuracy**: Whisper's `no_speech_prob` and bracketed annotations are inconsistent (trained on YouTube subtitles, not designed for this). The research identifies this as a known hard problem (7% error rate at best). **Handling:** Defer to Phase 4 (optional). If implemented, require very high confidence thresholds and make responses safe even if detection is wrong.
 
-- **OpenAI Realtime API GA model behavior:** The `gpt-realtime` model is newly GA; async function calling behavior may differ from preview model. Test thoroughly during Phase 3. If unexpected issues arise, pin to preview model or research model-specific quirks.
+- **Model2vec inference latency on target hardware**: Benchmark claims 20,000+ sentences/sec on CPU, but this wasn't verified on the actual deployment hardware. **Handling:** Phase 2 includes a benchmark step before integration. If model2vec exceeds 20ms per classification, fall back to pattern matching only (still functional, just less accurate on paraphrased inputs).
 
-- **WebSocket reconnection timing:** Optimal reconnection strategy (backoff intervals, context injection timing) will require testing under real network conditions. Phase 4 may need experimentation to find the right balance between eager reconnection and avoiding thundering herd on the OpenAI API.
+- **Clip factory batch generation time**: Current `clip_factory.py` generates ~1 clip/sec via Piper. A full 7-category library with 7 clips each = 49 clips = ~50 seconds. **Handling:** Ship a seed library with 2-3 clips per category (pre-generated, committed to repo). Curator adds variety over time. System is functional from first launch.
 
-- **Task result summarization quality:** How much Claude CLI output can fit in Realtime API context before hitting token limits? How effective is AI summarization of technical output for voice delivery? Phase 4 should include testing with diverse task types (code edits, test runs, git operations).
-
-- **Janus thread-bridge performance:** The pynput keyboard thread to asyncio bridge via janus is untested in this specific use case. Monitor for latency in hotkey response during Phase 2 integration.
-
-- **Concurrent task limits:** Research suggests 5-10 concurrent tasks is reasonable, but actual limits depend on system resources and Claude CLI behavior. Phase 4 should validate and set appropriate defaults based on testing.
+- **Piper TTS emotional expressivity**: Research confirms Piper (en_US-lessac-medium) produces intelligible but not emotionally expressive speech. **Handling:** Avoid emotionally loaded categories (sympathy, excitement, humor) entirely. Stick to neutral/functional categories where flat prosody is acceptable.
 
 ## Sources
 
 ### Primary (HIGH confidence)
-- [Python 3.12 asyncio subprocess documentation](https://docs.python.org/3.12/library/asyncio-subprocess.html) — subprocess APIs, Process class
-- [Python 3.12 dataclasses documentation](https://docs.python.org/3/library/dataclasses.html) — field(default_factory), slots=True
-- [Python 3.12 enum documentation](https://docs.python.org/3/library/enum.html) — StrEnum availability (3.11+)
-- [janus 2.0.0 on PyPI](https://pypi.org/project/janus/) — thread-safe queue API
-- [janus GitHub repository](https://github.com/aio-libs/janus) — sync_q/async_q pattern, aclose() requirement
-- [Claude CLI reference](https://code.claude.com/docs/en/cli-reference) — all flags verified
-- [Claude Code Agent Teams documentation](https://code.claude.com/docs/en/agent-teams) — task coordination patterns
-- [websockets 16.0 on PyPI](https://pypi.org/project/websockets/) — latest version compatibility
-- [CPython asyncio task reference retention](https://docs.python.org/3/library/asyncio-task.html) — garbage collection behavior
-- Existing codebase: `/home/ethan/code/push-to-talk/openai_realtime.py`, `/home/ethan/code/push-to-talk/push-to-talk.py` — direct code inspection
+- **Codebase reading** (complete): `live_session.py` (pipeline architecture, filler system, STT gating, barge-in logic, tool-use flow), `clip_factory.py` (clip generation, quality evaluation, pool management), `learner.py` (daemon pattern), `pipeline_frames.py` (frame types), `ack_pool.json` (metadata schema)
+- **[model2vec GitHub](https://github.com/MinishLab/model2vec)** — Verified API, model sizes, dependencies, inference speed (20,000+ sent/sec on CPU)
+- **[model2vec PyPI](https://pypi.org/project/model2vec/)** — Latest version, release history
+- **[minishlab/potion-base-8M on HuggingFace](https://huggingface.co/minishlab/potion-base-8M)** — Model specs: 8MB, 256 dimensions
+- **[Python sqlite3 stdlib](https://docs.python.org/3.12/library/sqlite3.html)** — Verified FTS5 available on system
+- **[OpenAI Whisper GitHub](https://github.com/openai/whisper)** — `no_speech_prob`, `avg_logprob`, `compression_ratio` segment fields
+- **[Google Duplex Research Blog](https://research.google/blog/google-duplex-an-ai-system-for-accomplishing-real-world-tasks-over-the-phone/)** — Filler design, latency management, context-aware disfluencies
 
 ### Secondary (MEDIUM confidence)
-- [OpenAI Realtime API documentation](https://platform.openai.com/docs/guides/realtime) — WebSocket protocol (403 during research, relied on cached/community sources)
-- [OpenAI community: long function calls](https://community.openai.com/t/long-function-calls-and-realtime-api/1119021) — async patterns
-- [OpenAI community: async tool calling](https://community.openai.com/t/disabling-asynchronous-tool-calling-with-gpt-realtime/1360261) — GA model behavior
-- [OpenAI community: WebSocket keepalive timeout](https://community.openai.com/t/realtime-api-websocket-disconnects-randomly-in-nodejs/1044456) — 20s ping interval
-- [OpenAI community: function calling response bug](https://community.openai.com/t/realtime-api-no-response-after-function-calling-until-next-user-turn-gpt-4o-realtime-preview-2025-06-03/1297639) — model version differences
-- [SystemPrompt Code Orchestrator](https://github.com/systempromptio/systemprompt-code-orchestrator) — MCP-based agent patterns
-- [Pipecat voice agent framework](https://github.com/pipecat-ai/pipecat) — voice agent architecture patterns
-- [VUI Design Principles](https://www.parallelhq.com/blog/voice-user-interface-vui-design-principles) — voice UX best practices
-- [Google VUI Design](https://design.google/library/speaking-the-same-language-vui) — conversation flow patterns
-- [Gladia: concurrent pipelines for voice AI](https://www.gladia.io/blog/concurrent-pipelines-for-voice-ai) — async architecture patterns
-- [SignalWire: the Double Update problem](https://signalwire.com/blogs/developers/the-double-update) — state race conditions
-- [Armin Ronacher on asyncio.create_task footgun](https://x.com/mitsuhiko/status/1920384040005173320) — task GC issue awareness
+- **[AssemblyAI: The 300ms Rule](https://www.assemblyai.com/blog/low-latency-voice-ai)** — Latency perception thresholds (200-300ms human-perceivable window)
+- **[Sierra: Engineering Low-Latency Voice Agents](https://sierra.ai/blog/voice-latency)** — Filler audio as latency masking
+- **[Retell AI: Backchanneling](https://www.retellai.com/blog/how-backchanneling-improves-user-experience-in-ai-powered-voice-agents)** — Context-aware acknowledgment selection
+- **[NVIDIA PersonaPlex](https://research.nvidia.com/labs/adlr/personaplex/)** — Backchannel training on 7,303 real conversations
+- **[Wikipedia: Backchannel (linguistics)](https://en.wikipedia.org/wiki/Backchannel_(linguistics))** — Linguistic framework for generic vs. specific backchannels
+- **[FunAudioLLM/SenseVoice](https://github.com/FunAudioLLM/SenseVoice)** — Non-speech event detection (cough, laugh, sneeze)
+- **[arXiv 2501.11378: Whisper ASR Hallucinations](https://arxiv.org/abs/2501.11378)** — 40.3% hallucination rate on non-speech audio
+- **[Talkdesk: Voice Design Uncanny Valley](https://www.talkdesk.com/blog/voice-design/)** — Consistency between voice quality and intelligence
+- **[Nonspeech7k Dataset](https://ietresearch.onlinelibrary.wiley.com/doi/full/10.1049/sil2.12233)** — Non-speech sound classification research
 
-### Tertiary (LOW confidence, needs validation)
-- [Voice AI stack 2026](https://www.assemblyai.com/blog/the-voice-ai-stack-for-building-agents) — ecosystem overview, not product-specific
-- [Claude CLI session management flags](https://claudelog.com/faqs/what-is-resume-flag-in-claude-code/) — third-party documentation
+### Tertiary (LOW confidence)
+- **[Intent Classification in <1ms](https://medium.com/@durgeshrathod.777/intent-classification-in-1ms-how-we-built-a-lightning-fast-classifier-with-embeddings-db76bfb6d964)** — Embedding-based fast classification (not verified, but architecture pattern is sound)
+- **[Whisper-AT PyPI](https://pypi.org/project/whisper-at/)** — 152 weekly downloads (low adoption signal, not recommended but documented as alternative)
 
 ---
-*Research completed: 2026-02-13*
+*Research completed: 2026-02-18*
 *Ready for roadmap: yes*

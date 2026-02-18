@@ -1,560 +1,618 @@
-# Architecture Patterns
+# Architecture: Adaptive Quick Responses Integration
 
-**Domain:** Voice-controlled async task orchestrator (Live Mode)
-**Researched:** 2026-02-13
-**Overall Confidence:** HIGH (existing codebase well-understood, API capabilities verified)
+**Domain:** Adaptive quick response system for existing voice pipeline
+**Researched:** 2026-02-18
+**Overall Confidence:** HIGH (codebase fully read, integration points verified in source)
+
+## Executive Summary
+
+The adaptive quick response system replaces the current random filler selection in `live_session.py` with a context-aware response library. The architecture adds three new components (input classifier, response library, library curator) while modifying two existing ones (filler manager in `live_session.py`, clip factory). The key insight from reading the codebase: the integration point is narrow and well-defined. The `_filler_manager()` method and `_llm_stage()` are the only places that need modification in the hot path. Library growth/pruning runs entirely outside the pipeline as a post-session process.
+
+## Current Pipeline Architecture
+
+```
+                  +--------------+
+                  | Audio Capture |  Stage 1: pw-record -> AUDIO_RAW frames
+                  +------+-------+
+                         | _audio_in_q (Queue, maxsize=100)
+                         v
+                  +--------------+
+                  |   STT Stage  |  Stage 2: Whisper in executor -> TRANSCRIPT frames
+                  | (+ VAD for   |  Also: silence detection, hallucination filtering,
+                  |  barge-in)   |        STT gating during playback
+                  +------+-------+
+                         | _stt_out_q (Queue, maxsize=50)
+                         v
+                  +--------------+
+                  |  LLM Stage   |  Stage 3: Claude CLI subprocess -> TEXT_DELTA frames
+                  | (+ filler    |  Also: filler_manager starts here, barge-in annotation,
+                  |  manager)    |        tool intent display, post-tool buffering
+                  +------+-------+
+                         | _llm_out_q (Queue, maxsize=50)
+                         v
+                  +--------------+
+                  |  TTS Stage   |  Stage 4: Piper TTS -> TTS_AUDIO frames
+                  |              |  22050Hz -> 24000Hz resampling
+                  +------+-------+
+                         | _audio_out_q (Queue, maxsize=200)
+                         v
+                  +--------------+
+                  | Playback     |  Stage 5: PyAudio output
+                  | Stage        |  Also: STT gating, sentence counting, delayed unmute
+                  +--------------+
+```
+
+### Current Filler Flow (What Gets Replaced)
+
+Reading `_llm_stage()` lines 1528-1559, the flow is:
+
+1. TRANSCRIPT frame arrives from STT
+2. `_filler_cancel = asyncio.Event()` created
+3. `_filler_manager(transcript, cancel_event)` started as asyncio task
+4. User message sent to CLI with `_send_to_cli()`
+5. `_read_cli_response()` streams back text deltas, setting `_filler_cancel` on first text
+6. After CLI response complete, `_filler_cancel.set()` forces cancellation
+
+Inside `_filler_manager()` (lines 559-574):
+1. Wait 500ms gate -- if LLM responds within 500ms, skip filler entirely
+2. If gate expires, pick random acknowledgment clip via `_pick_filler("acknowledgment")`
+3. Play clip via `_play_filler_audio()` which sends FILLER frames to `_audio_out_q`
+
+The `_pick_filler()` method (lines 545-557) is purely random with a no-repeat guard. It has zero awareness of what the user said.
+
+### Key Timing Constraint
+
+The filler system has a 500ms gate. This means the input classifier must produce a result in well under 500ms. Whisper transcription already takes 200-600ms (it runs in a thread executor -- see line 1471). So by the time the TRANSCRIPT arrives at `_llm_stage`, the user has already been waiting 200-600ms. The filler gate adds another 500ms. Total silence before filler: 700-1100ms.
+
+The classifier must run within that 500ms gate window, ideally in under 100ms to leave room for clip lookup and any pre-play processing. This rules out any LLM-based classification in the hot path.
 
 ## Recommended Architecture
 
-The core challenge: a persistent OpenAI Realtime WebSocket session needs to spawn, monitor, and collect results from multiple long-running Claude CLI subprocesses -- all without blocking voice conversation. The user keeps talking; tasks keep running; results flow back when ready.
-
-### Architecture Overview
+### Component Diagram
 
 ```
-                       +--------------------+
-                       |   PushToTalk       |
-                       | (hotkey routing)   |
-                       +--------+-----------+
-                                |
-                   hotkey combo triggers live mode
-                                |
-                       +--------v-----------+
-                       |   LiveSession      |
-                       | (session lifecycle)|
-                       +--------+-----------+
-                                |
-              +-----------------+------------------+
-              |                                    |
-    +---------v----------+              +----------v---------+
-    | RealtimeSession    |              |   TaskManager      |
-    | (voice layer)      |<------------>| (orchestration)    |
-    | - WebSocket I/O    | tool calls   | - spawn tasks      |
-    | - audio streaming  | & results    | - track state      |
-    | - function calling |              | - collect output   |
-    +--------------------+              +----+----------+----+
-                                             |          |
-                                    +--------v--+ +----v--------+
-                                    | ClaudeTask | | ClaudeTask  |
-                                    | (isolated) | | (isolated)  |
-                                    | - subprocess| - subprocess |
-                                    | - own cwd  | | - own cwd   |
-                                    | - output   | | - output    |
-                                    +------------+ +-------------+
+  EXISTING                          NEW
+  --------                          ---
+
+  +---------------+
+  | STT Stage     |
+  | (Whisper)     |------TRANSCRIPT frame----+
+  +---------------+                          |
+                                             v
+                              +-----------------------------+
+                              | InputClassifier             |  NEW
+                              | - keyword/pattern matching  |
+                              | - non-speech event flags    |
+                              | - situation categorization  |
+                              +-------------+---------------+
+                                            |
+                                   ClassifiedInput
+                                   {category, confidence,
+                                    original_text, tags}
+                                            |
+  +---------------+                         v
+  | LLM Stage     |          +-----------------------------+
+  | (Claude CLI)  |          | ResponseLibrary             |  NEW
+  | _filler_mgr   |<------  | - lookup(classification)    |
+  | (MODIFIED)    |          | - returns best clip or None |
+  +---------------+          | - in-memory index + disk    |
+                              +-----------------------------+
+                                            ^
+                                            | loads/saves
+                                            v
+                              +-----------------------------+
+                              | LibraryCurator              |  NEW
+                              | - post-session analysis     |  (daemon, like learner.py)
+                              | - gap identification        |
+                              | - clip generation           |
+                              | - quality pruning           |
+                              +-----------------------------+
 ```
 
-### Component Boundaries
+### New Components
 
-| Component | Responsibility | Communicates With | Thread Model |
-|-----------|---------------|-------------------|--------------|
-| **PushToTalk** | Hotkey detection, mode routing, session lifecycle | LiveSession (start/stop) | Main thread (pynput listener) |
-| **LiveSession** | Owns a Realtime session + TaskManager pair, manages session lifecycle | PushToTalk (lifecycle), RealtimeSession (voice), TaskManager (tasks) | Spawns asyncio event loop in background thread |
-| **RealtimeSession** | WebSocket connection, audio I/O, function call dispatch | LiveSession (events), TaskManager (via tool handlers) | asyncio tasks within event loop |
-| **TaskManager** | Spawn/track/collect Claude CLI processes, maintain task registry | RealtimeSession (tool call interface), ClaudeTask instances (subprocess management) | asyncio-compatible, runs tasks as asyncio subprocesses |
-| **ClaudeTask** | Single Claude CLI subprocess with isolated context | TaskManager (lifecycle), filesystem (working dir, output) | asyncio subprocess (non-blocking) |
-| **Indicator** | Status display, settings UI | PushToTalk (via status file) | Separate process (GTK main loop) |
+#### 1. InputClassifier (in-process, synchronous)
 
-## Component Design Details
+**Location:** New file `input_classifier.py`, instantiated in `LiveSession.__init__()`
 
-### LiveSession -- The Glue Layer
-
-LiveSession is the new component that ties the voice layer to the task layer. It replaces the current pattern where `start_realtime_session()` creates a bare RealtimeSession. Instead, LiveSession owns both the RealtimeSession and a TaskManager, and configures the RealtimeSession's tools to route through the TaskManager.
+**Why synchronous:** Must complete in <100ms. This is a pure-Python pattern matcher, not an LLM call. The current STT already provides the text; classification is string analysis.
 
 ```python
-class LiveSession:
-    """Manages a live voice session with async task orchestration."""
+@dataclass
+class ClassifiedInput:
+    """Result of classifying user input for quick response selection."""
+    category: str          # "question", "command", "emotional", "social",
+                           # "acknowledgment", "non_speech", "unknown"
+    subcategory: str       # "greeting", "farewell", "thanks", "cough",
+                           # "sigh", "laugh", "task_request", "info_query", etc.
+    confidence: float      # 0.0 - 1.0
+    original_text: str     # The raw transcript
+    tags: list[str]        # Additional context tags: ["short", "urgent", etc.]
 
-    def __init__(self, api_key, on_status=None):
-        self.session_id = str(uuid.uuid4())
-        self.task_manager = TaskManager()
-        self.realtime = RealtimeSession(
-            api_key=api_key,
-            on_status=on_status,
-            tools=self._build_tools(),
-            tool_handler=self._handle_tool_call,
-        )
-        self.active = False
+class InputClassifier:
+    """Fast, rule-based input classification for quick response selection.
 
-    def _build_tools(self):
-        """Define tools available to the Realtime AI."""
-        return [
-            # Task spawning
-            {"name": "start_task", "description": "Spawn a Claude CLI task...", ...},
-            # Task monitoring
-            {"name": "check_tasks", "description": "Get status of all tasks...", ...},
-            {"name": "get_task_result", "description": "Get the output of a completed task...", ...},
-            # Task cancellation
-            {"name": "cancel_task", "description": "Cancel a running task...", ...},
-            # Lightweight tools (run inline, not as tasks)
-            {"name": "run_command", ...},
-            {"name": "read_file", ...},
-            {"name": "remember", ...},
-            {"name": "recall", ...},
-        ]
+    NOT an LLM call. Uses keyword patterns, regex, and heuristics.
+    Designed to complete in <10ms for typical inputs.
+    """
 
-    async def _handle_tool_call(self, name, arguments, call_id):
-        """Route tool calls to appropriate handler."""
-        if name == "start_task":
-            # Spawn async -- return immediately with task_id
-            task_id = await self.task_manager.spawn(arguments)
-            return {"task_id": task_id, "status": "started"}
-        elif name == "check_tasks":
-            return self.task_manager.get_all_status()
-        elif name == "get_task_result":
-            return self.task_manager.get_result(arguments["task_id"])
-        elif name == "cancel_task":
-            return await self.task_manager.cancel(arguments["task_id"])
-        else:
-            # Inline tools (run_command, read_file, etc.)
-            return execute_tool(name, arguments)
+    def classify(self, transcript: str, stt_metadata: dict | None = None) -> ClassifiedInput:
+        """Classify user input into a situation category.
+
+        Args:
+            transcript: The STT-produced text
+            stt_metadata: Optional metadata from STT (no_speech_prob, etc.)
+
+        Returns:
+            ClassifiedInput with category and confidence
+        """
+        ...
 ```
 
-**Why this boundary:** LiveSession isolates the "what tools exist" question from both the voice layer (RealtimeSession doesn't need to know about tasks) and the task layer (TaskManager doesn't need to know about WebSockets). This makes each component testable and replaceable independently.
+**Classification categories (initial set):**
 
-### TaskManager -- The Registry
+| Category | Subcategory | Pattern | Example Input |
+|----------|-------------|---------|---------------|
+| social | greeting | starts with "hey", "hi", "hello", "what's up" | "Hey, how's it going?" |
+| social | farewell | "bye", "see you", "later", "goodnight" | "Alright, talk to you later" |
+| social | thanks | "thanks", "thank you", "appreciate it" | "Thanks for that" |
+| question | info_query | ends with "?", starts with wh-word | "What time is it?" |
+| question | opinion | "what do you think", "should I" | "Should I use SQLite or JSON?" |
+| command | task_request | "can you", "please", "do X", imperative | "Run the tests" |
+| command | tool_use | references files, code, projects | "Check the logs in /var/log" |
+| emotional | frustration | "ugh", "damn", "this sucks" | "Ugh, it broke again" |
+| emotional | excitement | "awesome", "yes!", "nice" | "That's awesome!" |
+| acknowledgment | affirmative | "yeah", "okay", "sure", "got it" | "Yeah, makes sense" |
+| acknowledgment | negative | "no", "nah", "not really" | "Nah, that's not right" |
+| non_speech | cough | STT rejected + audio characteristics | (cough detected by STT filter) |
+| non_speech | sigh | STT low confidence + duration | (sigh) |
+| non_speech | laugh | STT low confidence + pattern | (laugh) |
+| unknown | unknown | low confidence on all patterns | (ambiguous input) |
 
-TaskManager tracks all spawned ClaudeTask instances. It assigns IDs, monitors completion, and provides query interfaces. It does NOT own the asyncio event loop -- it participates in whatever loop LiveSession provides.
+**Non-speech detection integration:** The existing STT stage already filters non-speech via `_whisper_transcribe()` (lines 784-817). When all segments are rejected, it calls `self._set_status("stt_rejected")`. Currently this data is discarded. The new architecture captures these rejections:
+
+- When Whisper rejects all segments with high `no_speech_prob`, the STT stage can emit a new frame type (see pipeline frame changes below) carrying the rejection metadata
+- The classifier uses `no_speech_prob`, `avg_logprob`, and the raw text (even rejected text like "hmm" or "uh") to categorize the non-speech event
+- This allows "excuse you" for a cough, empathetic acknowledgment for a sigh, etc.
+
+#### 2. ResponseLibrary (in-process, lookup)
+
+**Location:** New file `response_library.py`, instantiated in `LiveSession.__init__()`
+
+**Storage format: JSON** (not SQLite). Rationale:
+- The library will have 50-200 entries at most (each is a situation + clip reference)
+- Entire library loads into memory at startup (same pattern as `_load_filler_clips()`)
+- No concurrent write access needed during a session (writes happen post-session)
+- JSON is human-readable and consistent with `ack_pool.json` pattern
+- SQLite adds a dependency for no benefit at this scale
+
+**Storage location:** `audio/responses/` (parallel to `audio/fillers/`)
+
+```
+audio/
+  fillers/
+    acknowledgment/          # existing ack clips (to be migrated)
+    ack_pool.json            # existing metadata
+  responses/
+    library.json             # response library index
+    clips/                   # pre-generated response audio clips
+      greeting_hey_001.wav
+      greeting_hey_002.wav
+      thanks_welcome_001.wav
+      cough_excuse_001.wav
+      ...
+```
+
+**library.json schema:**
+
+```json
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "greeting_hey_001",
+      "situation": {
+        "category": "social",
+        "subcategory": "greeting"
+      },
+      "response_text": "Hey! What's up?",
+      "clip_filename": "greeting_hey_001.wav",
+      "created_at": 1771418989.27,
+      "use_count": 14,
+      "last_used": 1771500000.0,
+      "effectiveness": 0.85,
+      "tags": ["casual", "short"]
+    }
+  ]
+}
+```
+
+**Lookup algorithm:**
 
 ```python
-class TaskManager:
-    """Registry and orchestrator for async Claude CLI tasks."""
-
+class ResponseLibrary:
     def __init__(self):
-        self.tasks: dict[str, ClaudeTask] = {}
-        self._task_counter = 0
+        self._entries: list[ResponseEntry] = []
+        self._index: dict[str, list[ResponseEntry]] = {}  # category -> entries
+        self._clips: dict[str, bytes] = {}  # id -> pcm_data
+        self._usage_log: list[dict] = []    # tracks what was played
 
-    async def spawn(self, args) -> str:
-        """Spawn a new Claude CLI task. Returns task_id immediately."""
-        self._task_counter += 1
-        task_id = f"task-{self._task_counter}"
-        task = ClaudeTask(
-            task_id=task_id,
-            prompt=args["prompt"],
-            working_dir=args.get("working_dir"),
-            description=args.get("description", f"Task {self._task_counter}"),
-        )
-        self.tasks[task_id] = task
-        await task.start()  # Launches subprocess, returns immediately
-        return task_id
+    def lookup(self, classification: ClassifiedInput) -> ResponseEntry | None:
+        """Find the best matching response for a classified input.
 
-    def get_all_status(self) -> dict:
-        """Snapshot of all task states."""
-        return {
-            "tasks": [
-                {
-                    "task_id": t.task_id,
-                    "description": t.description,
-                    "status": t.status,  # "running", "completed", "failed", "cancelled"
-                    "elapsed": t.elapsed_seconds(),
-                    "summary": t.summary if t.status == "completed" else None,
-                }
-                for t in self.tasks.values()
-            ]
+        Returns None if no good match exists (falls back to generic ack).
+        """
+        key = f"{classification.category}:{classification.subcategory}"
+        candidates = self._index.get(key, [])
+
+        if not candidates:
+            # Fall back to category-level match
+            candidates = self._index.get(classification.category, [])
+
+        if not candidates:
+            return None  # No match -- _filler_manager falls back to random ack
+
+        # Score candidates: prefer variety (avoid recently used), high effectiveness
+        return self._score_and_pick(candidates)
+
+    def get_clip(self, entry_id: str) -> bytes | None:
+        """Get pre-loaded PCM audio for a response entry."""
+        return self._clips.get(entry_id)
+```
+
+**Lookup must be fast:** The `_index` is a dict keyed by `"category:subcategory"`. Lookup is O(1) to find candidates, then O(n) to score a small list (typically 2-5 candidates per subcategory). Total: <1ms.
+
+#### 3. LibraryCurator (post-session daemon)
+
+**Location:** New file `library_curator.py`, spawned like `learner.py`
+
+**Pattern:** Follows the exact same pattern as `learner.py`:
+- Spawned as subprocess at session start via `_spawn_curator()`
+- Reads conversation JSONL log
+- Runs post-session analysis via `claude -p`
+- Writes new entries to `library.json` and generates clips via Piper
+- Communicates back via signal file (like `learner_notify`)
+
+**Why a separate daemon (not inline):**
+- Library growth involves LLM calls (deciding what phrases to generate) -- too slow for real-time
+- Clip generation via Piper takes 1-3s per clip -- would block the pipeline
+- Same architectural pattern as learner: watch log, extract insights, write to disk
+- Next session picks up new clips automatically via `_load_library()` at startup
+
+**Curator responsibilities:**
+
+1. **Gap identification:** After session ends, analyze conversation log for situations where:
+   - No response was found (logged as `response_miss` events)
+   - A generic acknowledgment was used where a specific response would be better
+   - New interaction patterns appeared (user greeting style, frequent question types)
+
+2. **Clip generation:** For each identified gap:
+   - Use Claude to generate 2-3 natural response phrases for the situation
+   - Generate audio clips via Piper with varied TTS parameters (same as clip_factory.py)
+   - Evaluate clip quality (same scoring as existing `evaluate_clip()`)
+   - Add passing clips to `library.json`
+
+3. **Quality pruning:** Remove entries that:
+   - Were used but followed by the user interrupting (barge-in after quick response = bad match)
+   - Have very low `effectiveness` scores
+   - Are duplicative (multiple entries for same situation with similar text)
+   - Exceed per-category caps (keep top N per subcategory)
+
+### Modified Components
+
+#### 4. Modified: `_filler_manager()` in live_session.py
+
+The current `_filler_manager()` is the surgical modification point. It currently:
+1. Waits 500ms gate
+2. Picks random clip
+3. Plays it
+
+The new version:
+1. Classifies input via `InputClassifier.classify(transcript)`
+2. Looks up response via `ResponseLibrary.lookup(classification)`
+3. Waits gate (keep the gate but may reduce to 300ms for known-good matches)
+4. If response found: play it
+5. If no response: fall back to random acknowledgment clip (existing behavior)
+
+```python
+async def _filler_manager(self, user_text: str, cancel_event: asyncio.Event):
+    """Play a context-appropriate quick response while waiting for LLM."""
+    # Step 1: Classify input (sync, <10ms)
+    classification = self._classifier.classify(user_text)
+
+    # Step 2: Lookup response (sync, <1ms)
+    response = self._response_library.lookup(classification)
+
+    # Step 3: Gate -- skip if LLM responds fast
+    gate_ms = 0.3 if response and response.confidence > 0.8 else 0.5
+    try:
+        await asyncio.wait_for(cancel_event.wait(), timeout=gate_ms)
+        return  # LLM responded fast, skip
+    except asyncio.TimeoutError:
+        pass
+
+    if cancel_event.is_set():
+        return
+
+    # Step 4: Play response or fall back
+    if response:
+        clip = self._response_library.get_clip(response.id)
+        if clip:
+            self._response_library.log_usage(response.id, classification)
+            await self._play_filler_audio(clip, cancel_event)
+            return
+
+    # Fallback: existing random acknowledgment
+    clip = self._pick_filler("acknowledgment")
+    if clip:
+        await self._play_filler_audio(clip, cancel_event)
+```
+
+**What does NOT change:**
+- `_play_filler_audio()` -- unchanged, sends FILLER frames to `_audio_out_q`
+- `_play_gated_ack()` -- unchanged, used for tool-use acknowledgments
+- `_pick_filler()` -- kept as fallback
+- All playback stage logic -- unchanged
+- Barge-in logic -- unchanged
+- STT gating -- unchanged
+
+#### 5. Modified: STT stage (non-speech event forwarding)
+
+Currently when Whisper rejects all segments (lines 813-817), it calls `self._set_status("stt_rejected")` and discards the data. The modification:
+
+```python
+# In _stt_stage, after all segments rejected:
+if not kept and segments:
+    self._set_status("stt_rejected")
+    rejected_text = "".join(s.get("text", "") for s in segments).strip()
+
+    # NEW: Forward non-speech event for quick response handling
+    await self._stt_out_q.put(PipelineFrame(
+        type=FrameType.NON_SPEECH,
+        generation_id=self.generation_id,
+        data=rejected_text,
+        metadata={
+            "no_speech_prob": max(s.get("no_speech_prob", 0) for s in segments),
+            "avg_logprob": min(s.get("avg_logprob", 0) for s in segments),
         }
-
-    def get_result(self, task_id) -> dict:
-        """Get full output of a completed task."""
-        task = self.tasks.get(task_id)
-        if not task:
-            return {"error": f"Unknown task: {task_id}"}
-        if task.status == "running":
-            return {"status": "running", "elapsed": task.elapsed_seconds()}
-        return {
-            "status": task.status,
-            "output": task.output[:3000],  # Truncate for Realtime API context
-            "elapsed": task.elapsed_seconds(),
-        }
-
-    async def cancel(self, task_id) -> dict:
-        """Cancel a running task."""
-        task = self.tasks.get(task_id)
-        if task and task.status == "running":
-            await task.cancel()
-            return {"status": "cancelled"}
-        return {"error": "Task not running"}
+    ))
 ```
 
-**Why a registry, not a queue:** Tasks are independent -- there's no ordering dependency between them. The user might say "start a task to fix the login bug" then "start another task to add tests for auth" and these run concurrently. A queue implies serial execution; a registry allows parallel execution with individual status tracking.
-
-### ClaudeTask -- The Isolated Worker
-
-Each ClaudeTask is a single Claude CLI subprocess with its own working directory and output buffer. Context isolation is achieved through filesystem separation: each task gets a unique temporary directory (or a user-specified project directory) and its own Claude session.
+Then in `_llm_stage`, handle NON_SPEECH frames by running classification and playing a quick response WITHOUT sending to the LLM:
 
 ```python
-class ClaudeTask:
-    """A single Claude CLI subprocess with isolated context."""
-
-    CLAUDE_CLI = Path.home() / ".local" / "bin" / "claude"
-
-    def __init__(self, task_id, prompt, working_dir=None, description=""):
-        self.task_id = task_id
-        self.prompt = prompt
-        self.description = description
-        self.status = "pending"  # pending -> running -> completed/failed/cancelled
-        self.output = ""
-        self.start_time = None
-        self.end_time = None
-        self.process = None
-
-        # Context isolation: each task gets its own working directory
-        if working_dir:
-            self.working_dir = Path(working_dir).expanduser().resolve()
-        else:
-            self.working_dir = Path.home()
-
-    async def start(self):
-        """Launch Claude CLI as async subprocess."""
-        self.status = "running"
-        self.start_time = time.time()
-
-        self.process = await asyncio.create_subprocess_exec(
-            str(self.CLAUDE_CLI),
-            '-p', self.prompt,
-            '--permission-mode', 'bypassPermissions',
-            '--output-format', 'text',
-            '--max-turns', '25',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(self.working_dir),
-        )
-
-        # Monitor completion in background (non-blocking)
-        asyncio.create_task(self._monitor())
-
-    async def _monitor(self):
-        """Wait for process completion and capture output."""
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                self.process.communicate(),
-                timeout=300,  # 5 minute max per task
-            )
-            self.output = stdout.decode('utf-8', errors='replace')
-            self.status = "completed" if self.process.returncode == 0 else "failed"
-            if self.process.returncode != 0:
-                self.output += f"\n[stderr]: {stderr.decode('utf-8', errors='replace')}"
-        except asyncio.TimeoutError:
-            self.process.kill()
-            self.output = "[Task timed out after 300 seconds]"
-            self.status = "failed"
-        except Exception as e:
-            self.output = f"[Error: {e}]"
-            self.status = "failed"
-        finally:
-            self.end_time = time.time()
-
-    async def cancel(self):
-        """Kill the subprocess."""
-        if self.process and self.process.returncode is None:
-            self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                self.process.kill()
-        self.status = "cancelled"
-        self.end_time = time.time()
-
-    def elapsed_seconds(self):
-        end = self.end_time or time.time()
-        return round(end - (self.start_time or end), 1)
-
-    @property
-    def summary(self):
-        """First 200 chars of output as quick summary."""
-        if self.output:
-            return self.output[:200].strip()
-        return None
+if frame.type == FrameType.NON_SPEECH:
+    # Classify non-speech event
+    classification = self._classifier.classify(
+        frame.data,
+        stt_metadata=frame.metadata
+    )
+    response = self._response_library.lookup(classification)
+    if response:
+        clip = self._response_library.get_clip(response.id)
+        if clip:
+            await self._play_filler_audio(clip, asyncio.Event())  # no cancel
+    continue  # Do NOT send to LLM
 ```
 
-**Context isolation approach:** Each ClaudeTask runs `claude -p` (non-interactive print mode) with its own `cwd`. This means:
-- Each task has its own implicit Claude session (no `--continue` flag)
-- File operations are scoped to that task's working directory
-- No conversation history bleeds between tasks
-- The `--permission-mode bypassPermissions` flag allows autonomous operation
+### Pipeline Frame Changes
 
-**Why `-p` (print mode) and not `-c` (continue):** Tasks are independent work units, not conversational turns. Print mode runs a single prompt to completion and exits. This maps perfectly to "go do X and come back with the result." Using `-c` would create session entanglement between tasks, which is the opposite of context isolation.
-
-### RealtimeSession Modifications
-
-The existing RealtimeSession needs minimal changes. The key modification: extract the tool execution loop out of the event handler and make it pluggable, so LiveSession can inject its own tool_handler.
-
-Current pattern (hardcoded tool execution):
-```python
-# In handle_events():
-if item_type == "function_call":
-    result = execute_tool(name, arguments)  # Synchronous, blocking
-    await self.ws.send(...)  # Send result immediately
-```
-
-New pattern (pluggable, async-aware):
-```python
-# In handle_events():
-if item_type == "function_call":
-    # Delegate to handler (which may be async for task spawning)
-    result = await self.tool_handler(name, arguments, call_id)
-    if result is not None:
-        # Immediate result -- send back now
-        await self.ws.send(...)
-    # If result is None, handler will send result later (async task)
-```
-
-**Critical insight from OpenAI Realtime API GA:** The GA model (`gpt-realtime`) supports async function calling natively. This means we can return a "task started" result immediately for `start_task` calls, and the model will gracefully handle the user asking about task status later -- it won't hallucinate results. The existing code uses the preview model (`gpt-4o-realtime-preview-2024-12-17`); upgrading to `gpt-realtime` is recommended for this feature.
-
-### Async Task Completion Notification
-
-When a task completes, the TaskManager can optionally inject a notification into the Realtime conversation:
+Add one new frame type to `pipeline_frames.py`:
 
 ```python
-# In TaskManager, called from ClaudeTask._monitor() on completion:
-async def _on_task_complete(self, task):
-    """Notify the Realtime session that a task finished."""
-    if self.on_task_complete:
-        await self.on_task_complete(task)
-
-# In LiveSession:
-async def _notify_task_complete(self, task):
-    """Inject task completion into Realtime conversation."""
-    await self.realtime.ws.send(json.dumps({
-        "type": "conversation.item.create",
-        "item": {
-            "type": "message",
-            "role": "system",
-            "content": [{
-                "type": "input_text",
-                "text": f"[Task '{task.description}' completed: {task.summary}]"
-            }]
-        }
-    }))
-    # Optionally trigger a response so the AI acknowledges
-    await self.realtime.ws.send(json.dumps({
-        "type": "response.create"
-    }))
+class FrameType(Enum):
+    AUDIO_RAW = auto()
+    TRANSCRIPT = auto()
+    TEXT_DELTA = auto()
+    TOOL_CALL = auto()
+    TOOL_RESULT = auto()
+    TTS_AUDIO = auto()
+    END_OF_TURN = auto()
+    END_OF_UTTERANCE = auto()
+    FILLER = auto()
+    BARGE_IN = auto()
+    CONTROL = auto()
+    NON_SPEECH = auto()       # NEW: STT-rejected audio event (cough, sigh, etc.)
 ```
 
-**Design choice:** Proactive notification vs. poll-only. Recommending proactive notification because the whole point of voice UX is hands-free -- the user shouldn't have to keep asking "is it done yet." The AI can naturally say "Hey, that login bug fix just finished -- want me to read you the summary?"
+The `metadata` field on `PipelineFrame` already exists and supports arbitrary dicts, so no structural change to the dataclass is needed. The NON_SPEECH frame carries:
+- `data`: the rejected transcript text (may be useful for classification: "hmm", "uh")
+- `metadata`: `{"no_speech_prob": float, "avg_logprob": float}` from Whisper segments
 
-## Data Flow
+### Data Flow: Complete Turn Lifecycle
 
-### Happy Path: User Requests a Task
-
-```
-1. User speaks: "Hey, fix the login validation bug in the auth module"
-2. Realtime API detects speech, transcribes, generates function_call for start_task
-3. LiveSession._handle_tool_call() receives start_task with prompt + working_dir
-4. TaskManager.spawn() creates ClaudeTask with isolated cwd, launches subprocess
-5. Returns immediately: {"task_id": "task-1", "status": "started"}
-6. Realtime AI speaks: "On it -- I've started task 1 to fix the login validation"
-7. User can keep talking, ask questions, start more tasks
-8. [30 seconds later] ClaudeTask._monitor() detects process completion
-9. TaskManager._on_task_complete() fires notification callback
-10. LiveSession injects system message into conversation
-11. Realtime AI speaks: "Task 1 just finished -- the login validation is fixed"
-12. User: "What did it change?" -> AI calls get_task_result -> reads output
-```
-
-### Concurrent Tasks
+**Normal speech turn (with quick response):**
 
 ```
-User: "Fix the login bug"          -> task-1 starts (cwd: ~/code/myapp)
-User: "Also add tests for auth"    -> task-2 starts (cwd: ~/code/myapp)
-User: "What's the status?"         -> AI calls check_tasks
-                                    -> Returns both tasks' status
-task-2 completes                   -> AI: "Tests are done, login fix still running"
-task-1 completes                   -> AI: "Login fix is done too, both tasks complete"
+1. User speaks into mic
+2. Audio Capture -> AUDIO_RAW frames -> audio_in_q
+3. STT Stage: Whisper transcribes -> "What's the weather?"
+4. STT Stage -> END_OF_UTTERANCE + TRANSCRIPT frames -> stt_out_q
+5. LLM Stage receives TRANSCRIPT:
+   a. InputClassifier.classify("What's the weather?")
+      -> ClassifiedInput(category="question", subcategory="info_query")
+   b. ResponseLibrary.lookup(classification)
+      -> ResponseEntry(text="Let me check on that.", clip="info_query_check_001.wav")
+   c. Start _filler_manager with classification + response pre-loaded
+   d. Send to Claude CLI
+   e. _filler_manager waits 300ms gate
+   f. Gate expires -> play "Let me check on that." clip as FILLER frames
+   g. Claude CLI responds -> cancel_event.set() -> filler stops
+   h. TEXT_DELTA frames flow to TTS
+6. TTS Stage: Piper synthesizes -> TTS_AUDIO frames -> audio_out_q
+7. Playback Stage: plays audio
 ```
 
-### Error Handling Flow
+**Non-speech event turn:**
 
 ```
-Task fails (Claude CLI exits non-zero or times out):
-1. ClaudeTask._monitor() captures stderr, sets status="failed"
-2. Notification injected: "[Task 'fix login' failed: ...]"
-3. AI speaks: "That task ran into an issue -- here's what happened..."
-4. User can ask for details or retry
+1. User coughs into mic
+2. Audio Capture -> AUDIO_RAW frames -> audio_in_q
+3. STT Stage: Whisper transcribes -> rejects all segments (no_speech_prob=0.85)
+4. STT Stage -> NON_SPEECH frame -> stt_out_q
+   (data="", metadata={"no_speech_prob": 0.85, "avg_logprob": -1.5})
+5. LLM Stage receives NON_SPEECH:
+   a. InputClassifier.classify("", stt_metadata={...})
+      -> ClassifiedInput(category="non_speech", subcategory="cough")
+   b. ResponseLibrary.lookup(classification)
+      -> ResponseEntry(text="Excuse you!", clip="cough_excuse_001.wav")
+   c. Play clip directly (no LLM call, no gate delay)
+6. Playback Stage: plays "Excuse you!" clip
+7. Return to listening (no LLM processing needed)
 ```
 
-## Integration with Existing Architecture
+**Session end (library growth):**
 
-### How Live Mode Fits Into the Mode System
-
-The existing codebase has four AI modes: `claude`, `realtime`, `interview`, `conversation`. Live mode replaces the current `realtime` mode and adds task orchestration. The current "dictation live" mode gets renamed to "dictate."
-
-Config changes:
-```python
-# dictation_mode options: "dictate" (was "live"), "prompt", "stream"
-# ai_mode options: "claude", "live" (was "realtime"), "interview", "conversation"
+```
+1. Session ends -> session_end event logged to JSONL
+2. LibraryCurator (daemon) detects session_end
+3. Curator reads conversation log + response_miss events
+4. Curator calls claude -p to analyze gaps:
+   "User said 'morning!' 3 times but got generic 'let me check' -- need morning greeting"
+5. Curator generates clips via Piper: "Good morning!", "Morning!", "Hey, good morning!"
+6. Curator writes new entries to library.json
+7. Next session: LiveSession.__init__() loads updated library
 ```
 
-### Hotkey Integration
+### Integration with Existing Systems
 
-Live mode uses the same PTT + AI key combo as the current realtime mode. The toggle behavior (press to start, press again to stop) carries over. The only difference: instead of creating a bare RealtimeSession, `PushToTalk.start_realtime_session()` creates a LiveSession which internally creates both.
+#### Integration with Learner Daemon
 
-```python
-# In PushToTalk.on_press(), the ai_mode == 'live' branch:
-if ai_mode == 'live':
-    if self.live_session:
-        self.stop_live_session()  # Toggle off
-    else:
-        self.start_live_session()  # Toggle on
-```
+The learner and curator are complementary but independent:
+- **Learner:** Watches conversation, writes to `personality/memories/` (who the user is)
+- **Curator:** Watches conversation, writes to `audio/responses/library.json` (how to respond quickly)
+- Both follow the same pattern: subprocess, JSONL tailing, claude -p evaluation
+- They run concurrently, no conflicts (different output files)
 
-### Status Indicator Updates
+The learner does NOT help grow the library directly. They have different concerns:
+- Learner extracts durable facts ("user likes Python, has a cat named Luna")
+- Curator identifies response patterns ("user says 'morning' at session start -> need greeting clip")
 
-Live mode adds task-aware status to the indicator. The status file protocol stays the same (single string written to `status` file), but we add new states:
+#### Integration with Clip Factory
 
-```python
-# Existing: idle, recording, processing, success, error, listening, speaking
-# New: task_running (indicates background tasks active while in live mode)
-```
+The existing `clip_factory.py` manages the acknowledgment clip pool. With adaptive responses:
+- The clip factory continues to maintain the acknowledgment fallback pool
+- The curator generates situation-specific clips using the same Piper TTS and `evaluate_clip()` function
+- The curator can import `generate_clip` and `evaluate_clip` from `clip_factory.py` directly
+- Over time, as the response library grows, the acknowledgment pool becomes less used (but never removed -- it is the safety net)
 
-The indicator can show a compound state: "listening" (main dot color) + "task_running" (small secondary indicator). Implementation detail deferred to UI phase.
+#### Integration with Barge-in
 
-## Patterns to Follow
+No changes to barge-in logic. The playback stage already handles FILLER frames identically to TTS_AUDIO for barge-in purposes. When the user interrupts a quick response:
+1. Barge-in triggers as normal (VAD detection, generation_id increment)
+2. Quick response audio stops (filler frame generation checks `cancel_event` and `generation_id`)
+3. Annotation is built with whatever was spoken
+4. The curator logs this as a negative signal for that response entry (barge-in after quick response = bad match)
 
-### Pattern 1: Async Subprocess via asyncio.create_subprocess_exec
+#### Integration with Tool-Use Flow
 
-**What:** Use asyncio's native subprocess support instead of threading + subprocess.run.
-**When:** Always, for ClaudeTask execution.
-**Why:** The Realtime session already runs in an asyncio event loop. Using asyncio subprocesses means tasks can be monitored without extra threads, and cancellation is clean (asyncio.Task cancellation propagates).
+The existing tool-use flow in `_read_cli_response()` has its own acknowledgment path (`_play_gated_ack`). This remains unchanged. The adaptive response system only affects the initial filler played before the LLM starts responding. Tool-use acknowledgments ("checking now", "one moment") are already contextually appropriate since they play after a tool_use content_block_start event.
 
-```python
-process = await asyncio.create_subprocess_exec(
-    str(CLAUDE_CLI), '-p', prompt,
-    '--permission-mode', 'bypassPermissions',
-    stdout=asyncio.subprocess.PIPE,
-    stderr=asyncio.subprocess.PIPE,
-    cwd=str(working_dir),
-)
-stdout, stderr = await process.communicate()
-```
+### Storage and Persistence
 
-### Pattern 2: Pluggable Tool Handler
+| Data | Location | Format | Lifecycle |
+|------|----------|--------|-----------|
+| Response library index | `audio/responses/library.json` | JSON | Grows across sessions, loaded at startup |
+| Response audio clips | `audio/responses/clips/*.wav` | WAV (22050Hz) | Generated by curator, loaded at startup |
+| Usage log (per session) | Session dir `response_usage.jsonl` | JSONL | Written during session, read by curator |
+| Response miss log | Session dir `response_misses.jsonl` | JSONL | Written during session, read by curator |
+| Acknowledgment fallback | `audio/fillers/acknowledgment/*.wav` | WAV (22050Hz) | Existing, maintained by clip_factory |
 
-**What:** Decouple tool execution from event handling in RealtimeSession.
-**When:** Any time tools need to be configurable per-session.
-**Why:** LiveSession needs different tool behavior than the current bare realtime mode. Making the tool handler a callback means RealtimeSession stays generic.
+### Concurrency and Thread Safety
 
-```python
-class RealtimeSession:
-    def __init__(self, api_key, on_status=None, tools=None, tool_handler=None):
-        self.tools = tools or TOOLS
-        self.tool_handler = tool_handler or execute_tool
-```
+- `InputClassifier.classify()`: Pure function, no state mutation, safe to call from asyncio
+- `ResponseLibrary.lookup()`: Read-only during session, safe from asyncio event loop
+- `ResponseLibrary.log_usage()`: Appends to in-memory list, flushed to JSONL at session end
+- `LibraryCurator`: Separate subprocess, writes to `library.json` only after session ends, no concurrent access
+- Clip loading at startup: synchronous in `__init__`, same pattern as existing `_load_filler_clips()`
 
-### Pattern 3: Fire-and-Acknowledge for Long Tasks
+## Build Order
 
-**What:** Return an acknowledgment immediately, deliver the actual result later via conversation injection.
-**When:** Any tool call that takes > 2 seconds.
-**Why:** The Realtime API supports async function calling in GA, but the user experience is better when the AI acknowledges immediately ("I'm on it") rather than going silent for 30 seconds.
+Components can be built in phases with clear independence:
 
-### Pattern 4: Context Isolation via Working Directory
+### Phase 1: Input Classification (can be built and tested independently)
 
-**What:** Each ClaudeTask runs with its own `cwd`, no shared Claude session state.
-**When:** Always for task spawning.
-**Why:** Prevents cross-contamination. Task A editing files shouldn't affect Task B's view of the filesystem. Using `-p` (print mode) ensures no session continuity between tasks.
+Build `input_classifier.py` with `ClassifiedInput` dataclass and `InputClassifier` class. This has zero dependencies on the rest of the system. Can be tested with unit tests against sample transcripts.
+
+**Deliverable:** `input_classifier.py` with tests
+**Dependencies:** None
+**Risk:** Low -- pattern matching is well-understood
+
+### Phase 2: Response Library (can be built and tested independently)
+
+Build `response_library.py` with `ResponseEntry` dataclass, `ResponseLibrary` class, JSON storage, and lookup algorithm. Seed with initial entries (migrate existing acknowledgment phrases + add social/emotional responses).
+
+**Deliverable:** `response_library.py` with initial `library.json`, tests
+**Dependencies:** None (uses existing Piper for initial clip generation)
+**Risk:** Low -- data structure and lookup
+
+### Phase 3: Pipeline Integration (depends on Phase 1 + 2)
+
+Modify `_filler_manager()` in `live_session.py` to use classifier + library. Add `NON_SPEECH` frame type. Modify STT stage to emit non-speech events. Wire up logging of usage and misses.
+
+**Deliverable:** Modified `live_session.py`, `pipeline_frames.py`
+**Dependencies:** Phase 1, Phase 2
+**Risk:** Medium -- touching the hot path, needs careful testing to avoid regression
+
+### Phase 4: Library Curator (can be built after Phase 2)
+
+Build `library_curator.py` daemon. Follows learner.py pattern exactly. Post-session gap analysis, clip generation, quality pruning.
+
+**Deliverable:** `library_curator.py`
+**Dependencies:** Phase 2 (needs library.json schema), `clip_factory.py` (reuses generate/evaluate)
+**Risk:** Medium -- LLM-based analysis quality depends on prompt engineering
 
 ## Anti-Patterns to Avoid
 
-### Anti-Pattern 1: Shared Claude Session Across Tasks
+### Anti-Pattern 1: LLM Classification in the Hot Path
 
-**What:** Using `--continue` or `--session-id` to share a Claude session between multiple tasks.
-**Why bad:** Tasks would see each other's conversation history, tool calls, and file edits. A task modifying a file would confuse another task reading the same file. Debug nightmare.
-**Instead:** Each task is a fresh `claude -p` invocation with its own working directory.
+**What:** Using Claude to classify input before selecting a quick response.
+**Why bad:** Claude CLI takes 1-3 seconds for even simple prompts. This would eliminate the entire benefit of quick responses (which exist to fill that wait time).
+**Instead:** Use pure-Python pattern matching. The classification does not need to be perfect -- it needs to be fast. A wrong quick response is better than silence, and the LLM response arrives within seconds anyway.
 
-### Anti-Pattern 2: Blocking the Asyncio Event Loop
+### Anti-Pattern 2: Shared Mutable State Between Session and Curator
 
-**What:** Using `subprocess.run()` (synchronous) inside the async event handler.
-**Why bad:** The entire Realtime session freezes -- no audio streaming, no event processing, no mic control. The user hears silence and thinks it crashed.
-**Instead:** Use `asyncio.create_subprocess_exec()` and `await process.communicate()` with timeouts.
+**What:** Having the curator modify the library while a session is running.
+**Why bad:** Race conditions on `library.json` reads/writes. The in-memory index would go stale.
+**Instead:** Curator only writes when no session is active (post-session). Next session loads fresh state at startup. Same pattern as learner.py.
 
-### Anti-Pattern 3: Polling for Task Status in a Loop
+### Anti-Pattern 3: Over-Engineering the Classifier
 
-**What:** Having the Realtime AI repeatedly call `check_tasks` on a timer to detect completion.
-**Why bad:** Wastes API tokens, creates annoying repeated interruptions ("Still running... still running..."), and the poll interval creates latency.
-**Instead:** Use the proactive notification pattern -- TaskManager pushes completion events into the conversation.
+**What:** Building an ML-based classifier for input categorization.
+**Why bad:** Adds model loading latency, dependency complexity, and the categories are simple enough for rules. The 15 categories above cover 90%+ of conversational inputs with regex + keyword matching.
+**Instead:** Start with rules. If classification quality is insufficient, add ML later (can swap the classifier implementation without changing the interface).
 
-### Anti-Pattern 4: Storing Task Output in Memory Indefinitely
+### Anti-Pattern 4: Replacing the Filler System Entirely
 
-**What:** Keeping all task output in the TaskManager dict forever during a session.
-**Why bad:** Long sessions with many tasks accumulate output. Each `get_task_result` sends potentially 3000 chars to the Realtime API, consuming tokens.
-**Instead:** Keep summaries (first 200 chars) in the registry, full output on disk. Load on demand.
+**What:** Removing the existing `_pick_filler("acknowledgment")` fallback.
+**Why bad:** The response library starts empty/small. Without fallback, there would be silence for uncovered situations.
+**Instead:** Keep the existing acknowledgment pool as fallback. Quick responses are an upgrade layer, not a replacement.
 
-### Anti-Pattern 5: Thread-per-Task Model
+### Anti-Pattern 5: Pre-Generating All Possible Responses
 
-**What:** Spawning a Python thread for each Claude CLI subprocess (like the current conversation/interview modes do with `threading.Thread`).
-**Why bad:** Mixes threading with asyncio, creates synchronization headaches, and makes it harder to cancel tasks cleanly. The existing codebase already suffers from thread-based complexity.
-**Instead:** Stay fully in asyncio for the live mode path. The Realtime session already uses asyncio; keep tasks in the same event loop.
+**What:** Trying to generate clips for every possible situation up front.
+**Why bad:** Combinatorial explosion. The strength of this system is that it learns which situations actually occur and generates clips for those.
+**Instead:** Start with a minimal seed library (greetings, thanks, common question acknowledgments). Let the curator grow it based on actual usage.
 
-## Scalability Considerations
+## Summary of Changes by File
 
-| Concern | At 1-2 tasks | At 5-10 tasks | At 20+ tasks |
-|---------|--------------|---------------|-------------|
-| Memory | Negligible (~1MB per task output) | ~10MB buffered output | Implement disk-based output storage |
-| CPU | Fine (subprocess, not in-process) | Fine (OS handles scheduling) | May want to cap concurrent tasks |
-| API cost | ~$0.10-0.50 per task | ~$1-5 per session | Add cost tracking, warn user |
-| Realtime context | No issue | Context window starts filling | Implement task result summarization |
-| Subprocess count | Fine | OS limit not a concern | Add max_concurrent_tasks config (default: 5) |
-
-## Suggested Build Order (Dependencies)
-
-This is the critical section for roadmap phase structure.
-
-### Phase 1: RealtimeSession Refactor (foundation)
-
-**Must come first.** The existing RealtimeSession has hardcoded tool execution. Before adding task management, the tool handler must be pluggable. Also upgrade from preview model to GA model.
-
-Deliverables:
-- Pluggable `tool_handler` callback on RealtimeSession
-- Configurable `tools` list on RealtimeSession
-- Upgrade WebSocket URL to `gpt-realtime` GA model
-- Existing functionality preserved (current tools still work)
-
-Dependencies: None (pure refactor of existing code)
-
-### Phase 2: TaskManager + ClaudeTask (core capability)
-
-**Depends on Phase 1 for the pluggable tool handler.** This is the new capability -- the ability to spawn and track Claude CLI subprocesses asynchronously.
-
-Deliverables:
-- TaskManager class (spawn, track, query, cancel)
-- ClaudeTask class (async subprocess, output capture, timeout)
-- Unit-testable in isolation (no Realtime API needed)
-
-Dependencies: Phase 1 (pluggable handler interface)
-
-### Phase 3: LiveSession Integration (assembly)
-
-**Depends on Phase 1 + Phase 2.** Wire TaskManager into RealtimeSession via LiveSession. Define the task-oriented tools. Implement proactive completion notifications.
-
-Deliverables:
-- LiveSession class (owns RealtimeSession + TaskManager)
-- Tool definitions (start_task, check_tasks, get_task_result, cancel_task)
-- Tool handler routing
-- Proactive task completion notification
-- Integration into PushToTalk mode routing
-
-Dependencies: Phase 1 (refactored RealtimeSession), Phase 2 (TaskManager)
-
-### Phase 4: Mode Rename + UI (user-facing)
-
-**Depends on Phase 3 for the new mode to exist.** Rename "live" to "dictate" and "realtime" to "live" across codebase and UI. Update indicator, settings, config.
-
-Deliverables:
-- Config migration (dictation_mode: "live" -> "dictate", ai_mode: "realtime" -> "live")
-- Indicator UI updates (new mode names, task status display)
-- Settings tab for live mode configuration
-- Documentation updates
-
-Dependencies: Phase 3 (live mode exists to be named)
+| File | Change Type | What Changes |
+|------|-------------|--------------|
+| `pipeline_frames.py` | MODIFY | Add `NON_SPEECH` to FrameType enum |
+| `live_session.py` | MODIFY | `_filler_manager()` uses classifier + library; `_llm_stage()` handles NON_SPEECH frames; `__init__()` instantiates classifier + library; STT stage emits NON_SPEECH frames; `_spawn_curator()` added; logging additions |
+| `input_classifier.py` | NEW | InputClassifier class, ClassifiedInput dataclass |
+| `response_library.py` | NEW | ResponseLibrary class, ResponseEntry dataclass, JSON persistence |
+| `library_curator.py` | NEW | Post-session daemon for library growth/pruning |
+| `audio/responses/library.json` | NEW | Response library index (seed + grows over time) |
+| `audio/responses/clips/` | NEW | Directory for response audio clips |
+| `clip_factory.py` | UNCHANGED | Continues managing acknowledgment fallback pool |
+| `learner.py` | UNCHANGED | Continues managing personality memories |
 
 ## Sources
 
-- OpenAI Realtime API documentation: https://platform.openai.com/docs/guides/realtime
-- OpenAI Realtime GA announcement (gpt-realtime model): https://openai.com/index/introducing-gpt-realtime/
-- OpenAI developer notes on async function calling: https://developers.openai.com/blog/realtime-api/
-- Claude Code CLI reference: https://code.claude.com/docs/en/cli-reference
-- Python asyncio subprocess docs: https://docs.python.org/3/library/asyncio-subprocess.html
-- Existing codebase: `/home/ethan/code/push-to-talk/openai_realtime.py`, `/home/ethan/code/push-to-talk/push-to-talk.py`
-- Existing architecture analysis: `/home/ethan/code/push-to-talk/.planning/codebase/ARCHITECTURE.md`
-
----
-
-*Architecture research: 2026-02-13*
+- **live_session.py** (read in full): Pipeline architecture, filler system, STT gating, barge-in logic, tool-use flow. Lines 559-574 (filler_manager), 1496-1564 (llm_stage), 1325-1492 (stt_stage).
+- **pipeline_frames.py** (read in full): Frame types and PipelineFrame dataclass.
+- **learner.py** (read in full): Daemon pattern for post-session processing.
+- **clip_factory.py** (read in full): Clip generation, quality evaluation, pool management.
+- **task_manager.py** (read in full): Subprocess management patterns.
+- **ack_pool.json** (read in full): Current clip metadata schema.
