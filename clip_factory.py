@@ -42,7 +42,7 @@ SAMPLE_RATE = 22050  # Piper native sample rate
 
 # Non-verbal prompts — must be real speakable words/phrases so Piper
 # doesn't spell them out letter-by-letter (e.g. "Hm" → "H-M")
-PROMPTS = ["hum", "um", "uh huh", "ah", "mm hm", "oh", "uh", "huh"]
+PROMPTS = ["hum", "um", "uh huh", "ah", "oh", "uh", "huh", "okay"]
 
 # Acknowledgment clip pool
 ACK_CLIP_DIR = Path(__file__).parent / "audio" / "fillers" / "acknowledgment"
