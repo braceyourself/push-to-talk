@@ -8,43 +8,52 @@ A Linux desktop tool providing global hotkey-driven voice input with multiple AI
 
 Natural, low-friction voice conversation with Claude that feels like talking to a person — fast recognition, intelligent responses, no jarring artifacts.
 
-## Current Milestone: v1.1 Voice UX Polish
+## Completed Milestone: v1.1 Voice UX Polish ✓
 
 **Goal:** Make the live voice session feel natural — fix filler conflicts, reduce false STT triggers, suppress stale tool narration, enable barge-in interruption.
 
+**Status:** All 15 requirements satisfied, 4/4 phases passed. Audit passed 2026-02-18.
+
+## Next Milestone: v1.2 Adaptive Quick Responses
+
+**Goal:** Replace the dumb filler system with an AI-driven quick response library that learns what to say based on context — making the assistant feel socially aware, not just technically capable.
+
+**Core idea:** The AI builds and maintains a library of situational quick responses (situation → pre-generated audio clip). When input arrives, the system instantly matches it to the right response and plays it while the full LLM response processes in the background.
+
 **Target features:**
-- Filler system overhaul: non-verbal clips only + clip factory for generation/rotation
-- STT reliability: Whisper no_speech_prob filtering to reject non-speech sounds
-- Tool-use speech flow: only speak the final coherent response after all tool calls
-- Barge-in: let user interrupt AI mid-speech
-- Overlay polish: granular status states, expandable history
+- Quick response library: growing cache of (situation → audio clip) pairs
+- AI-chosen responses: the AI decides what phrases to use, not random selection
+- Context-aware matching: classify input instantly and match to appropriate response
+- Non-speech awareness: cough → "excuse you", sigh → empathetic response, etc.
+- Library growth: after sessions, identify uncovered situations and generate new phrases
+- Library pruning: phase out phrases that feel unnatural over time
+- Always processing: no perceptible gate/delay, background pipeline feels seamless
 
 ## Requirements
 
 ### Validated
 
-- ✓ Mode rename ("live" dictation → "dictate") — v1.0 Phase 1
-- ✓ Live voice session with 5-stage pipeline — v1.0 Phase 1
-- ✓ Claude CLI integration via stream-json — v1.0 Phase 1
-- ✓ MCP tool server for task management — v1.0 Phase 3
-- ✓ TaskManager for async background tasks — v1.0 Phase 2
-- ✓ Filler system (canned clips + smart generation) — v1.0 Phase 1
-- ✓ Learner daemon for persistent memory — v1.0 Phase 3
-- ✓ Live overlay with status, drag, model selection — v1.0 Phase 1
-- ✓ Conversation logging (JSONL) — v1.0 Phase 3
-- ✓ Granular status indicators (thinking, tool_use) — v1.1 pre-work
-- ✓ Expandable status history panel — v1.1 pre-work
-- ✓ Tool-use text suppression (post_tool_buffer) — v1.1 pre-work
-- ✓ Whisper no_speech_prob segment filtering — v1.1 pre-work
+- ✓ Mode rename ("live" dictation → "dictate") — v1.0
+- ✓ Live voice session with 5-stage pipeline — v1.0
+- ✓ Claude CLI integration via stream-json — v1.0
+- ✓ MCP tool server for task management — v1.0
+- ✓ TaskManager for async background tasks — v1.0
+- ✓ Filler system (acknowledgment clip factory with quality gating) — v1.0→v1.1
+- ✓ Learner daemon for persistent memory — v1.0
+- ✓ Live overlay with status, drag, model selection — v1.0
+- ✓ Conversation logging (JSONL) — v1.0
+- ✓ Barge-in interruption with VAD, context annotation, shortened silence — v1.1
+- ✓ Multi-layer STT filtering (no_speech_prob, logprob, compression ratio) — v1.1
+- ✓ Tool-use speech suppression (only final response spoken) — v1.1
+- ✓ Dynamic overlay (tool intent labels, history coalescing, STT rejection flash) — v1.1
 
 ### Active
 
-- [ ] Non-verbal filler clips only (remove Ollama smart filler)
-- [ ] Filler clip factory: subprocess generates/rotates clips, capped pool, natural evaluation
-- [ ] STT false trigger tuning and verification
-- [ ] Tool-use speech flow end-to-end verification
-- [ ] Barge-in: user can interrupt AI mid-speech via voice activity detection
-- [ ] Overlay and status polish: verify all states render correctly
+- [ ] Quick response library with situation → audio clip mapping
+- [ ] AI-driven phrase selection based on input context
+- [ ] Non-speech event awareness (coughs, sighs, laughter → appropriate responses)
+- [ ] Background library growth and pruning across sessions
+- [ ] Seamless background processing — no perceptible filler gate
 
 ### Out of Scope
 
@@ -55,7 +64,7 @@ Natural, low-friction voice conversation with Claude that feels like talking to 
 
 ## Context
 
-The live mode evolved from the original OpenAI Realtime API plan into a Claude CLI-based pipeline using local Whisper for STT and Piper for TTS. The Silero VAD model is already in the codebase (loaded by `_load_vad_model`) but only used for barge-in monitoring which is currently non-functional (mic is muted during playback via pactl). Barge-in requires gating STT instead of muting the physical mic source.
+The live mode evolved from the original OpenAI Realtime API plan into a Claude CLI-based pipeline using local Whisper for STT and Piper for TTS. v1.1 added barge-in (VAD-based, STT gating instead of mic mute), multi-layer STT filtering, tool-use speech suppression, and acknowledgment phrase fillers. The current filler system picks random clips from a pool — it doesn't understand context, so task-oriented phrases ("let me take a look") play even for simple conversational questions ("what's your name?"). v1.2 replaces this with an AI-driven quick response system that understands what's happening and responds appropriately, including to non-speech events like coughs.
 
 ## Constraints
 
@@ -70,9 +79,10 @@ The live mode evolved from the original OpenAI Realtime API plan into a Claude C
 |----------|-----------|---------|
 | Claude CLI pipeline instead of OpenAI Realtime | Direct Claude access, no API key dependency for LLM, lower cost | ✓ Good |
 | Local Whisper + Piper instead of cloud STT/TTS | Zero latency dependency on cloud, works offline | ✓ Good |
-| Non-verbal fillers only | Semantic fillers (smart filler, "okay", "sure") conflict with LLM response | — Pending |
-| Filler clip factory subprocess | Generate varied non-verbal clips, rotate pool, evaluate naturalness | — Pending |
-| Gate STT for barge-in instead of mic mute | Mic must stay live for VAD to detect speech during playback | — Pending |
+| Acknowledgment phrase fillers | Non-verbal (hums) failed with Piper TTS; verbal acknowledgments work well | ✓ Good |
+| Filler clip factory subprocess | Generate varied clips, rotate pool, evaluate naturalness | ✓ Good |
+| Gate STT for barge-in instead of mic mute | Mic must stay live for VAD to detect speech during playback | ✓ Good |
+| AI-driven quick response library | Dumb random fillers sound wrong in context; AI should choose what to say | — v1.2 |
 
 ---
-*Last updated: 2026-02-17 after v1.1 milestone start*
+*Last updated: 2026-02-18 after v1.1 milestone*
