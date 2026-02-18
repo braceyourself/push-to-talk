@@ -1213,6 +1213,9 @@ class LiveSession:
                             if saw_tool_use:
                                 # After tool use: hold text, don't send to TTS yet
                                 post_tool_buffer += text
+                                # Cancel ack on first post-tool text
+                                if self._ack_cancel and not self._ack_cancel.is_set():
+                                    self._ack_cancel.set()
                             else:
                                 # Normal path: stream text to TTS
                                 sentence_buffer += text
@@ -1589,9 +1592,11 @@ class LiveSession:
                 t_done = time.time()
                 print(f"  [timing] CLI response: {t_done - t_sent:.2f}s, total: {t_done - t_start:.2f}s", flush=True)
 
-                # Cancel filler if still running
+                # Cancel filler and acknowledgment if still running
                 if self._filler_cancel:
                     self._filler_cancel.set()
+                if self._ack_cancel:
+                    self._ack_cancel.set()
                 if filler_task and not filler_task.done():
                     filler_task.cancel()
 
