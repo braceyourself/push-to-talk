@@ -115,6 +115,7 @@ Plans:
   2. No nonverbal clip generation code remains in clip_factory.py
   3. No unused nonverbal audio files on disk
   4. FILL-02 requirement text reflects the actual acknowledgment-phrase behavior
+**Plans:** 1 plan
 
 Plans:
 - [ ] 07-01-PLAN.md -- Fix barge-in filler, remove nonverbal generation/assets, update docs
