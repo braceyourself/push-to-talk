@@ -1862,6 +1862,7 @@ class LiveOverlayWidget(Gtk.Window):
         self.status_history = []  # [(HH:MM:SS, status), ...] capped at 50
         self.expanded = False
         self._rejection_flash = False
+        self.tool_intent = None
 
         # Drag state
         self.dragging = False
@@ -1963,8 +1964,14 @@ class LiveOverlayWidget(Gtk.Window):
         cr.arc(dot_x, dot_y, self.DOT_RADIUS, 0, 2 * PI)
         cr.fill()
 
-        # Draw status text
-        label = self.STATUS_LABELS.get(self.status, self.status.title())
+        # Draw status text (dynamic tool intent label when available)
+        if self.status == 'tool_use' and self.tool_intent:
+            label = self.tool_intent
+        else:
+            label = self.STATUS_LABELS.get(self.status, self.status.title())
+        # Truncate to fit overlay width
+        if len(label) > 18:
+            label = label[:17] + "..."
         cr.set_source_rgba(0.9, 0.9, 0.9, 1.0)
         cr.select_font_face("Sans", 0, 0)
         cr.set_font_size(13)
@@ -2003,8 +2010,16 @@ class LiveOverlayWidget(Gtk.Window):
             entries = list(reversed(self.status_history))[:self.HISTORY_MAX_VISIBLE]
             row_y = self.OVERLAY_HEIGHT + 8
             for ts, st in entries:
+                # Parse enriched status (may be "tool_use: intent text")
+                if ': ' in st and st.startswith('tool_use'):
+                    base_status = 'tool_use'
+                    display_label = st.split(': ', 1)[1]
+                else:
+                    base_status = st
+                    display_label = self.STATUS_LABELS.get(st, st.title())
+
                 # Small colored dot
-                dc = self.DOT_COLORS.get(st, self.DOT_COLORS['idle'])
+                dc = self.DOT_COLORS.get(base_status, self.DOT_COLORS['idle'])
                 cr.set_source_rgba(dc[0], dc[1], dc[2], 0.9)
                 cr.arc(18, row_y + self.HISTORY_ROW_HEIGHT / 2, 3.5, 0, 2 * PI)
                 cr.fill()
@@ -2016,11 +2031,10 @@ class LiveOverlayWidget(Gtk.Window):
                 cr.move_to(28, row_y + self.HISTORY_ROW_HEIGHT / 2 + 4)
                 cr.show_text(ts)
 
-                # Label
-                sl = self.STATUS_LABELS.get(st, st.title())
+                # Label — truncate long intent labels
                 cr.set_source_rgba(0.75, 0.75, 0.75, 1.0)
                 cr.move_to(82, row_y + self.HISTORY_ROW_HEIGHT / 2 + 4)
-                cr.show_text(sl)
+                cr.show_text(display_label[:20])
 
                 row_y += self.HISTORY_ROW_HEIGHT
 
@@ -2038,16 +2052,38 @@ class LiveOverlayWidget(Gtk.Window):
         self.queue_draw()
         return False  # Don't repeat the timer
 
-    def update_status(self, status):
-        """Update the displayed status. Call from any thread via GLib.idle_add."""
+    def update_status(self, status, metadata=None):
+        """Update the displayed status with optional metadata.
+
+        Call from any thread via GLib.idle_add.
+        Metadata dict may contain 'intent' for tool_use status.
+        Consecutive tool_use entries are coalesced into a single evolving entry.
+        """
         if status == 'stt_rejected':
             self._flash_rejection()
             return
-        if status != self.status:
+
+        # Extract tool intent from metadata
+        if status == 'tool_use' and metadata and 'intent' in metadata:
+            self.tool_intent = metadata['intent']
+        elif status != 'tool_use':
+            self.tool_intent = None
+
+        if status != self.status or (status == 'tool_use' and self.tool_intent):
             timestamp = time.strftime("%H:%M:%S")
-            self.status_history.append((timestamp, status))
-            if len(self.status_history) > 50:
-                self.status_history = self.status_history[-50:]
+
+            # Coalesce consecutive tool_use entries in history
+            if (status == 'tool_use' and self.status_history
+                    and self.status_history[-1][1].startswith('tool_use')):
+                # Update the last entry instead of appending
+                display = f"tool_use: {self.tool_intent}" if self.tool_intent else "tool_use"
+                self.status_history[-1] = (timestamp, display)
+            else:
+                display = f"tool_use: {self.tool_intent}" if (status == 'tool_use' and self.tool_intent) else status
+                self.status_history.append((timestamp, display))
+                if len(self.status_history) > 50:
+                    self.status_history = self.status_history[-50:]
+
         self.status = status
         self._resize_window()
         self.queue_draw()
@@ -2191,11 +2227,11 @@ def hide_live_overlay():
         _live_overlay.hide()
 
 
-def update_live_overlay(status):
-    """Update the live overlay status."""
+def update_live_overlay(status, metadata=None):
+    """Update the live overlay status with optional metadata."""
     global _live_overlay
     if _live_overlay is not None and _live_overlay.get_visible():
-        _live_overlay.update_status(status)
+        _live_overlay.update_status(status, metadata)
 
 
 def main():
@@ -2231,14 +2267,25 @@ def main():
                 # Show live overlay
                 if not _live_overlay.get_visible():
                     _live_overlay.show_all()
-                # Route status updates to overlay
+                # Route status updates to overlay (supports JSON metadata)
                 if STATUS_FILE.exists():
-                    status = STATUS_FILE.read_text().strip()
+                    content = STATUS_FILE.read_text().strip()
+                    if content.startswith('{'):
+                        try:
+                            data = json.loads(content)
+                            status = data.get('status', 'idle')
+                            metadata = data
+                        except (json.JSONDecodeError, ValueError):
+                            status = content
+                            metadata = None
+                    else:
+                        status = content
+                        metadata = None
                     # Don't override user-set muted status
                     if _live_overlay.status == 'muted' and status != 'muted':
                         pass  # Keep muted until explicitly changed
                     else:
-                        _live_overlay.update_status(status)
+                        _live_overlay.update_status(status, metadata)
             else:
                 # Hide live overlay
                 if _live_overlay.get_visible():
