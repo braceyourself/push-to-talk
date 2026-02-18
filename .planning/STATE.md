@@ -11,18 +11,18 @@ See: .planning/PROJECT.md (updated 2026-02-17)
 
 Milestone: v1.1 Voice UX Polish
 Phase: 6 of 6 (Polish & Verification)
-Plan: 1 of 3
+Plan: 2 of 3
 Status: In progress
-Last activity: 2026-02-18 — Completed 06-01-PLAN.md (STT filtering + rejection flash)
+Last activity: 2026-02-18 — Completed 06-02-PLAN.md (pre-tool acknowledgment clips + tool intent)
 
-Progress: [██████████████████████░░░░░░░░░] 78% (7/9 v1.1 plans complete)
+Progress: [█████████████████████████░░░░░░] 89% (8/9 v1.1 plans complete)
 
 ## Performance Metrics
 
 **v1.0 Velocity:**
-- Total plans completed: 7
-- Average duration: ~7.5 minutes
-- Total execution time: ~52 minutes
+- Total plans completed: 8
+- Average duration: ~7 minutes
+- Total execution time: ~55 minutes
 
 **By Phase:**
 
@@ -33,7 +33,7 @@ Progress: [██████████████████████░
 | 03 | 2/2 | ~3min | ~3min |
 | 04 | 2/2 | ~7.5min | ~3.75min |
 | 05 | 2/2 | ~5.5min | ~2.75min |
-| 06 | 1/3 | ~1min | ~1min |
+| 06 | 2/3 | ~4min | ~2min |
 
 *Updated after each plan completion*
 
@@ -67,6 +67,11 @@ Phase 5 additions:
 Phase 6 additions:
 - 3-layer Whisper segment filtering: no_speech_prob >= 0.6, avg_logprob < -1.0, compression_ratio > 2.4
 - stt_rejected as transient overlay flash (300ms dot dim), not a state transition
+- Clip factory refactored to generic _top_up helper supporting multiple pool categories
+- Acknowledgment clip pool: 10-15 verbal phrases, relaxed quality thresholds (0.3-4.0s, RMS > 200)
+- Gated pre-tool acknowledgment: 300ms asyncio gate, skips if tool completes fast
+- TOOL_INTENT_MAP maps MCP tool names to human-readable intents for overlay display
+- _set_status accepts optional metadata dict, serialized as JSON through existing callback chain
 
 ### Pending Todos
 
@@ -78,6 +83,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-02-18T12:48:40Z
-Stopped at: Completed 06-01-PLAN.md — STT filtering + rejection flash
+Last session: 2026-02-18T12:52:10Z
+Stopped at: Completed 06-02-PLAN.md — pre-tool acknowledgment clips + tool intent
 Resume file: None
