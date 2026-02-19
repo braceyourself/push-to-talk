@@ -21,9 +21,21 @@ import shutil
 from collections import deque
 from pathlib import Path
 
+import pysbd
+
 from pipeline_frames import PipelineFrame, FrameType
 from response_library import ResponseLibrary
+from stream_composer import StreamComposer, AudioSegment, SegmentType
 from task_manager import TaskManager, ClaudeTask, TaskStatus
+
+# Module-level sentence segmenter for post-tool-buffer and end-of-turn flushing
+_sentence_segmenter = pysbd.Segmenter(language="en", clean=False)
+
+# Question patterns for detecting when AI asks user a question
+_AI_QUESTION_PATTERNS = re.compile(
+    r'\b(should I|do you want|would you like|shall I|can I|what do you think)\b',
+    re.IGNORECASE,
+)
 
 # Audio settings
 SAMPLE_RATE = 24000
@@ -152,6 +164,12 @@ class LiveSession:
         self._classifier_process = None
         self._classifier_socket_path = None
         self._seed_process = None
+
+        # AI question tracking (for trivial detection context)
+        self._ai_asked_question = False
+
+        # Stream composer (created in run())
+        self._composer = None
 
         # Barge-in (VAD) system
         self.barge_in_enabled = barge_in_enabled
@@ -322,7 +340,10 @@ class LiveSession:
                 asyncio.open_unix_connection(self._classifier_socket_path),
                 timeout=0.1
             )
-            request = json.dumps({"text": text}) + "\n"
+            request = json.dumps({
+                "text": text,
+                "ai_asked_question": self._ai_asked_question,
+            }) + "\n"
             writer.write(request.encode())
             await writer.drain()
             response = await asyncio.wait_for(reader.readline(), timeout=0.1)
@@ -657,17 +678,38 @@ class LiveSession:
             if LIBRARY_META.exists():
                 self._load_response_library()
 
-        # Step 1: Classify via daemon IPC (<5ms)
+        # Step 1: Classify via daemon IPC (<5ms) -- includes ai_asked_question context
         classification = await self._classify_input(user_text)
         category = classification.get("category", "acknowledgment")
         confidence = classification.get("confidence", 0.0)
         subcategory = classification.get("subcategory", "")
+        match_type = classification.get("match_type", "heuristic")
+        trivial = classification.get("trivial", False)
 
-        # Step 2: Low confidence -> fall back to acknowledgment
+        # Reset ai_asked_question after classification (user has responded)
+        self._ai_asked_question = False
+
+        # Step 2: Trivial input -> natural silence (no filler clip)
+        if trivial:
+            self._log_event("classification",
+                input_text=user_text,
+                category=category,
+                confidence=confidence,
+                subcategory=subcategory,
+                match_type=match_type,
+                trivial=True,
+                clip_id=None,
+                clip_phrase=None,
+                fallback_used=False,
+            )
+            self._set_status("thinking")
+            return  # Natural silence -- no filler
+
+        # Step 3: Low confidence -> fall back to acknowledgment
         if confidence < 0.4:
             category = "acknowledgment"
 
-        # Step 3: Lookup clip from response library
+        # Step 4: Lookup clip from response library
         response = None
         clip_pcm = None
         if self._response_library.is_loaded():
@@ -675,18 +717,20 @@ class LiveSession:
             if response:
                 clip_pcm = self._response_library.get_clip_pcm(response.id)
 
-        # Step 4: Log classification trace
+        # Step 5: Log classification trace
         self._log_event("classification",
             input_text=user_text,
             category=category,
             confidence=confidence,
             subcategory=subcategory,
+            match_type=match_type,
+            trivial=False,
             clip_id=response.id if response else None,
             clip_phrase=response.phrase if response else None,
             fallback_used=response is None,
         )
 
-        # Step 5: Gate -- skip if LLM responds fast (500ms)
+        # Step 6: Gate -- skip if LLM responds fast (500ms)
         try:
             await asyncio.wait_for(cancel_event.wait(), timeout=0.5)
             return
@@ -696,19 +740,25 @@ class LiveSession:
         if cancel_event.is_set():
             return
 
-        # Step 6: Play clip from response library
+        # Step 7: Play clip via composer (or direct if composer not available)
         if clip_pcm:
             clip_pcm = self._resample_22050_to_24000(clip_pcm)
-            await self._play_filler_audio(clip_pcm, cancel_event)
+            if self._composer:
+                await self._composer.enqueue(AudioSegment(SegmentType.FILLER_CLIP, data=clip_pcm))
+            else:
+                await self._play_filler_audio(clip_pcm, cancel_event)
             if response:
                 barged = cancel_event.is_set()
                 self._response_library.record_usage(response.id, barged_in=barged)
             return
 
-        # Step 7: Ultimate fallback -- existing random ack clip (old system)
+        # Step 8: Ultimate fallback -- existing random ack clip (old system)
         clip = self._pick_filler("acknowledgment")
         if clip:
-            await self._play_filler_audio(clip, cancel_event)
+            if self._composer:
+                await self._composer.enqueue(AudioSegment(SegmentType.FILLER_CLIP, data=clip))
+            else:
+                await self._play_filler_audio(clip, cancel_event)
 
     async def _tts_to_pcm(self, text: str) -> bytes | None:
         """Convert text to PCM audio via Piper. Returns resampled 24kHz bytes."""
@@ -760,6 +810,26 @@ class LiveSession:
         clip = self._pick_filler("acknowledgment")
         if clip:
             await self._play_filler_audio(clip, cancel_event)
+
+    async def _play_gated_ack_via_composer(self, cancel_event: asyncio.Event, gen_id: int):
+        """Play an acknowledgment clip via composer after 300ms gate."""
+        # Gate: wait 300ms -- if tool completes fast, skip acknowledgment
+        try:
+            await asyncio.wait_for(cancel_event.wait(), timeout=0.3)
+            return  # Tool completed fast, skip acknowledgment
+        except asyncio.TimeoutError:
+            pass
+
+        if cancel_event.is_set() or self.generation_id != gen_id:
+            return
+
+        # Play acknowledgment clip via composer for consistency
+        clip = self._pick_filler("acknowledgment")
+        if clip:
+            if self._composer:
+                await self._composer.enqueue(AudioSegment(SegmentType.FILLER_CLIP, data=clip))
+            else:
+                await self._play_filler_audio(clip, cancel_event)
 
     # ── VAD Barge-in ──────────────────────────────────────────────
 
@@ -1193,7 +1263,7 @@ class LiveSession:
             self._cli_ready = False
 
     async def _read_cli_response(self):
-        """Read streaming events from CLI until turn is complete. Route text to TTS."""
+        """Read streaming events from CLI until turn is complete. Route text through composer."""
         if not self._cli_process or not self._cli_process.stdout:
             return
 
@@ -1261,19 +1331,20 @@ class LiveSession:
 
                             if not saw_tool_use:
                                 saw_tool_use = True
-                                # First tool call — drain any text already
-                                # sent to TTS so we don't speak pre-tool narration
+                                # First tool call — reset composer to drain
+                                # any pre-tool sentences, then drain audio_out
+                                if self._composer:
+                                    self._composer.reset()
                                 drained = 0
-                                for q in (self._llm_out_q, self._audio_out_q):
-                                    while not q.empty():
-                                        try:
-                                            f = q.get_nowait()
-                                            if f.type == FrameType.END_OF_TURN:
-                                                await q.put(f)
-                                                break
-                                            drained += 1
-                                        except asyncio.QueueEmpty:
+                                while not self._audio_out_q.empty():
+                                    try:
+                                        f = self._audio_out_q.get_nowait()
+                                        if f.type == FrameType.END_OF_TURN:
+                                            await self._audio_out_q.put(f)
                                             break
+                                        drained += 1
+                                    except asyncio.QueueEmpty:
+                                        break
                                 if drained:
                                     print(f"  [tool] Drained {drained} pre-tool frames", flush=True)
 
@@ -1282,7 +1353,7 @@ class LiveSession:
                                     ack_cancel = asyncio.Event()
                                     self._ack_cancel = ack_cancel
                                     asyncio.create_task(
-                                        self._play_gated_ack(ack_cancel, gen_id)
+                                        self._play_gated_ack_via_composer(ack_cancel, gen_id)
                                     )
 
                             # Discard any accumulated text (pre-tool or inter-tool narration)
@@ -1322,7 +1393,7 @@ class LiveSession:
                                 if self._ack_cancel and not self._ack_cancel.is_set():
                                     self._ack_cancel.set()
 
-                                # Flush complete sentences to TTS
+                                # Flush complete sentences to composer
                                 while True:
                                     match = SENTENCE_END_RE.search(sentence_buffer)
                                     if not match:
@@ -1334,11 +1405,16 @@ class LiveSession:
                                         # Strip markdown for TTS
                                         clean = self._strip_markdown(sentence)
                                         if clean:
-                                            await self._llm_out_q.put(PipelineFrame(
-                                                type=FrameType.TEXT_DELTA,
-                                                generation_id=gen_id,
-                                                data=clean
-                                            ))
+                                            if self._composer:
+                                                await self._composer.enqueue(
+                                                    AudioSegment(SegmentType.TTS_SENTENCE, data=clean)
+                                                )
+                                            else:
+                                                await self._llm_out_q.put(PipelineFrame(
+                                                    type=FrameType.TEXT_DELTA,
+                                                    generation_id=gen_id,
+                                                    data=clean
+                                                ))
                                             self._spoken_sentences.append(clean)
 
                 elif event_type == "result":
@@ -1353,34 +1429,62 @@ class LiveSession:
         if full_response.strip() and self.generation_id == gen_id:
             self._log_event("assistant", text=full_response.strip())
 
-        # Flush post-tool text now that the turn is complete
+        # Flush post-tool text now that the turn is complete (use pysbd for proper splitting)
         if saw_tool_use and post_tool_buffer.strip() and self.generation_id == gen_id:
             clean = self._strip_markdown(post_tool_buffer)
             if clean:
-                await self._llm_out_q.put(PipelineFrame(
-                    type=FrameType.TEXT_DELTA,
-                    generation_id=gen_id,
-                    data=clean
-                ))
-                self._spoken_sentences.append(clean)
+                sentences = _sentence_segmenter.segment(clean)
+                for sent in sentences:
+                    sent = sent.strip()
+                    if sent:
+                        if self._composer:
+                            await self._composer.enqueue(
+                                AudioSegment(SegmentType.TTS_SENTENCE, data=sent)
+                            )
+                        else:
+                            await self._llm_out_q.put(PipelineFrame(
+                                type=FrameType.TEXT_DELTA,
+                                generation_id=gen_id,
+                                data=sent
+                            ))
+                        self._spoken_sentences.append(sent)
 
-        # Flush remaining text (non-tool-use path)
+        # Flush remaining text (non-tool-use path, use pysbd for final flush)
         if not saw_tool_use and sentence_buffer.strip() and self.generation_id == gen_id:
             clean = self._strip_markdown(sentence_buffer)
             if clean:
-                await self._llm_out_q.put(PipelineFrame(
-                    type=FrameType.TEXT_DELTA,
-                    generation_id=gen_id,
-                    data=clean
-                ))
-                self._spoken_sentences.append(clean)
+                sentences = _sentence_segmenter.segment(clean)
+                for sent in sentences:
+                    sent = sent.strip()
+                    if sent:
+                        if self._composer:
+                            await self._composer.enqueue(
+                                AudioSegment(SegmentType.TTS_SENTENCE, data=sent)
+                            )
+                        else:
+                            await self._llm_out_q.put(PipelineFrame(
+                                type=FrameType.TEXT_DELTA,
+                                generation_id=gen_id,
+                                data=sent
+                            ))
+                        self._spoken_sentences.append(sent)
+
+        # Track ai_asked_question: check if last sentence is a question
+        if full_response.strip() and self.generation_id == gen_id:
+            self._full_response_text = full_response.strip()
+            last_sentence = self._spoken_sentences[-1] if self._spoken_sentences else ""
+            if last_sentence.rstrip().endswith("?") or _AI_QUESTION_PATTERNS.search(last_sentence):
+                self._ai_asked_question = True
 
         # Signal end of turn
         if self.generation_id == gen_id:
-            await self._llm_out_q.put(PipelineFrame(
-                type=FrameType.END_OF_TURN,
-                generation_id=gen_id
-            ))
+            if self._composer:
+                await self._composer.enqueue_end_of_turn()
+            else:
+                await self._llm_out_q.put(PipelineFrame(
+                    type=FrameType.END_OF_TURN,
+                    generation_id=gen_id
+                ))
 
     # ── Pipeline Stage 1: Audio Capture ────────────────────────────
 
@@ -1816,8 +1920,8 @@ class LiveSession:
                 if frame.generation_id != self.generation_id:
                     continue
 
-                # Count completed sentences via sentinel from TTS stage
-                if frame.type == FrameType.CONTROL and frame.data == "sentence_done":
+                # Count completed sentences via sentinel from composer (or legacy TTS stage)
+                if frame.type == FrameType.SENTENCE_DONE or (frame.type == FrameType.CONTROL and frame.data == "sentence_done"):
                     self._played_sentence_count += 1
                     continue
 
@@ -1911,13 +2015,14 @@ class LiveSession:
             self.playing_audio = False
             self._stt_gated = False
             self._vad_speech_count = 0
-            # Drain pending audio and LLM queues
-            for q in (self._audio_out_q, self._llm_out_q):
-                while not q.empty():
-                    try:
-                        q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
+            # Reset composer and drain audio queue
+            if self._composer:
+                self._composer.reset()
+            while not self._audio_out_q.empty():
+                try:
+                    self._audio_out_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
             self._unmute_mic()
             self._set_status("listening")
 
@@ -1934,35 +2039,41 @@ class LiveSession:
         # 2. Increment generation_id to discard all queued frames
         self.generation_id += 1
 
-        # 3. Drain audio_out and llm_out queues (stale frames)
-        for q in (self._audio_out_q, self._llm_out_q):
-            while not q.empty():
-                try:
-                    q.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+        # 3. Pause and reset composer (returns unplayed segments for annotation)
+        held_segments = []
+        if self._composer:
+            held_segments = self._composer.pause()
+            self._composer.reset()
 
-        # 4. Cancel filler and acknowledgment if running
+        # 4. Drain audio_out queue (stale frames from before composer pause)
+        while not self._audio_out_q.empty():
+            try:
+                self._audio_out_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        # 5. Cancel filler and acknowledgment if running
         if self._filler_cancel and not self._filler_cancel.is_set():
             self._filler_cancel.set()
         if self._ack_cancel and not self._ack_cancel.is_set():
             self._ack_cancel.set()
 
-        # 5. Set cooldown (1.5s)
+        # 6. Set cooldown (1.5s)
         self._barge_in_cooldown_until = time.time() + 1.5
 
-        # 6. Reset VAD speech counter and state
+        # 7. Reset VAD speech counter and state
         self._vad_speech_count = 0
         self._reset_vad_state()
 
-        # 7. Transition state — ungating triggers _was_stt_gated reset in STT stage
+        # 8. Transition state — ungating triggers _was_stt_gated reset in STT stage
         self.playing_audio = False
         self._stt_gated = False
 
-        # 8. Unmute mic (undo the _llm_stage mute from thinking phase)
+        # 9. Unmute mic (undo the _llm_stage mute from thinking phase)
         self._unmute_mic()
 
-        # 9. Play a trailing acknowledgment filler clip for naturalness
+        # 10. Play a trailing acknowledgment filler clip for naturalness
+        # (bypasses composer intentionally -- one-shot trail directly to audio_out)
         if self.fillers_enabled:
             clip = self._pick_filler("acknowledgment")
             if clip:
@@ -1981,10 +2092,18 @@ class LiveSession:
                         data=samples.tobytes()
                     ))
 
-        # 10. Build interruption annotation for next turn
+        # 11. Build interruption annotation for next turn
+        # Use held_segments from composer for unspoken count, combined with sentence tracking
         self._was_interrupted = True
+        unspoken_from_composer = [
+            s for s in held_segments
+            if s.type == SegmentType.TTS_SENTENCE and isinstance(s.data, str)
+        ]
         spoken = self._spoken_sentences[:self._played_sentence_count]
+        # Combine tracked unspoken with composer held segments for complete picture
         unspoken = self._spoken_sentences[self._played_sentence_count:]
+        if unspoken_from_composer and not unspoken:
+            unspoken = [s.data for s in unspoken_from_composer]
         spoken_text = " ".join(spoken) if spoken else "(nothing)"
         unspoken_text = " ".join(unspoken) if unspoken else "(nothing)"
 
@@ -2051,14 +2170,24 @@ class LiveSession:
         # Create pipeline queues
         self._audio_in_q = asyncio.Queue(maxsize=100)
         self._stt_out_q = asyncio.Queue(maxsize=50)
-        self._llm_out_q = asyncio.Queue(maxsize=50)
+        self._llm_out_q = asyncio.Queue(maxsize=50)  # kept for fallback compatibility
         self._audio_out_q = asyncio.Queue(maxsize=200)
         self._stt_flush_event = asyncio.Event()
         self._loop = asyncio.get_event_loop()
 
+        # Create StreamComposer -- replaces _tts_stage for TTS generation
+        async def _tts_callback(text: str) -> bytes | None:
+            return await self._tts_to_pcm(text)
+
+        self._composer = StreamComposer(
+            self._audio_out_q,
+            _tts_callback,
+            lambda: self.generation_id,
+        )
+
         self._set_status("listening")
         self._reset_idle_timer()
-        print("Live session: Pipeline started", flush=True)
+        print("Live session: Pipeline started (with StreamComposer)", flush=True)
 
         try:
             # Run interrupt checker as background task
@@ -2071,7 +2200,7 @@ class LiveSession:
                 self._audio_capture_stage(),
                 self._stt_stage(),
                 self._llm_stage(),
-                self._tts_stage(),
+                self._composer.run(),  # Composer replaces _tts_stage
                 self._playback_stage(),
                 interrupt_loop(),
             ]
