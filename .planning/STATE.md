@@ -5,30 +5,31 @@
 See: .planning/PROJECT.md (updated 2026-02-18)
 
 **Core value:** Natural, low-friction voice conversation with Claude that feels like talking to a person
-**Current focus:** v1.2 Adaptive Quick Responses -- Phase 8 complete, ready for Phase 9
+**Current focus:** v1.2 Adaptive Quick Responses -- Phase 9 in progress
 
 ## Current Position
 
 Milestone: v1.2 Adaptive Quick Responses
-Phase: 8 of 11 (Core Classification + Response Library)
-Plan: 3 of 3 complete
-Status: Phase complete
-Last activity: 2026-02-19 -- Completed 08-03-PLAN.md (human-verified)
+Phase: 9 of 11 (Semantic Matching + Pipeline Polish)
+Plan: 1 of 3 in current phase
+Status: In progress
+Last activity: 2026-02-19 -- Completed 09-01-PLAN.md
 
-Progress: [########                      ] 25% (1/4 phases)
+Progress: [##########                    ] 33% (4/12 plans)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 3 (this milestone)
-- Average duration: 3.3min
-- Total execution time: 10min
+- Total plans completed: 4 (this milestone)
+- Average duration: 3.5min
+- Total execution time: 14min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 8 | 3/3 | 10min | 3.3min |
+| 9 | 1/3 | 4min | 4min |
 
 *Updated after each plan completion*
 
@@ -68,6 +69,12 @@ v1.2 execution decisions (08-03):
 - Confidence < 0.4 falls back to acknowledgment category
 - Response library clips resampled 22050->24000Hz for playback compatibility
 
+v1.2 execution decisions (09-01):
+- Heuristic tiebreak: "could you"/"can you"/"would you" framing prefers task over question
+- Confidence normalization: cosine>=0.6 maps to 0.8-0.9, 0.4-0.6 maps to 0.5-0.7, <0.4 maps to 0.2-0.4
+- CLASSIFIER_READY before semantic model loads (background thread graceful degradation)
+- TRIVIAL_PATTERNS as frozenset for O(1) lookup
+
 ### Pending Todos
 
 - Assistant tool creation feature (user idea captured during Phase 8 execution)
@@ -79,5 +86,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-19
-Stopped at: Phase 8 complete, ready for Phase 9
+Stopped at: Completed 09-01-PLAN.md
 Resume file: None

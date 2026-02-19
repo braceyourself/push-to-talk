@@ -93,6 +93,6 @@ Phases execute in numeric order: 8 -> 9 -> 10 -> 11
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
 | 8. Core Classification + Response Library | v1.2 | 3/3 | Complete | 2026-02-19 |
-| 9. Semantic Matching + Pipeline Polish | v1.2 | 0/3 | Not started | - |
+| 9. Semantic Matching + Pipeline Polish | v1.2 | 1/3 | In progress | - |
 | 10. Library Growth + Pruning | v1.2 | 0/TBD | Not started | - |
 | 11. Non-Speech Awareness | v1.2 | 0/TBD | Not started | - |
