@@ -1,0 +1,64 @@
+{
+    "task": [
+        "fix the bug in the login page",
+        "run the test suite",
+        "deploy the app to production",
+        "refactor the auth module",
+        "could you take a peek at this",
+        "clean up the old files",
+        "set up the database",
+        "go ahead and merge that",
+        "can you look into this issue",
+        "try restarting the server"
+    ],
+    "question": [
+        "what does this function do",
+        "how does the authentication work",
+        "why is the test failing",
+        "when was this last deployed",
+        "can you explain this error",
+        "what do you think about this approach",
+        "how would you handle this",
+        "is there a better way to do this"
+    ],
+    "conversational": [
+        "the weather is nice today",
+        "I had a long day",
+        "just thinking out loud",
+        "interesting thought",
+        "that reminds me of something",
+        "I was reading about this",
+        "random question",
+        "so I was thinking"
+    ],
+    "social": [
+        "hey how's it going",
+        "good morning",
+        "see you later",
+        "thanks for your help",
+        "appreciate it",
+        "hello there",
+        "take care",
+        "goodbye for now"
+    ],
+    "emotional": [
+        "this is so frustrating",
+        "that's amazing news",
+        "I really appreciate your help",
+        "this sucks",
+        "I'm so excited about this",
+        "oh that's terrible",
+        "you're the best",
+        "I hate when this happens"
+    ],
+    "acknowledgment": [
+        "okay",
+        "got it",
+        "sure",
+        "makes sense",
+        "understood",
+        "alright then",
+        "sounds good",
+        "perfect"
+    ]
+}

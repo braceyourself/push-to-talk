@@ -3,8 +3,9 @@
 Input classifier daemon for push-to-talk.
 
 Classifies user speech transcripts into 6 categories via heuristic pattern
-matching.  Runs as a standalone daemon process, listens on a Unix domain
-socket, and returns JSON classification results in <1ms.
+matching with model2vec semantic fallback.  Runs as a standalone daemon
+process, listens on a Unix domain socket, and returns JSON classification
+results in <5ms.
 
 Categories:
     task          - imperative/action requests ("fix the bug", "deploy it")
@@ -23,7 +24,9 @@ import json
 import os
 import re
 import sys
+import threading
 from dataclasses import dataclass, asdict
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +39,7 @@ class ClassifiedInput:
     confidence: float    # 0.0 - 1.0
     original_text: str
     subcategory: str = ""  # e.g. "greeting", "farewell", "frustration"
+    match_type: str = "heuristic"  # "heuristic" or "semantic"
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +137,125 @@ _EMO_SADNESS = re.compile(
 
 
 # ---------------------------------------------------------------------------
+# Trivial input detection
+# ---------------------------------------------------------------------------
+
+TRIVIAL_PATTERNS = frozenset({
+    # Pure affirmatives (no verb, no directive)
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "alright",
+    "right", "correct", "exactly", "mhm", "mm-hm", "mmhm", "uh huh",
+    "cool", "fine", "gotcha", "got it",
+    # Pure negatives
+    "no", "nah", "nope", "not really",
+    # Minimal acknowledgments
+    "ah", "oh", "hm", "hmm", "huh",
+    # Casual affirmations
+    "yeah sure", "okay cool", "sure thing", "sounds good",
+    "yeah okay", "ok cool", "alright cool",
+})
+
+
+def is_trivial(text: str, ai_asked_question: bool = False) -> bool:
+    """Detect trivial backchannel input that needs no filler clip.
+
+    Args:
+        text: User's transcribed speech.
+        ai_asked_question: If True, treat ANY input as real (answer to question).
+    """
+    if ai_asked_question:
+        return False  # Context override: AI asked, user answered
+
+    cleaned = text.strip().lower().rstrip(".!?,")
+
+    # Must be short (<=4 words) to be trivial
+    if len(cleaned.split()) > 4:
+        return False
+
+    # Anything with a question mark is real input
+    if text.strip().endswith("?"):
+        return False
+
+    # If it matches task patterns, it's real input
+    for pat in PATTERNS.get("task", []):
+        if pat.search(cleaned):
+            return False
+
+    # Check against trivial word/phrase list
+    return cleaned in TRIVIAL_PATTERNS
+
+
+# ---------------------------------------------------------------------------
+# Semantic fallback (model2vec)
+# ---------------------------------------------------------------------------
+
+class SemanticFallback:
+    """Semantic similarity classifier using model2vec embeddings.
+
+    Pre-computes embeddings for category exemplar phrases at init time,
+    then classifies new text by cosine similarity against exemplars.
+    """
+
+    def __init__(self, exemplars_path: str):
+        import numpy as np
+        from model2vec import StaticModel
+
+        self._np = np
+        self.model = StaticModel.from_pretrained("minishlab/potion-base-8M")
+
+        # Load exemplar phrases per category
+        with open(exemplars_path) as f:
+            exemplars = json.load(f)
+
+        # Pre-compute embeddings for all exemplars
+        self._category_embeddings: dict[str, "np.ndarray"] = {}
+        for category, phrases in exemplars.items():
+            embeddings = self.model.encode(phrases)  # shape: (N, dim)
+            self._category_embeddings[category] = embeddings
+
+    def classify(self, text: str) -> tuple[str, float]:
+        """Return (category, normalized_confidence) via semantic similarity."""
+        np = self._np
+        text_emb = self.model.encode([text])[0]  # shape: (dim,)
+        text_norm = np.linalg.norm(text_emb)
+
+        best_category = "acknowledgment"
+        best_score = 0.0
+
+        for category, exemplar_embs in self._category_embeddings.items():
+            # Cosine similarity against each exemplar
+            norms = np.linalg.norm(exemplar_embs, axis=1) * text_norm
+            sims = np.dot(exemplar_embs, text_emb) / np.maximum(norms, 1e-8)
+            max_sim = float(np.max(sims))
+
+            if max_sim > best_score:
+                best_score = max_sim
+                best_category = category
+
+        # Normalize cosine similarity to confidence scale
+        # (see 09-RESEARCH.md Pitfall 2: cosine sim != heuristic confidence)
+        confidence = self._normalize_confidence(best_score)
+        return best_category, confidence
+
+    @staticmethod
+    def _normalize_confidence(cosine_sim: float) -> float:
+        """Map cosine similarity to confidence scale comparable with heuristic.
+
+        cosine >= 0.6  -> 0.8-0.9 (high confidence)
+        cosine 0.4-0.6 -> 0.5-0.7 (moderate confidence)
+        cosine < 0.4   -> 0.2-0.4 (low confidence)
+        """
+        if cosine_sim >= 0.6:
+            # Linear map [0.6, 1.0] -> [0.8, 0.9]
+            return 0.8 + min((cosine_sim - 0.6) / 0.4, 1.0) * 0.1
+        elif cosine_sim >= 0.4:
+            # Linear map [0.4, 0.6] -> [0.5, 0.7]
+            return 0.5 + (cosine_sim - 0.4) / 0.2 * 0.2
+        else:
+            # Linear map [0.0, 0.4] -> [0.2, 0.4]
+            return 0.2 + (cosine_sim / 0.4) * 0.2
+
+
+# ---------------------------------------------------------------------------
 # Classification logic
 # ---------------------------------------------------------------------------
 
@@ -157,8 +280,13 @@ def _infer_subcategory(category: str, text: str) -> str:
     return ""
 
 
-def classify(text: str) -> ClassifiedInput:
-    """Classify user input into a category. Returns in <1ms."""
+def classify(text: str, semantic: "SemanticFallback | None" = None) -> ClassifiedInput:
+    """Classify user input into a category.
+
+    Heuristic patterns run first (<1ms). If confident (>=0.5), returns
+    immediately. Otherwise falls back to semantic similarity if available.
+    Higher confidence wins when heuristic and semantic disagree.
+    """
     text_stripped = text.strip()
     if not text_stripped:
         return ClassifiedInput("acknowledgment", 0.3, text_stripped)
@@ -171,7 +299,7 @@ def classify(text: str) -> ClassifiedInput:
         for pat in PATTERNS["acknowledgment"]:
             if pat.search(text_lower):
                 sub = "negative" if re.match(r"^(no|nah|nope|not really)", text_lower) else "affirmative"
-                return ClassifiedInput("acknowledgment", 0.9, text_stripped, sub)
+                return ClassifiedInput("acknowledgment", 0.9, text_stripped, sub, "heuristic")
 
     # Score each category by counting regex matches
     scores: dict[str, int] = {}
@@ -182,21 +310,80 @@ def classify(text: str) -> ClassifiedInput:
 
     if scores:
         best = max(scores, key=scores.get)  # type: ignore[arg-type]
-        confidence = min(0.5 + scores[best] * 0.2, 0.95)
+        top_score = scores[best]
+
+        # Tiebreak: when question and task tie, "could you" / "can you" /
+        # "would you" framing is a polite request -- prefer task.
+        if (
+            scores.get("question", 0) == top_score
+            and scores.get("task", 0) == top_score
+            and re.match(r"^(can you|could you|would you)\b", text_stripped, re.IGNORECASE)
+        ):
+            best = "task"
+
+        confidence = min(0.5 + top_score * 0.2, 0.95)
         subcategory = _infer_subcategory(best, text_stripped)
-        return ClassifiedInput(best, confidence, text_stripped, subcategory)
+        heuristic_result = ClassifiedInput(best, confidence, text_stripped, subcategory, "heuristic")
+
+        # If heuristic is confident enough, return immediately
+        if confidence >= 0.5:
+            return heuristic_result
+
+        # Try semantic fallback if available
+        if semantic is not None:
+            sem_category, sem_confidence = semantic.classify(text_stripped)
+            if sem_confidence > confidence:
+                sem_subcategory = _infer_subcategory(sem_category, text_stripped)
+                return ClassifiedInput(
+                    sem_category, sem_confidence, text_stripped,
+                    sem_subcategory, "semantic",
+                )
+
+        return heuristic_result
+
+    # No heuristic match at all -- try semantic fallback
+    if semantic is not None:
+        sem_category, sem_confidence = semantic.classify(text_stripped)
+        sem_subcategory = _infer_subcategory(sem_category, text_stripped)
+        return ClassifiedInput(
+            sem_category, sem_confidence, text_stripped,
+            sem_subcategory, "semantic",
+        )
 
     # Structural fallback: ends with ? -> question
     if text_stripped.endswith("?"):
-        return ClassifiedInput("question", 0.6, text_stripped)
+        return ClassifiedInput("question", 0.6, text_stripped, "", "heuristic")
 
     # Ultimate default: acknowledgment (safe fallback -- per CONTEXT.md)
-    return ClassifiedInput("acknowledgment", 0.3, text_stripped)
+    return ClassifiedInput("acknowledgment", 0.3, text_stripped, "", "heuristic")
 
 
 # ---------------------------------------------------------------------------
 # Unix socket daemon
 # ---------------------------------------------------------------------------
+
+# Global semantic fallback instance (loaded in background thread)
+_semantic_fallback: "SemanticFallback | None" = None
+_semantic_lock = threading.Lock()
+
+
+def _load_semantic_model(exemplars_path: str):
+    """Load semantic model in background thread. Sets global when ready."""
+    global _semantic_fallback
+    try:
+        sf = SemanticFallback(exemplars_path)
+        with _semantic_lock:
+            _semantic_fallback = sf
+        print("SEMANTIC_READY", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"Semantic model load failed: {e}", file=sys.stderr, flush=True)
+
+
+def _get_semantic() -> "SemanticFallback | None":
+    """Thread-safe access to the semantic fallback instance."""
+    with _semantic_lock:
+        return _semantic_fallback
+
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     """Handle a single classification request over Unix socket."""
@@ -205,8 +392,20 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         if data:
             request = json.loads(data.decode().strip())
             text = request.get("text", "")
-            result = classify(text)
-            response = json.dumps(asdict(result))
+            ai_asked_question = request.get("ai_asked_question", False)
+
+            # Classify with optional semantic fallback
+            semantic = _get_semantic()
+            result = classify(text, semantic=semantic)
+
+            # Detect trivial input
+            trivial = is_trivial(text, ai_asked_question=ai_asked_question)
+
+            # Build response dict
+            response_dict = asdict(result)
+            response_dict["trivial"] = trivial
+
+            response = json.dumps(response_dict)
             writer.write(response.encode() + b"\n")
             await writer.drain()
     except Exception as e:
@@ -215,6 +414,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             "confidence": 0.0,
             "original_text": "",
             "subcategory": "",
+            "match_type": "heuristic",
+            "trivial": False,
             "error": str(e),
         })
         writer.write(error_resp.encode() + b"\n")
@@ -237,8 +438,23 @@ async def run_server(socket_path: str):
         os.unlink(socket_path)
 
     server = await asyncio.start_unix_server(handle_client, socket_path)
-    # Signal readiness to parent process
+    # Signal readiness to parent process (heuristic classification is ready)
     print("CLASSIFIER_READY", flush=True)
+
+    # Load semantic model in background thread (graceful degradation)
+    exemplars_path = str(Path(__file__).parent / "category_exemplars.json")
+    if os.path.exists(exemplars_path):
+        t = threading.Thread(
+            target=_load_semantic_model,
+            args=(exemplars_path,),
+            daemon=True,
+        )
+        t.start()
+    else:
+        print(
+            f"Warning: {exemplars_path} not found, semantic fallback disabled",
+            file=sys.stderr, flush=True,
+        )
 
     async with server:
         await server.serve_forever()
