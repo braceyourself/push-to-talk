@@ -58,7 +58,11 @@ Plans:
   2. User says a trivial input ("yes", "ok", "mhm") and hears natural silence instead of an unnecessary filler
   3. User barges in during a quick response clip and the clip stops cleanly without leaving audio artifacts or confusing the LLM context
   4. Quick response clip transitions smoothly to LLM TTS response with no overlap, gap, or audio glitch
-**Plans**: TBD
+**Plans:** 3 plans
+Plans:
+- [ ] 09-01-PLAN.md -- Semantic fallback + trivial detection in classifier daemon
+- [ ] 09-02-PLAN.md -- StreamComposer class for unified audio queue
+- [ ] 09-03-PLAN.md -- Pipeline integration + end-to-end verification
 
 ### Phase 10: Library Growth + Pruning
 **Goal**: The response library improves automatically across sessions -- new situations get coverage, ineffective clips get phased out
@@ -89,6 +93,6 @@ Phases execute in numeric order: 8 -> 9 -> 10 -> 11
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
 | 8. Core Classification + Response Library | v1.2 | 3/3 | Complete | 2026-02-19 |
-| 9. Semantic Matching + Pipeline Polish | v1.2 | 0/TBD | Not started | - |
+| 9. Semantic Matching + Pipeline Polish | v1.2 | 0/3 | Not started | - |
 | 10. Library Growth + Pruning | v1.2 | 0/TBD | Not started | - |
 | 11. Non-Speech Awareness | v1.2 | 0/TBD | Not started | - |
