@@ -1,0 +1,70 @@
+{
+  "task": [
+    "On it.",
+    "Sure thing.",
+    "Got it.",
+    "Gotcha.",
+    "Let me take a look.",
+    "Working on it.",
+    "One sec.",
+    "Let me check."
+  ],
+  "question": [
+    "Hmm.",
+    "Good question.",
+    "Let me think.",
+    "Hmm, let me think about that.",
+    "Oh, interesting.",
+    "Let me see."
+  ],
+  "conversational": [
+    "Hmm.",
+    "Right.",
+    "Well.",
+    "Oh.",
+    "Yeah.",
+    "Huh."
+  ],
+  "social": [
+    "Hey!",
+    "Hey, what's up.",
+    "Hi.",
+    "See ya.",
+    "Later.",
+    "Of course.",
+    "You bet.",
+    "Anytime."
+  ],
+  "emotional": [
+    "Ugh.",
+    "Nice!",
+    "Wow.",
+    "Aw, thanks.",
+    "Oh no.",
+    "Hell yeah.",
+    "That sucks.",
+    "Ha."
+  ],
+  "acknowledgment": [
+    "Gotcha.",
+    "Sure.",
+    "Mm-hm.",
+    "Right.",
+    "Okay.",
+    "Got it.",
+    "Yep.",
+    "Alright."
+  ],
+  "_emotional_subcategories": {
+    "frustration": ["Ugh.", "That sucks."],
+    "excitement": ["Nice!", "Hell yeah."],
+    "gratitude": ["Aw, thanks."],
+    "sadness": ["Oh no."],
+    "general": ["Wow.", "Ha."]
+  },
+  "_social_subcategories": {
+    "greeting": ["Hey!", "Hey, what's up.", "Hi."],
+    "farewell": ["See ya.", "Later."],
+    "thanks": ["Of course.", "You bet.", "Anytime."]
+  }
+}
