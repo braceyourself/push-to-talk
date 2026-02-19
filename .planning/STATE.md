@@ -5,30 +5,30 @@
 See: .planning/PROJECT.md (updated 2026-02-18)
 
 **Core value:** Natural, low-friction voice conversation with Claude that feels like talking to a person
-**Current focus:** v1.2 Adaptive Quick Responses -- Phase 8 in progress
+**Current focus:** v1.2 Adaptive Quick Responses -- Phase 8 complete, ready for Phase 9
 
 ## Current Position
 
 Milestone: v1.2 Adaptive Quick Responses
 Phase: 8 of 11 (Core Classification + Response Library)
-Plan: 2 of 3 complete
-Status: In progress
-Last activity: 2026-02-19 -- Completed 08-02-PLAN.md
+Plan: 3 of 3 complete
+Status: Phase complete
+Last activity: 2026-02-19 -- Completed 08-03-PLAN.md (human-verified)
 
-Progress: [#####                         ] 17% (2/12 plans estimated)
+Progress: [########                      ] 25% (1/4 phases)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 2 (this milestone)
-- Average duration: 3.5min
-- Total execution time: 7min
+- Total plans completed: 3 (this milestone)
+- Average duration: 3.3min
+- Total execution time: 10min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 8 | 2/3 | 7min | 3.5min |
+| 8 | 3/3 | 10min | 3.3min |
 
 *Updated after each plan completion*
 
@@ -63,9 +63,14 @@ v1.2 execution decisions (08-02):
 - Relaxed silence threshold (0.7) for short clips (<1s) to account for Piper padding
 - Subcategory metadata as underscore-prefixed maps in seed_phrases.json
 
+v1.2 execution decisions (08-03):
+- Classification before 500ms gate (time absorbed into wait, no added latency)
+- Confidence < 0.4 falls back to acknowledgment category
+- Response library clips resampled 22050->24000Hz for playback compatibility
+
 ### Pending Todos
 
-None.
+- Assistant tool creation feature (user idea captured during Phase 8 execution)
 
 ### Blockers/Concerns
 
@@ -74,5 +79,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-19
-Stopped at: Completed 08-02-PLAN.md
+Stopped at: Phase 8 complete, ready for Phase 9
 Resume file: None

@@ -9,16 +9,16 @@ Requirements for v1.2 Adaptive Quick Responses milestone.
 
 ### Classification
 
-- [ ] **CLAS-01**: System classifies STT output into coarse categories (question, command, agreement, emotional, greeting, farewell) via heuristic pattern matching in under 1ms
+- [x] **CLAS-01**: System classifies STT output into coarse categories (question, command, agreement, emotional, greeting, farewell) via heuristic pattern matching in under 1ms
 - [ ] **CLAS-02**: Semantic similarity matching via model2vec serves as fallback when heuristic classifier produces no confident match
 - [ ] **CLAS-03**: Short or trivial inputs receive silence-as-response (natural pause) instead of a filler clip
 
 ### Response Library
 
-- [ ] **RLIB-01**: Response library stores situation-to-audio-clip mappings organized by input category
-- [ ] **RLIB-02**: Seed library ships with 30-40 pre-generated Piper TTS clips across all categories, available on first use
-- [ ] **RLIB-03**: Category-aware filler selection replaces random clip selection in `_filler_manager()`
-- [ ] **RLIB-04**: Each clip tracks usage count and contextual accuracy metrics for pruning decisions
+- [x] **RLIB-01**: Response library stores situation-to-audio-clip mappings organized by input category
+- [x] **RLIB-02**: Seed library ships with 30-40 pre-generated Piper TTS clips across all categories, available on first use
+- [x] **RLIB-03**: Category-aware filler selection replaces random clip selection in `_filler_manager()`
+- [x] **RLIB-04**: Each clip tracks usage count and contextual accuracy metrics for pruning decisions
 
 ### Non-Speech Awareness
 
@@ -28,7 +28,7 @@ Requirements for v1.2 Adaptive Quick Responses milestone.
 
 ### Pipeline Integration
 
-- [ ] **PIPE-01**: Classification and response selection complete within existing 500ms filler gate with no added perceptible latency
+- [x] **PIPE-01**: Classification and response selection complete within existing 500ms filler gate with no added perceptible latency
 - [ ] **PIPE-02**: Quick response clips integrate with barge-in system via sentence tracking awareness
 - [ ] **PIPE-03**: Playback handles collision-free transition from quick response clip to full LLM TTS response (sink-side frame draining)
 
@@ -67,17 +67,17 @@ Deferred to future milestones.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CLAS-01 | Phase 8 | Pending |
+| CLAS-01 | Phase 8 | Complete |
 | CLAS-02 | Phase 9 | Pending |
 | CLAS-03 | Phase 9 | Pending |
-| RLIB-01 | Phase 8 | Pending |
-| RLIB-02 | Phase 8 | Pending |
-| RLIB-03 | Phase 8 | Pending |
-| RLIB-04 | Phase 8 | Pending |
+| RLIB-01 | Phase 8 | Complete |
+| RLIB-02 | Phase 8 | Complete |
+| RLIB-03 | Phase 8 | Complete |
+| RLIB-04 | Phase 8 | Complete |
 | NSPC-01 | Phase 11 | Pending |
 | NSPC-02 | Phase 11 | Pending |
 | NSPC-03 | Phase 11 | Pending |
-| PIPE-01 | Phase 8 | Pending |
+| PIPE-01 | Phase 8 | Complete |
 | PIPE-02 | Phase 9 | Pending |
 | PIPE-03 | Phase 9 | Pending |
 | LMGT-01 | Phase 10 | Pending |
@@ -91,4 +91,4 @@ Deferred to future milestones.
 
 ---
 *Requirements defined: 2026-02-18*
-*Last updated: 2026-02-18 after roadmap creation*
+*Last updated: 2026-02-19 after Phase 8 completion*

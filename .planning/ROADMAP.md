@@ -26,7 +26,7 @@ See MILESTONES.md for details.
 
 **Milestone Goal:** Replace random filler selection with an AI-driven quick response library that understands context, learns across sessions, and responds to non-speech events.
 
-- [ ] **Phase 8: Core Classification + Response Library** - Heuristic classifier and categorized clip library replace random filler selection
+- [x] **Phase 8: Core Classification + Response Library** - Heuristic classifier and categorized clip library replace random filler selection
 - [ ] **Phase 9: Semantic Matching + Pipeline Polish** - model2vec fallback improves accuracy; barge-in and clip-to-LLM transitions work seamlessly
 - [ ] **Phase 10: Library Growth + Pruning** - Curator daemon expands and refines the library after each session
 - [ ] **Phase 11: Non-Speech Awareness** - Coughs, sighs, and laughter get contextual responses instead of silence
@@ -45,9 +45,9 @@ See MILESTONES.md for details.
   5. If classification fails or confidence is low, user hears a generic acknowledgment (never silence, never a wrong-category clip)
 **Plans:** 3 plans
 Plans:
-- [ ] 08-01-PLAN.md -- Classifier daemon + response library modules
-- [ ] 08-02-PLAN.md -- Seed phrase list + clip generation
-- [ ] 08-03-PLAN.md -- Pipeline integration + end-to-end verification
+- [x] 08-01-PLAN.md -- Classifier daemon + response library modules
+- [x] 08-02-PLAN.md -- Seed phrase list + clip generation
+- [x] 08-03-PLAN.md -- Pipeline integration + end-to-end verification
 
 ### Phase 9: Semantic Matching + Pipeline Polish
 **Goal**: Classification handles paraphrased and ambiguous inputs gracefully, quick response clips integrate cleanly with barge-in and LLM playback transitions
@@ -88,7 +88,7 @@ Phases execute in numeric order: 8 -> 9 -> 10 -> 11
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
-| 8. Core Classification + Response Library | v1.2 | 0/3 | Planning complete | - |
+| 8. Core Classification + Response Library | v1.2 | 3/3 | Complete | 2026-02-19 |
 | 9. Semantic Matching + Pipeline Polish | v1.2 | 0/TBD | Not started | - |
 | 10. Library Growth + Pruning | v1.2 | 0/TBD | Not started | - |
 | 11. Non-Speech Awareness | v1.2 | 0/TBD | Not started | - |
