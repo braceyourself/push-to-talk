@@ -22,6 +22,7 @@ from collections import deque
 from pathlib import Path
 
 from pipeline_frames import PipelineFrame, FrameType
+from response_library import ResponseLibrary
 from task_manager import TaskManager, ClaudeTask, TaskStatus
 
 # Audio settings
@@ -145,6 +146,12 @@ class LiveSession:
         self._ack_cancel = None    # asyncio.Event to cancel acknowledgment playback
         if self.fillers_enabled:
             self._load_filler_clips()
+
+        # Response library (replaces random filler selection)
+        self._response_library = ResponseLibrary()
+        self._classifier_process = None
+        self._classifier_socket_path = None
+        self._seed_process = None
 
         # Barge-in (VAD) system
         self.barge_in_enabled = barge_in_enabled
@@ -271,6 +278,92 @@ class LiveSession:
             print(f"Live session: Clip factory spawned (PID {self._clip_factory_process.pid})", flush=True)
         except Exception as e:
             print(f"Live session: Failed to spawn clip factory: {e}", flush=True)
+
+    # ── Classifier Daemon + Response Library ─────────────────────────
+
+    def _spawn_classifier(self):
+        """Spawn the classifier daemon process."""
+        self._classifier_socket_path = f"/tmp/ptt-classifier-{os.getpid()}.sock"
+        if os.path.exists(self._classifier_socket_path):
+            os.unlink(self._classifier_socket_path)
+
+        classifier_script = Path(__file__).parent / "input_classifier.py"
+        if not classifier_script.exists():
+            print("Live session: input_classifier.py not found, skipping", flush=True)
+            return
+
+        cmd = [sys.executable, str(classifier_script), self._classifier_socket_path]
+        try:
+            self._classifier_process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+            # Wait for readiness signal (up to 3 seconds)
+            import select
+            ready_fds, _, _ = select.select([self._classifier_process.stdout], [], [], 3.0)
+            if ready_fds:
+                line = self._classifier_process.stdout.readline().decode().strip()
+                if "CLASSIFIER_READY" in line:
+                    print(f"Live session: Classifier spawned (PID {self._classifier_process.pid})", flush=True)
+                else:
+                    print(f"Live session: Classifier unexpected output: {line}", flush=True)
+            else:
+                print("Live session: Classifier readiness timeout (3s), continuing", flush=True)
+        except Exception as e:
+            print(f"Live session: Failed to spawn classifier: {e}", flush=True)
+            self._classifier_process = None
+
+    async def _classify_input(self, text: str) -> dict:
+        """Send text to classifier daemon, get classification result."""
+        if not self._classifier_socket_path:
+            return {"category": "acknowledgment", "confidence": 0.0}
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(self._classifier_socket_path),
+                timeout=0.1
+            )
+            request = json.dumps({"text": text}) + "\n"
+            writer.write(request.encode())
+            await writer.drain()
+            response = await asyncio.wait_for(reader.readline(), timeout=0.1)
+            writer.close()
+            return json.loads(response.decode().strip())
+        except Exception as e:
+            print(f"  [classifier] IPC error: {e}", flush=True)
+            return {"category": "acknowledgment", "confidence": 0.0}
+
+    def _load_response_library(self):
+        """Load the categorized response library. Falls back to existing ack clips if not available."""
+        self._response_library.load()
+        if self._response_library.is_loaded():
+            print(f"Live session: Response library loaded", flush=True)
+        else:
+            print("Live session: Response library empty, will use ack clip fallback", flush=True)
+
+    def _ensure_seed_library(self):
+        """Check if response library needs seed generation. Run in background if needed."""
+        from response_library import LIBRARY_META
+        if LIBRARY_META.exists():
+            return  # Already seeded
+
+        seed_phrases = Path(__file__).parent / "seed_phrases.json"
+        if not seed_phrases.exists():
+            return  # No seed phrases available
+
+        factory_script = Path(__file__).parent / "clip_factory.py"
+        if not factory_script.exists():
+            return
+
+        print("Live session: Seed library not found, generating in background...", flush=True)
+        cmd = [sys.executable, str(factory_script), "--seed-responses"]
+        try:
+            self._seed_process = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+            print(f"Live session: Seed generation started (PID {self._seed_process.pid})", flush=True)
+        except Exception as e:
+            print(f"Live session: Failed to start seed generation: {e}", flush=True)
 
     # ── Task tools (reused unchanged) ──────────────────────────────
 
@@ -557,8 +650,43 @@ class LiveSession:
         return clips[idx]
 
     async def _filler_manager(self, user_text: str, cancel_event: asyncio.Event):
-        """Play an acknowledgment clip while waiting for LLM response."""
-        # Wait 500ms gate — skip if LLM responds fast
+        """Play a context-appropriate quick response while waiting for LLM."""
+        # Hot-reload response library if seed generation completed
+        if not self._response_library.is_loaded():
+            from response_library import LIBRARY_META
+            if LIBRARY_META.exists():
+                self._load_response_library()
+
+        # Step 1: Classify via daemon IPC (<5ms)
+        classification = await self._classify_input(user_text)
+        category = classification.get("category", "acknowledgment")
+        confidence = classification.get("confidence", 0.0)
+        subcategory = classification.get("subcategory", "")
+
+        # Step 2: Low confidence -> fall back to acknowledgment
+        if confidence < 0.4:
+            category = "acknowledgment"
+
+        # Step 3: Lookup clip from response library
+        response = None
+        clip_pcm = None
+        if self._response_library.is_loaded():
+            response = self._response_library.lookup(category, subcategory=subcategory)
+            if response:
+                clip_pcm = self._response_library.get_clip_pcm(response.id)
+
+        # Step 4: Log classification trace
+        self._log_event("classification",
+            input_text=user_text,
+            category=category,
+            confidence=confidence,
+            subcategory=subcategory,
+            clip_id=response.id if response else None,
+            clip_phrase=response.phrase if response else None,
+            fallback_used=response is None,
+        )
+
+        # Step 5: Gate -- skip if LLM responds fast (500ms)
         try:
             await asyncio.wait_for(cancel_event.wait(), timeout=0.5)
             return
@@ -568,7 +696,16 @@ class LiveSession:
         if cancel_event.is_set():
             return
 
-        # Play an acknowledgment clip
+        # Step 6: Play clip from response library
+        if clip_pcm:
+            clip_pcm = self._resample_22050_to_24000(clip_pcm)
+            await self._play_filler_audio(clip_pcm, cancel_event)
+            if response:
+                barged = cancel_event.is_set()
+                self._response_library.record_usage(response.id, barged_in=barged)
+            return
+
+        # Step 7: Ultimate fallback -- existing random ack clip (old system)
         clip = self._pick_filler("acknowledgment")
         if clip:
             await self._play_filler_audio(clip, cancel_event)
@@ -1903,6 +2040,9 @@ class LiveSession:
         active_file.write_text(str(self._session_log_path))
         self._spawn_learner()
         self._spawn_clip_factory()
+        self._spawn_classifier()
+        self._ensure_seed_library()
+        self._load_response_library()
 
         # Load VAD model once at startup (used by STT stage for barge-in)
         if self.barge_in_enabled:
@@ -1968,6 +2108,37 @@ class LiveSession:
                         except Exception:
                             pass
                     print(f"Live session: {name} stopped", flush=True)
+
+            # Kill classifier daemon
+            if self._classifier_process:
+                try:
+                    self._classifier_process.terminate()
+                    self._classifier_process.wait(timeout=3)
+                except Exception:
+                    try:
+                        self._classifier_process.kill()
+                    except Exception:
+                        pass
+                print("Live session: classifier stopped", flush=True)
+            if self._classifier_socket_path and os.path.exists(self._classifier_socket_path):
+                try:
+                    os.unlink(self._classifier_socket_path)
+                except Exception:
+                    pass
+
+            # Kill seed generation if still running
+            if self._seed_process and self._seed_process.poll() is None:
+                try:
+                    self._seed_process.terminate()
+                except Exception:
+                    pass
+
+            # Save response library usage data
+            if self._response_library.is_loaded():
+                try:
+                    self._response_library.save()
+                except Exception as e:
+                    print(f"Live session: Failed to save response library: {e}", flush=True)
 
             print("Live session: Pipeline stopped", flush=True)
 
