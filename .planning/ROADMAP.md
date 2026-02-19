@@ -60,8 +60,8 @@ Plans:
   4. Quick response clip transitions smoothly to LLM TTS response with no overlap, gap, or audio glitch
 **Plans:** 3 plans
 Plans:
-- [ ] 09-01-PLAN.md -- Semantic fallback + trivial detection in classifier daemon
-- [ ] 09-02-PLAN.md -- StreamComposer class for unified audio queue
+- [x] 09-01-PLAN.md -- Semantic fallback + trivial detection in classifier daemon
+- [x] 09-02-PLAN.md -- StreamComposer class for unified audio queue
 - [ ] 09-03-PLAN.md -- Pipeline integration + end-to-end verification
 
 ### Phase 10: Library Growth + Pruning

@@ -11,25 +11,25 @@ See: .planning/PROJECT.md (updated 2026-02-18)
 
 Milestone: v1.2 Adaptive Quick Responses
 Phase: 9 of 11 (Semantic Matching + Pipeline Polish)
-Plan: 1 of 3 in current phase
+Plan: 2 of 3 in current phase
 Status: In progress
-Last activity: 2026-02-19 -- Completed 09-01-PLAN.md
+Last activity: 2026-02-19 -- Completed 09-02-PLAN.md
 
-Progress: [##########                    ] 33% (4/12 plans)
+Progress: [############                  ] 42% (5/12 plans)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4 (this milestone)
-- Average duration: 3.5min
-- Total execution time: 14min
+- Total plans completed: 5 (this milestone)
+- Average duration: 3.6min
+- Total execution time: 18min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 8 | 3/3 | 10min | 3.3min |
-| 9 | 1/3 | 4min | 4min |
+| 9 | 2/3 | 8min | 4min |
 
 *Updated after each plan completion*
 
@@ -75,6 +75,11 @@ v1.2 execution decisions (09-01):
 - CLASSIFIER_READY before semantic model loads (background thread graceful degradation)
 - TRIVIAL_PATTERNS as frozenset for O(1) lookup
 
+v1.2 execution decisions (09-02):
+- Lookahead buffer for FIFO-safe queue peek (asyncio.Queue lacks put-front)
+- Silence emitted as TTS_AUDIO frames for playback stage compatibility
+- Synchronous pause() for instant barge-in response (no await)
+
 ### Pending Todos
 
 - Assistant tool creation feature (user idea captured during Phase 8 execution)
@@ -86,5 +91,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-19
-Stopped at: Completed 09-01-PLAN.md
+Stopped at: Completed 09-02-PLAN.md
 Resume file: None
