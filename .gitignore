@@ -4,6 +4,7 @@ __pycache__/
 status
 *.wav
 !audio/fillers/**/*.wav
+!audio/responses/**/*.wav
 config.json
 CLAUDE.md
 piper-voices/

@@ -18,6 +18,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import random
 import subprocess
 import time
@@ -58,6 +59,12 @@ ACKNOWLEDGMENT_PROMPTS = [
     "One moment.",
     "Let me take a look.",
 ]
+
+# Seed response library
+RESPONSES_DIR = Path(__file__).parent / "audio" / "responses"
+RESPONSES_META = RESPONSES_DIR / "library.json"
+SEED_PHRASES_PATH = Path(__file__).parent / "seed_phrases.json"
+SEED_CATEGORIES = ["task", "question", "conversational", "social", "emotional", "acknowledgment"]
 
 # Maximum consecutive generation failures before giving up
 MAX_CONSECUTIVE_FAILURES = 20
@@ -142,11 +149,15 @@ def evaluate_clip(pcm_data: bytes, category: str = "acknowledgment") -> dict:
     clipping_ratio = float(np.sum(np.abs(samples) >= 32000) / n)
     silence_ratio = float(np.sum(np.abs(samples) < 500) / n)
 
+    # Short clips (< 1s) have proportionally more Piper start/end padding,
+    # so relax silence threshold for them. RMS check ensures real audio content.
+    silence_threshold = 0.7 if duration < 1.0 else 0.5
+
     passes = (
         0.3 <= duration <= 4.0    # Full phrases
         and rms > 200             # Phrases may be quieter than hums
         and clipping_ratio < 0.01
-        and silence_ratio < 0.5   # Less silence tolerance
+        and silence_ratio < silence_threshold
     )
 
     return {
@@ -317,6 +328,103 @@ def top_up_ack_pool() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Seed response library generation
+# ---------------------------------------------------------------------------
+
+def _infer_subcategory(category: str, phrase: str, seed_data: dict) -> str:
+    """Determine subcategory for a phrase based on seed_phrases.json metadata."""
+    subcategory_map = seed_data.get(f"_{category}_subcategories", {})
+    for subcat, phrases in subcategory_map.items():
+        if phrase in phrases:
+            return subcat
+    return ""
+
+
+def generate_seed_responses() -> None:
+    """Generate seed response clips from seed_phrases.json.
+
+    Creates audio/responses/{category}/ directories with WAV clips and writes
+    a library.json index in the ResponseLibrary-compatible format.
+
+    Uses Piper defaults (length_scale=1.0, noise_w=0.667, noise_scale=0.667)
+    to match live TTS quality -- no randomized parameters.
+    """
+    if not SEED_PHRASES_PATH.exists():
+        log.error("seed_phrases.json not found at %s", SEED_PHRASES_PATH)
+        return
+
+    seed_data = json.loads(SEED_PHRASES_PATH.read_text())
+    entries = []
+    total_generated = 0
+    total_failed = 0
+    categories_populated = 0
+
+    for category in SEED_CATEGORIES:
+        phrases = seed_data.get(category, [])
+        if not phrases:
+            log.warning("No phrases for category %r in seed_phrases.json", category)
+            continue
+
+        cat_dir = RESPONSES_DIR / category
+        cat_dir.mkdir(parents=True, exist_ok=True)
+        existing_filenames = {p.name for p in cat_dir.glob("*.wav")}
+        cat_count = 0
+
+        for phrase in phrases:
+            # Use Piper defaults -- match live TTS quality (pitfall 4)
+            pcm = generate_clip(phrase, length_scale=1.0, noise_w=0.667, noise_scale=0.667)
+            if pcm is None:
+                log.warning("Seed generation failed for %r (%s)", phrase, category)
+                total_failed += 1
+                continue
+
+            scores = evaluate_clip(pcm, category=category)
+            if not scores["pass"]:
+                log.warning(
+                    "Seed clip rejected (%s): %r (dur=%.2fs rms=%.0f clip=%.4f sil=%.3f)",
+                    category, phrase, scores["duration"], scores["rms"],
+                    scores["clipping_ratio"], scores["silence_ratio"],
+                )
+                total_failed += 1
+                continue
+
+            filename = _next_filename(phrase, existing_filenames)
+            save_clip_to(pcm, filename, cat_dir)
+            existing_filenames.add(filename)
+
+            subcategory = _infer_subcategory(category, phrase, seed_data)
+            entry_id = f"{category}_{filename.replace('.wav', '')}"
+
+            entries.append({
+                "id": entry_id,
+                "category": category,
+                "subcategory": subcategory,
+                "phrase": phrase,
+                "filename": filename,
+                "use_count": 0,
+                "barge_in_count": 0,
+                "last_used": 0.0,
+            })
+            cat_count += 1
+            log.info("Seed saved (%s): %s [%s]", category, filename,
+                     subcategory or "no-subcat")
+
+        if cat_count > 0:
+            categories_populated += 1
+        total_generated += cat_count
+
+    # Write library.json atomically (temp file + os.rename)
+    RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
+    meta = {"version": 1, "entries": entries}
+    tmp = RESPONSES_META.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(meta, indent=2) + "\n")
+    os.rename(str(tmp), str(RESPONSES_META))
+
+    print(f"Seed generation: {total_generated} clips across {categories_populated} categories"
+          f" ({total_failed} failed)", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Daemon mode
 # ---------------------------------------------------------------------------
 
@@ -339,6 +447,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Acknowledgment clip factory")
     parser.add_argument("--daemon", action="store_true", help="Run in daemon mode (periodic top-up)")
     parser.add_argument("--interval", type=int, default=300, help="Daemon check interval in seconds (default: 300)")
+    parser.add_argument("--seed-responses", action="store_true", help="Generate seed response library clips")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -347,7 +456,9 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    if args.daemon:
+    if args.seed_responses:
+        generate_seed_responses()
+    elif args.daemon:
         try:
             daemon_mode(check_interval=args.interval)
         except KeyboardInterrupt:

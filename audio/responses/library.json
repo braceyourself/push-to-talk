@@ -1,0 +1,425 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "task_on_it_001",
+      "category": "task",
+      "subcategory": "",
+      "phrase": "On it.",
+      "filename": "on_it_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "task_sure_thing_001",
+      "category": "task",
+      "subcategory": "",
+      "phrase": "Sure thing.",
+      "filename": "sure_thing_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "task_got_it_001",
+      "category": "task",
+      "subcategory": "",
+      "phrase": "Got it.",
+      "filename": "got_it_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "task_gotcha_001",
+      "category": "task",
+      "subcategory": "",
+      "phrase": "Gotcha.",
+      "filename": "gotcha_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "task_let_me_take_a_look_001",
+      "category": "task",
+      "subcategory": "",
+      "phrase": "Let me take a look.",
+      "filename": "let_me_take_a_look_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "task_working_on_it_001",
+      "category": "task",
+      "subcategory": "",
+      "phrase": "Working on it.",
+      "filename": "working_on_it_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "task_one_sec_001",
+      "category": "task",
+      "subcategory": "",
+      "phrase": "One sec.",
+      "filename": "one_sec_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "task_let_me_check_001",
+      "category": "task",
+      "subcategory": "",
+      "phrase": "Let me check.",
+      "filename": "let_me_check_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "question_hmm_001",
+      "category": "question",
+      "subcategory": "",
+      "phrase": "Hmm.",
+      "filename": "hmm_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "question_good_question_001",
+      "category": "question",
+      "subcategory": "",
+      "phrase": "Good question.",
+      "filename": "good_question_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "question_let_me_think_001",
+      "category": "question",
+      "subcategory": "",
+      "phrase": "Let me think.",
+      "filename": "let_me_think_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "question_oh,_interesting_001",
+      "category": "question",
+      "subcategory": "",
+      "phrase": "Oh, interesting.",
+      "filename": "oh,_interesting_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "question_let_me_see_001",
+      "category": "question",
+      "subcategory": "",
+      "phrase": "Let me see.",
+      "filename": "let_me_see_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "conversational_hmm_001",
+      "category": "conversational",
+      "subcategory": "",
+      "phrase": "Hmm.",
+      "filename": "hmm_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "conversational_right_001",
+      "category": "conversational",
+      "subcategory": "",
+      "phrase": "Right.",
+      "filename": "right_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "conversational_well_001",
+      "category": "conversational",
+      "subcategory": "",
+      "phrase": "Well.",
+      "filename": "well_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "conversational_oh_001",
+      "category": "conversational",
+      "subcategory": "",
+      "phrase": "Oh.",
+      "filename": "oh_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "conversational_yeah_001",
+      "category": "conversational",
+      "subcategory": "",
+      "phrase": "Yeah.",
+      "filename": "yeah_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "conversational_huh_001",
+      "category": "conversational",
+      "subcategory": "",
+      "phrase": "Huh.",
+      "filename": "huh_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "social_hey!_001",
+      "category": "social",
+      "subcategory": "greeting",
+      "phrase": "Hey!",
+      "filename": "hey!_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "social_hi_001",
+      "category": "social",
+      "subcategory": "greeting",
+      "phrase": "Hi.",
+      "filename": "hi_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "social_see_ya_001",
+      "category": "social",
+      "subcategory": "farewell",
+      "phrase": "See ya.",
+      "filename": "see_ya_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "social_later_001",
+      "category": "social",
+      "subcategory": "farewell",
+      "phrase": "Later.",
+      "filename": "later_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "social_of_course_001",
+      "category": "social",
+      "subcategory": "thanks",
+      "phrase": "Of course.",
+      "filename": "of_course_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "social_you_bet_001",
+      "category": "social",
+      "subcategory": "thanks",
+      "phrase": "You bet.",
+      "filename": "you_bet_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "social_anytime_001",
+      "category": "social",
+      "subcategory": "thanks",
+      "phrase": "Anytime.",
+      "filename": "anytime_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "emotional_ugh_001",
+      "category": "emotional",
+      "subcategory": "frustration",
+      "phrase": "Ugh.",
+      "filename": "ugh_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "emotional_nice!_001",
+      "category": "emotional",
+      "subcategory": "excitement",
+      "phrase": "Nice!",
+      "filename": "nice!_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "emotional_wow_001",
+      "category": "emotional",
+      "subcategory": "general",
+      "phrase": "Wow.",
+      "filename": "wow_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "emotional_aw,_thanks_001",
+      "category": "emotional",
+      "subcategory": "gratitude",
+      "phrase": "Aw, thanks.",
+      "filename": "aw,_thanks_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "emotional_oh_no_001",
+      "category": "emotional",
+      "subcategory": "sadness",
+      "phrase": "Oh no.",
+      "filename": "oh_no_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "emotional_hell_yeah_001",
+      "category": "emotional",
+      "subcategory": "excitement",
+      "phrase": "Hell yeah.",
+      "filename": "hell_yeah_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "emotional_that_sucks_001",
+      "category": "emotional",
+      "subcategory": "frustration",
+      "phrase": "That sucks.",
+      "filename": "that_sucks_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "emotional_ha_001",
+      "category": "emotional",
+      "subcategory": "general",
+      "phrase": "Ha.",
+      "filename": "ha_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "acknowledgment_gotcha_001",
+      "category": "acknowledgment",
+      "subcategory": "",
+      "phrase": "Gotcha.",
+      "filename": "gotcha_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "acknowledgment_sure_001",
+      "category": "acknowledgment",
+      "subcategory": "",
+      "phrase": "Sure.",
+      "filename": "sure_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "acknowledgment_mm-hm_001",
+      "category": "acknowledgment",
+      "subcategory": "",
+      "phrase": "Mm-hm.",
+      "filename": "mm-hm_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "acknowledgment_right_001",
+      "category": "acknowledgment",
+      "subcategory": "",
+      "phrase": "Right.",
+      "filename": "right_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "acknowledgment_okay_001",
+      "category": "acknowledgment",
+      "subcategory": "",
+      "phrase": "Okay.",
+      "filename": "okay_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "acknowledgment_got_it_001",
+      "category": "acknowledgment",
+      "subcategory": "",
+      "phrase": "Got it.",
+      "filename": "got_it_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "acknowledgment_yep_001",
+      "category": "acknowledgment",
+      "subcategory": "",
+      "phrase": "Yep.",
+      "filename": "yep_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "acknowledgment_alright_001",
+      "category": "acknowledgment",
+      "subcategory": "",
+      "phrase": "Alright.",
+      "filename": "alright_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    }
+  ]
+}
