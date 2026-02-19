@@ -16,6 +16,7 @@ class FrameType(Enum):
     END_OF_UTTERANCE = auto() # STT detected end of user speech
     FILLER = auto()           # Filler audio (acknowledgment/thinking)
     BARGE_IN = auto()         # Barge-in signal (user interrupted AI)
+    SENTENCE_DONE = auto()    # TTS sentence boundary marker
     CONTROL = auto()          # Control signals (stop, interrupt, etc.)
 
 
