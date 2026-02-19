@@ -43,7 +43,11 @@ See MILESTONES.md for details.
   3. System launches with a working seed library of 30-40 clips across all categories on first use
   4. Classification completes within the existing 500ms filler gate with no perceptible added latency
   5. If classification fails or confidence is low, user hears a generic acknowledgment (never silence, never a wrong-category clip)
-**Plans**: TBD
+**Plans:** 3 plans
+Plans:
+- [ ] 08-01-PLAN.md -- Classifier daemon + response library modules
+- [ ] 08-02-PLAN.md -- Seed phrase list + clip generation
+- [ ] 08-03-PLAN.md -- Pipeline integration + end-to-end verification
 
 ### Phase 9: Semantic Matching + Pipeline Polish
 **Goal**: Classification handles paraphrased and ambiguous inputs gracefully, quick response clips integrate cleanly with barge-in and LLM playback transitions
@@ -84,7 +88,7 @@ Phases execute in numeric order: 8 -> 9 -> 10 -> 11
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
-| 8. Core Classification + Response Library | v1.2 | 0/TBD | Not started | - |
+| 8. Core Classification + Response Library | v1.2 | 0/3 | Planning complete | - |
 | 9. Semantic Matching + Pipeline Polish | v1.2 | 0/TBD | Not started | - |
 | 10. Library Growth + Pruning | v1.2 | 0/TBD | Not started | - |
 | 11. Non-Speech Awareness | v1.2 | 0/TBD | Not started | - |
