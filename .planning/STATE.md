@@ -11,24 +11,24 @@ See: .planning/PROJECT.md (updated 2026-02-18)
 
 Milestone: v1.2 Adaptive Quick Responses
 Phase: 8 of 11 (Core Classification + Response Library)
-Plan: 1 of 3 complete
+Plan: 2 of 3 complete
 Status: In progress
-Last activity: 2026-02-19 -- Completed 08-01-PLAN.md
+Last activity: 2026-02-19 -- Completed 08-02-PLAN.md
 
-Progress: [##                            ] 8% (1/12 plans estimated)
+Progress: [#####                         ] 17% (2/12 plans estimated)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 1 (this milestone)
-- Average duration: 4min
-- Total execution time: 4min
+- Total plans completed: 2 (this milestone)
+- Average duration: 3.5min
+- Total execution time: 7min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 8 | 1/3 | 4min | 4min |
+| 8 | 2/3 | 7min | 3.5min |
 
 *Updated after each plan completion*
 
@@ -58,6 +58,11 @@ v1.2 execution decisions (08-01):
 - Acknowledgment patterns use anchored regex to only match full-text acknowledgments
 - Classifier daemon uses CLASSIFIER_READY stdout signal for readiness synchronization
 
+v1.2 execution decisions (08-02):
+- Piper defaults for seed clips (not randomized) to match live TTS voice quality
+- Relaxed silence threshold (0.7) for short clips (<1s) to account for Piper padding
+- Subcategory metadata as underscore-prefixed maps in seed_phrases.json
+
 ### Pending Todos
 
 None.
@@ -69,5 +74,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-19
-Stopped at: Completed 08-01-PLAN.md
+Stopped at: Completed 08-02-PLAN.md
 Resume file: None
