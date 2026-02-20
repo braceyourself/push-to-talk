@@ -184,6 +184,9 @@ class LiveSession:
         self._barge_in_annotation = None    # Annotation prepended to next user message
         self._post_barge_in = False         # Shortened silence after barge-in
 
+        # CLI response reader task — tracked so barge-in can cancel it
+        self._response_reader_task = None
+
         # Circuit breakers for service fallback
         self._stt_breaker = CircuitBreaker("STT/Deepgram")
         self._tts_breaker = CircuitBreaker("TTS/OpenAI")
@@ -616,14 +619,19 @@ class LiveSession:
     def _on_idle_timeout(self):
         print(f"Live session: Idle timeout ({self._idle_timeout}s), disconnecting", flush=True)
         self.running = False
+        if self._composer:
+            self._composer.stop()
 
     # ── Mic mute/unmute ────────────────────────────────────────────
 
     def _mute_mic(self):
-        subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '1'], capture_output=True)
+        # No-op: mic stays physically live so VAD can detect barge-in speech.
+        # _stt_gated prevents transcription during playback.
+        pass
 
     def _unmute_mic(self):
-        subprocess.run(['pactl', 'set-source-mute', '@DEFAULT_SOURCE@', '0'], capture_output=True)
+        # No-op: mic is never physically muted.
+        pass
 
     # ── Filler System ────────────────────────────────────────────────
 
@@ -743,8 +751,12 @@ class LiveSession:
         # Step 7: Play clip via composer (or direct if composer not available)
         if clip_pcm:
             clip_pcm = self._resample_22050_to_24000(clip_pcm)
+            # Mark social fillers as sufficient — composer will suppress LLM TTS
+            meta = {"sufficient": True} if category == "social" else {}
             if self._composer:
-                await self._composer.enqueue(AudioSegment(SegmentType.FILLER_CLIP, data=clip_pcm))
+                await self._composer.enqueue(
+                    AudioSegment(SegmentType.FILLER_CLIP, data=clip_pcm, metadata=meta)
+                )
             else:
                 await self._play_filler_audio(clip_pcm, cancel_event)
             if response:
@@ -847,12 +859,13 @@ class LiveSession:
                 str(model_path),
                 providers=['CPUExecutionProvider']
             )
-            # Initialize VAD state: h and c tensors (2, 1, 64)
+            # Initialize VAD state: Silero VAD v5 uses single 'state' tensor [2, 1, 128]
+            # and requires a 64-sample context prepended to each 512-sample input
             import numpy as np
             self._vad_state = {
-                'h': np.zeros((2, 1, 64), dtype=np.float32),
-                'c': np.zeros((2, 1, 64), dtype=np.float32),
-                'sr': np.array([SAMPLE_RATE], dtype=np.int64)
+                'state': np.zeros((2, 1, 128), dtype=np.float32),
+                'sr': np.array(16000, dtype=np.int64),  # scalar; always 16kHz after resample
+                'context': np.zeros(64, dtype=np.float32),  # 64-sample context for continuity
             }
             print("Live session: Silero VAD loaded", flush=True)
         except Exception as e:
@@ -860,7 +873,13 @@ class LiveSession:
             self.barge_in_enabled = False
 
     def _run_vad(self, audio_bytes: bytes) -> float:
-        """Run VAD inference on audio chunk, return speech probability."""
+        """Run VAD inference on audio chunk, return max speech probability.
+
+        Silero VAD v5 expects 512-sample windows at 16kHz with a 64-sample
+        context prepended (total input: 576 samples). Each 4096-byte chunk
+        at 24kHz yields ~1365 resampled samples, which we process as
+        consecutive 512-sample windows, returning the max probability.
+        """
         if not self._vad_model:
             return 0.0
 
@@ -869,43 +888,49 @@ class LiveSession:
         # Convert bytes to float32 samples
         samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
-        # Silero VAD expects 512 samples at 16kHz, or 768 at 24kHz
-        # Resample to 16kHz if needed by taking every 1.5th sample (simple decimation)
+        # Resample to 16kHz if needed by taking 2 of every 3 samples
         if SAMPLE_RATE == 24000:
-            # Approximate resample 24k->16k by taking 2 of every 3
             indices = np.arange(0, len(samples), 1.5).astype(int)
             indices = indices[indices < len(samples)]
             samples = samples[indices]
 
-        # Pad or trim to 512 samples
-        if len(samples) < 512:
-            samples = np.pad(samples, (0, 512 - len(samples)))
-        else:
-            samples = samples[:512]
-
-        input_data = samples.reshape(1, -1)
+        # Process all resampled samples in 512-sample windows with 64-sample context
+        context = self._vad_state['context']
+        max_prob = 0.0
 
         try:
-            ort_inputs = {
-                'input': input_data,
-                'h': self._vad_state['h'],
-                'c': self._vad_state['c'],
-                'sr': self._vad_state['sr']
-            }
-            ort_outputs = self._vad_model.run(None, ort_inputs)
-            prob = ort_outputs[0].item()
-            self._vad_state['h'] = ort_outputs[1]
-            self._vad_state['c'] = ort_outputs[2]
-            return prob
-        except Exception:
+            for i in range(0, len(samples) - 511, 512):
+                window = samples[i:i + 512]
+                # Prepend context (as Silero's own OnnxWrapper does)
+                input_data = np.concatenate([context, window]).reshape(1, -1)
+
+                ort_inputs = {
+                    'input': input_data,
+                    'state': self._vad_state['state'],
+                    'sr': self._vad_state['sr']
+                }
+                ort_outputs = self._vad_model.run(None, ort_inputs)
+                prob = ort_outputs[0].item()
+                self._vad_state['state'] = ort_outputs[1]
+
+                # Update context from the end of this window
+                context = window[-64:]
+
+                if prob > max_prob:
+                    max_prob = prob
+
+            self._vad_state['context'] = context
+            return max_prob
+        except Exception as e:
+            print(f"VAD error: {e}", flush=True)
             return 0.0
 
     def _reset_vad_state(self):
         """Reset VAD hidden state to avoid contamination between segments."""
         if self._vad_state:
             import numpy as np
-            self._vad_state['h'] = np.zeros((2, 1, 64), dtype=np.float32)
-            self._vad_state['c'] = np.zeros((2, 1, 64), dtype=np.float32)
+            self._vad_state['state'] = np.zeros((2, 1, 128), dtype=np.float32)
+            self._vad_state['context'] = np.zeros(64, dtype=np.float32)
 
     # ── Fallback: Whisper STT ────────────────────────────────────
 
@@ -1262,6 +1287,34 @@ class LiveSession:
             print(f"Live session: Error sending to CLI: {e}", flush=True)
             self._cli_ready = False
 
+    async def _drain_stale_cli_output(self):
+        """Drain leftover CLI output from a previous cancelled read until we see a result message."""
+        if not self._cli_process or not self._cli_process.stdout:
+            return
+        drained = 0
+        while True:
+            try:
+                line = await asyncio.wait_for(
+                    self._cli_process.stdout.readline(),
+                    timeout=0.1  # Very short timeout — if nothing waiting, we're clean
+                )
+                if not line:
+                    break
+                line_str = line.decode().strip()
+                if not line_str:
+                    continue
+                drained += 1
+                try:
+                    event_data = json.loads(line_str)
+                    if event_data.get("type") == "result":
+                        break  # Old turn fully drained
+                except json.JSONDecodeError:
+                    continue
+            except asyncio.TimeoutError:
+                break  # Nothing waiting — stdout is clean
+        if drained:
+            print(f"Live session: Drained {drained} stale CLI events", flush=True)
+
     async def _read_cli_response(self):
         """Read streaming events from CLI until turn is complete. Route text through composer."""
         if not self._cli_process or not self._cli_process.stdout:
@@ -1569,12 +1622,13 @@ class LiveSession:
 
         print("STT: Using local Whisper", flush=True)
         audio_buffer = bytearray()
-        SILENCE_THRESHOLD = 18   # RMS below this = silence (ambient ~10)
+        SILENCE_THRESHOLD = 150  # RMS below this = silence (ambient noise ~20-100)
         SILENCE_DURATION_NORMAL = 0.8     # seconds of silence to trigger transcription
         SILENCE_DURATION_POST_BARGE = 0.4 # Faster response after interruption
-        SPEECH_ENERGY_MIN = 25   # Per-chunk RMS to flag speech (just above ambient)
-        SPEECH_CHUNKS_MIN = 5    # Need ~425ms of speech-level audio
+        SPEECH_ENERGY_MIN = 200  # Per-chunk RMS to flag speech (well above ambient)
+        SPEECH_CHUNKS_MIN = 3    # Need ~255ms of speech-level audio
         MIN_BUFFER_SECONDS = 0.5 # Minimum buffer length to transcribe
+        MAX_BUFFER_SECONDS = 10  # Safety cap: force transcription after this long
         # Whisper hallucinates these on silence/noise — reject them
         HALLUCINATION_PHRASES = {
             "thank you", "thanks for watching", "thanks for listening",
@@ -1659,12 +1713,17 @@ class LiveSession:
                         prob = self._run_vad(frame.data)
                         if prob > 0.5:
                             self._vad_speech_count += 1
+                            # Show "listening" indicator on first detected speech chunk
+                            if self._vad_speech_count == 1:
+                                self._set_status("listening")
                             # ~0.5s sustained speech: 4096 bytes at 24kHz 16-bit = ~85ms per chunk
                             # 0.5s / 0.085s ~ 6 chunks
                             if self._vad_speech_count >= 6:
                                 print(f"Barge-in: Sustained speech detected ({self._vad_speech_count} chunks, prob={prob:.2f})", flush=True)
                                 await self._trigger_barge_in()
                         else:
+                            if self._vad_speech_count > 0:
+                                self._set_status("speaking")
                             self._vad_speech_count = 0
                     continue
 
@@ -1692,42 +1751,59 @@ class LiveSession:
                 if rms > peak_rms:
                     peak_rms = rms
 
+                # Determine if we should transcribe
+                should_transcribe = False
+                trigger_reason = ""
+
+                buf_bytes = len(audio_buffer)
+                buf_seconds = buf_bytes / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+                min_buf = int(SAMPLE_RATE * MIN_BUFFER_SECONDS * BYTES_PER_SAMPLE)
+
                 if rms < SILENCE_THRESHOLD:
                     if silence_start is None:
                         silence_start = time.time()
                     else:
                         current_silence_duration = SILENCE_DURATION_POST_BARGE if self._post_barge_in else SILENCE_DURATION_NORMAL
-                        if time.time() - silence_start > current_silence_duration and has_speech and len(audio_buffer) > int(SAMPLE_RATE * MIN_BUFFER_SECONDS * BYTES_PER_SAMPLE):
-                            # Silence detected after speech — transcribe
-                            pcm_data = bytes(audio_buffer)
-                            buf_seconds = len(pcm_data) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
-                            print(f"STT: Transcribing {buf_seconds:.1f}s buffer (peak RMS: {peak_rms:.0f})", flush=True)
-                            audio_buffer.clear()
-                            silence_start = None
-                            has_speech = False
-                            speech_chunk_count = 0
-                            peak_rms = 0.0
-
-                            # Run Whisper in executor to avoid blocking event loop
-                            transcript = await asyncio.get_event_loop().run_in_executor(
-                                None, self._whisper_transcribe, pcm_data
-                            )
-                            if transcript and not _is_hallucination(transcript):
-                                print(f"STT [whisper]: {transcript}", flush=True)
-                                await self._stt_out_q.put(PipelineFrame(
-                                    type=FrameType.END_OF_UTTERANCE,
-                                    generation_id=self.generation_id
-                                ))
-                                await self._stt_out_q.put(PipelineFrame(
-                                    type=FrameType.TRANSCRIPT,
-                                    generation_id=self.generation_id,
-                                    data=transcript
-                                ))
-                                self._post_barge_in = False
-                            elif transcript:
-                                print(f"STT: Rejected hallucination: \"{transcript}\"", flush=True)
+                        if time.time() - silence_start > current_silence_duration and has_speech and buf_bytes > min_buf:
+                            should_transcribe = True
+                            trigger_reason = "silence"
                 else:
                     silence_start = None
+
+                # Safety cap: force transcription if buffer is too long
+                # No has_speech requirement — Whisper + hallucination filter handles empty audio
+                if not should_transcribe and buf_seconds > MAX_BUFFER_SECONDS:
+                    should_transcribe = True
+                    trigger_reason = "max_buffer"
+
+                if should_transcribe:
+                    pcm_data = bytes(audio_buffer)
+                    actual_seconds = len(pcm_data) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+                    print(f"STT: Transcribing {actual_seconds:.1f}s buffer (peak RMS: {peak_rms:.0f}, trigger: {trigger_reason})", flush=True)
+                    audio_buffer.clear()
+                    silence_start = None
+                    has_speech = False
+                    speech_chunk_count = 0
+                    peak_rms = 0.0
+
+                    # Run Whisper in executor to avoid blocking event loop
+                    transcript = await asyncio.get_event_loop().run_in_executor(
+                        None, self._whisper_transcribe, pcm_data
+                    )
+                    if transcript and not _is_hallucination(transcript):
+                        print(f"STT [whisper]: {transcript}", flush=True)
+                        await self._stt_out_q.put(PipelineFrame(
+                            type=FrameType.END_OF_UTTERANCE,
+                            generation_id=self.generation_id
+                        ))
+                        await self._stt_out_q.put(PipelineFrame(
+                            type=FrameType.TRANSCRIPT,
+                            generation_id=self.generation_id,
+                            data=transcript
+                        ))
+                        self._post_barge_in = False
+                    elif transcript:
+                        print(f"STT: Rejected hallucination: \"{transcript}\"", flush=True)
 
         except Exception as e:
             print(f"STT Whisper error: {e}", flush=True)
@@ -1783,11 +1859,22 @@ class LiveSession:
                     user_content = f"{self._barge_in_annotation}\n\n{user_content}"
                     self._barge_in_annotation = None
 
+                # Drain any stale CLI output from a previous cancelled read
+                await self._drain_stale_cli_output()
+
                 # Send to CLI and read response
                 await self._send_to_cli(user_content)
                 t_sent = time.time()
                 print(f"  [timing] CLI send: {t_sent - t_start:.2f}s", flush=True)
-                await self._read_cli_response()
+
+                # Wrap reader in a task so barge-in can cancel it
+                self._response_reader_task = asyncio.create_task(self._read_cli_response())
+                try:
+                    await self._response_reader_task
+                except asyncio.CancelledError:
+                    print("Live session: CLI read cancelled by barge-in", flush=True)
+                finally:
+                    self._response_reader_task = None
                 t_done = time.time()
                 print(f"  [timing] CLI response: {t_done - t_sent:.2f}s, total: {t_done - t_start:.2f}s", flush=True)
 
@@ -1960,10 +2047,12 @@ class LiveSession:
 
                     # First audio chunk — gate STT and set status
                     # Mic stays physically live so VAD can detect barge-in speech
+                    # Skip re-gating for post-barge-in trail clip (user is already talking)
                     if not self.playing_audio:
                         self.playing_audio = True
-                        self._set_status("speaking")
-                        self._stt_gated = True
+                        if not self._post_barge_in:
+                            self._set_status("speaking")
+                            self._stt_gated = True
 
                     self._reset_idle_timer()
 
@@ -2039,6 +2128,10 @@ class LiveSession:
         # 2. Increment generation_id to discard all queued frames
         self.generation_id += 1
 
+        # 2b. Cancel the CLI response reader task so _llm_stage unblocks
+        if self._response_reader_task and not self._response_reader_task.done():
+            self._response_reader_task.cancel()
+
         # 3. Pause and reset composer (returns unplayed segments for annotation)
         held_segments = []
         if self._composer:
@@ -2090,6 +2183,11 @@ class LiveSession:
                         type=FrameType.FILLER,
                         generation_id=gen_id,
                         data=samples.tobytes()
+                    ))
+                    # END_OF_TURN so playback stage resets playing_audio
+                    await self._audio_out_q.put(PipelineFrame(
+                        type=FrameType.END_OF_TURN,
+                        generation_id=gen_id,
                     ))
 
         # 11. Build interruption annotation for next turn
@@ -2212,6 +2310,8 @@ class LiveSession:
         finally:
             self._log_event("session_end")
             self.running = False
+            if self._composer:
+                self._composer.stop()
             self._cancel_idle_timer()
             self._unmute_mic()
             self._set_status("idle")
@@ -2274,4 +2374,6 @@ class LiveSession:
     def stop(self):
         """Stop the session gracefully."""
         self.running = False
+        if self._composer:
+            self._composer.stop()
         self._cancel_idle_timer()
