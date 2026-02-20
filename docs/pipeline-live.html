@@ -31,18 +31,25 @@
   .stage-node {
     display: flex; flex-direction: column; align-items: center; gap: 4px;
     padding: 10px 12px; border-radius: 10px; border: 2px solid; min-width: 80px;
-    position: relative; transition: box-shadow 0.3s; flex-shrink: 0;
+    position: relative; flex-shrink: 0;
+    transition: background 0.3s, border-color 0.3s, box-shadow 0.3s;
+    background: transparent;
   }
-  .stage-node.active { animation: pulse 1.5s ease-in-out infinite; }
-  @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 transparent; } 50% { box-shadow: 0 0 16px var(--glow); } }
-  .stage-name { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
-  .stage-detail { font-size: 11px; color: #888; font-family: monospace; }
+  .stage-node.active {
+    background: var(--bg-active);
+    box-shadow: 0 0 20px var(--glow), inset 0 0 12px var(--glow);
+    border-color: var(--color-bright);
+  }
+  .stage-node.active .stage-name { color: #fff; }
+  .stage-node.active .stage-detail { color: #ccc; }
+  .stage-name { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; transition: color 0.3s; }
+  .stage-detail { font-size: 11px; color: #888; font-family: monospace; transition: color 0.3s; }
 
-  .node-mic { border-color: #4ade80; --glow: #4ade8060; }
-  .node-stt { border-color: #60a5fa; --glow: #60a5fa60; }
-  .node-llm { border-color: #a78bfa; --glow: #a78bfa60; }
-  .node-composer { border-color: #f59e0b; --glow: #f59e0b60; }
-  .node-playback { border-color: #ec4899; --glow: #ec489960; }
+  .node-mic { border-color: #4ade8060; --color-bright: #4ade80; --bg-active: #4ade8025; --glow: #4ade8040; }
+  .node-stt { border-color: #60a5fa60; --color-bright: #60a5fa; --bg-active: #60a5fa25; --glow: #60a5fa40; }
+  .node-llm { border-color: #a78bfa60; --color-bright: #a78bfa; --bg-active: #a78bfa25; --glow: #a78bfa40; }
+  .node-composer { border-color: #f59e0b60; --color-bright: #f59e0b; --bg-active: #f59e0b25; --glow: #f59e0b40; }
+  .node-playback { border-color: #ec489960; --color-bright: #ec4899; --bg-active: #ec489925; --glow: #ec489940; }
 
   .queue-pill {
     display: flex; align-items: center; justify-content: center;
@@ -241,11 +248,30 @@
   }
 
   // ── Activate node (pulse) ──
+  // Track per-node timeout handles so we can extend/clear
+  const nodeTimers = {};
   function activateNode(id, ms) {
     const el = $(id);
     if (!el) return;
     el.classList.add('active');
-    setTimeout(() => el.classList.remove('active'), ms || 2000);
+    if (nodeTimers[id]) clearTimeout(nodeTimers[id]);
+    nodeTimers[id] = setTimeout(() => { el.classList.remove('active'); nodeTimers[id] = null; }, ms || 2000);
+  }
+  function deactivateAllNodes() {
+    for (const id of ['nodeMic','nodeStt','nodeLlm','nodeComposer','nodePlayback']) {
+      const el = $(id);
+      if (el) el.classList.remove('active');
+      if (nodeTimers[id]) { clearTimeout(nodeTimers[id]); nodeTimers[id] = null; }
+    }
+  }
+  // Set the primary active stage based on pipeline status
+  function setPipelineStage(status) {
+    deactivateAllNodes();
+    if (status === 'listening') activateNode('nodeMic', 60000);
+    else if (status === 'thinking') activateNode('nodeLlm', 60000);
+    else if (status === 'speaking') { activateNode('nodeComposer', 60000); activateNode('nodePlayback', 60000); }
+    else if (status === 'tool_use') activateNode('nodeLlm', 60000);
+    else if (status === 'muted') {} // nothing lit
   }
 
   // ── Status update ──
@@ -295,9 +321,7 @@
     },
     status(e) {
       setStatus(e.status);
-      if (e.status === 'listening') activateNode('nodeMic', 3000);
-      if (e.status === 'thinking') activateNode('nodeLlm', 5000);
-      if (e.status === 'speaking') activateNode('nodePlayback', 3000);
+      setPipelineStage(e.status);
     },
     audio_rms(e) {
       const bars = rmsMeter.children;

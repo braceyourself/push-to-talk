@@ -1834,22 +1834,36 @@ async def test_sse_server_disabled():
     assert task.done(), "Stage should complete immediately when disabled"
 
 
+def _setup_bus(session):
+    """Helper: initialize a bus in a temp dir and wire SSE callback."""
+    from event_bus import EventBus
+    tmpdir = tempfile.mkdtemp()
+    session._bus = EventBus(Path(tmpdir), "live_session", "test_sid")
+    session._bus.open()
+    if session._sse_dashboard:
+        session._bus.on("*", session._sse_broadcast)
+    return tmpdir
+
+
 @test("_emit_event no-op with no clients")
 async def test_emit_event_no_clients():
     """Returns immediately, no error."""
     session = make_session(sse_dashboard=True)
     session.generation_id = 1
+    _setup_bus(session)
     # No clients connected
     assert len(session._sse_clients) == 0
     # Should not raise
     session._emit_event("test", foo="bar")
+    session._bus.close()
 
 
-@test("_emit_event broadcasts to clients")
+@test("_emit_event broadcasts to clients via bus")
 async def test_emit_event_broadcasts():
-    """Mock writers receive JSON with type/ts/gen_id."""
+    """Mock writers receive JSON with type/ts/gen_id via bus callback."""
     session = make_session(sse_dashboard=True)
     session.generation_id = 42
+    _setup_bus(session)
 
     # Create mock writers
     writer1 = MagicMock()
@@ -1874,13 +1888,15 @@ async def test_emit_event_broadcasts():
     assert payload['gen_id'] == 42
     assert payload['status'] == 'listening'
     assert 'ts' in payload
+    session._bus.close()
 
 
-@test("_emit_event removes dead clients")
+@test("_sse_broadcast removes dead clients")
 async def test_emit_event_prunes_dead():
-    """Writer that raises gets pruned."""
+    """Writer that raises gets pruned via bus callback."""
     session = make_session(sse_dashboard=True)
     session.generation_id = 1
+    _setup_bus(session)
 
     # One good writer, one dead
     good_writer = MagicMock()
@@ -1897,13 +1913,15 @@ async def test_emit_event_prunes_dead():
 
     assert len(session._sse_clients) == 1, f"Dead client should be pruned, got {len(session._sse_clients)}"
     assert session._sse_clients[0] is good_writer
+    session._bus.close()
 
 
 @test("_emit_event envelope has required fields")
 async def test_emit_event_envelope():
-    """Every event has type, ts, gen_id."""
+    """Every event has type, ts, gen_id via bus."""
     session = make_session(sse_dashboard=True)
     session.generation_id = 7
+    _setup_bus(session)
 
     writer = MagicMock()
     writer.write = MagicMock()
@@ -1919,28 +1937,41 @@ async def test_emit_event_envelope():
     assert 'gen_id' in payload, "Missing 'gen_id'"
     assert payload['type'] == 'audio_rms'
     assert payload['rms'] == 150.5
+    session._bus.close()
 
 
 # ══════════════════════════════════════════════════════════════════
 # Test Group 23: Event Decimation
 # ══════════════════════════════════════════════════════════════════
 
-@test("audio_rms decimated to every 3rd chunk")
-async def test_audio_rms_decimation():
-    """9 emission attempts → 3 actual events sent."""
+@test("audio_rms fires via bus emit_ephemeral (no disk write)")
+async def test_audio_rms_ephemeral():
+    """audio_rms events go to bus callbacks, not to disk."""
     session = make_session(sse_dashboard=True)
     session.generation_id = 1
-    session._sse_rms_counter = 0
+    _setup_bus(session)
+
+    # Track events via bus callback
+    rms_events = []
+    session._bus.on("audio_rms", lambda evt: rms_events.append(evt))
 
     writer = MagicMock()
     writer.write = MagicMock()
     writer.is_closing = MagicMock(return_value=False)
     session._sse_clients = [writer]
 
-    for i in range(9):
+    for i in range(3):
         session._emit_audio_rms(rms=100 + i, has_speech=False, speech_chunks=0, buf_seconds=1.0)
 
-    assert writer.write.call_count == 3, f"Expected 3 events (every 3rd), got {writer.write.call_count}"
+    assert len(rms_events) == 3, f"Expected 3 callback events, got {len(rms_events)}"
+    # SSE clients should also get them (via wildcard _sse_broadcast)
+    assert writer.write.call_count == 3, f"Expected 3 SSE writes, got {writer.write.call_count}"
+
+    # Verify no disk write for ephemeral events
+    bus_path = session._bus.bus_path
+    content = bus_path.read_text() if bus_path.exists() else ""
+    assert "audio_rms" not in content, "audio_rms should not be written to disk"
+    session._bus.close()
 
 
 @test("Queue depth helper returns all 5 queues")
@@ -2071,6 +2102,111 @@ async def test_composer_on_event_filler():
     assert 'filler_played' in event_types, f"Expected filler_played, got {event_types}"
     filler_event = [e for e in events if e['type'] == 'filler_played'][0]
     assert filler_event['sufficient'] == True
+
+
+# ══════════════════════════════════════════════════════════════════
+# Test Group 25: Event Bus Integration
+# ══════════════════════════════════════════════════════════════════
+
+@test("Bus: _log_event writes to bus JSONL")
+def test_bus_log_event():
+    """_log_event now writes through bus instead of direct file append."""
+    session = make_session()
+    session.generation_id = 3
+    _setup_bus(session)
+
+    session._log_event("user", text="hello world")
+    session._log_event("assistant", text="hi there")
+
+    events = session._bus.read_recent(last_n=10)
+    assert len(events) == 2, f"Expected 2 events, got {len(events)}"
+    assert events[0].type == "user"
+    assert events[0].payload["text"] == "hello world"
+    assert events[1].type == "assistant"
+    assert events[1].payload["text"] == "hi there"
+    session._bus.close()
+
+
+@test("Bus: _set_status emits status event")
+def test_bus_set_status():
+    """_set_status writes to bus."""
+    session = make_session()
+    session.generation_id = 1
+    _setup_bus(session)
+
+    session._set_status("listening")
+    session._set_status("thinking")
+
+    events = session._bus.read_recent(event_type="status")
+    assert len(events) == 2
+    assert events[0].payload["status"] == "listening"
+    assert events[1].payload["status"] == "thinking"
+    session._bus.close()
+
+
+@test("Bus: get_pipeline_events tool returns recent events")
+async def test_bus_get_pipeline_events_tool():
+    """get_pipeline_events tool handler reads from bus."""
+    session = make_session()
+    session.generation_id = 1
+    _setup_bus(session)
+
+    session._log_event("user", text="test input")
+    session._log_event("assistant", text="test output")
+    session._log_event("stt_complete", text="test input", latency_ms=200)
+
+    result = await session._execute_tool("get_pipeline_events", {"last_n": 10})
+    parsed = json.loads(result)
+    assert len(parsed) == 3, f"Expected 3 events, got {len(parsed)}"
+    types = [e["type"] for e in parsed]
+    assert "user" in types
+    assert "assistant" in types
+    assert "stt_complete" in types
+    session._bus.close()
+
+
+@test("Bus: get_pipeline_events filters by event_type")
+async def test_bus_get_pipeline_events_filter():
+    """get_pipeline_events respects event_type filter."""
+    session = make_session()
+    session.generation_id = 1
+    _setup_bus(session)
+
+    session._log_event("user", text="hello")
+    session._log_event("status", status="thinking")
+    session._log_event("user", text="bye")
+
+    result = await session._execute_tool("get_pipeline_events",
+                                          {"last_n": 10, "event_type": "user"})
+    parsed = json.loads(result)
+    assert len(parsed) == 2
+    assert all(e["type"] == "user" for e in parsed)
+    session._bus.close()
+
+
+@test("Bus: task_complete emits bus event")
+async def test_bus_task_complete_event():
+    """_on_task_complete emits to bus."""
+    session = make_session()
+    session.generation_id = 1
+    session.running = True
+    _setup_bus(session)
+
+    # Mock task
+    mock_task = MagicMock()
+    mock_task.id = 1
+    mock_task.name = "test task"
+    mock_task.completed_at = time.time()
+    mock_task.started_at = time.time() - 5
+    mock_task.created_at = time.time() - 6
+    mock_task.output_lines = deque(["line1", "line2"])
+
+    await session._on_task_complete(mock_task)
+
+    events = session._bus.read_recent(event_type="task_complete")
+    assert len(events) == 1
+    assert events[0].payload["task_name"] == "test task"
+    session._bus.close()
 
 
 # ══════════════════════════════════════════════════════════════════

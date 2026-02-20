@@ -186,6 +186,33 @@ TOOLS = [
             "required": ["title", "body"]
         }
     },
+    {
+        "name": "get_pipeline_events",
+        "description": (
+            "Query recent pipeline events from the event bus. Returns JSONL events showing "
+            "what happened in the pipeline: STT transcriptions, LLM responses, tool use, "
+            "barge-ins, task completions, errors, etc. Use when the user asks about what's "
+            "been happening, pipeline status, or recent activity."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "last_n": {
+                    "type": "integer",
+                    "description": "Number of recent events to return (default 20)"
+                },
+                "event_type": {
+                    "type": "string",
+                    "description": "Filter to specific event type (e.g. 'user', 'assistant', 'stt_complete', 'error')"
+                },
+                "since_seconds": {
+                    "type": "number",
+                    "description": "Only events from the last N seconds (default 300 = 5 minutes)"
+                }
+            },
+            "required": []
+        }
+    },
 ]
 
 

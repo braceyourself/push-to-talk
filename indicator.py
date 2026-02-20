@@ -2241,19 +2241,41 @@ class LiveOverlayWidget(Gtk.Window):
         menu.show_all()
         menu.popup_at_pointer(event)
 
+    def _emit_bus_command(self, action):
+        """Write a command event to the event bus JSONL."""
+        try:
+            active_file = Path("~/.local/share/push-to-talk/active_session").expanduser()
+            if active_file.exists():
+                session_dir = Path(active_file.read_text().strip())
+                bus_path = session_dir / "events.jsonl"
+                if bus_path.exists():
+                    from event_bus import EventBusWriter
+                    sid = session_dir.name
+                    writer = EventBusWriter(bus_path, "indicator", sid)
+                    writer.emit("command", action=action)
+                    writer.close()
+                    return True
+        except Exception as e:
+            print(f"Indicator: bus command failed: {e}", flush=True)
+        return False
+
     def _on_mute_clicked(self, widget):
-        signal_file = Path(__file__).parent / "live_mute_toggle"
-        signal_file.write_text("mute")
+        if not self._emit_bus_command("mute"):
+            # Fallback to signal file
+            signal_file = Path(__file__).parent / "live_mute_toggle"
+            signal_file.write_text("mute")
         self.update_status('muted')
 
     def _on_unmute_clicked(self, widget):
-        signal_file = Path(__file__).parent / "live_mute_toggle"
-        signal_file.write_text("unmute")
+        if not self._emit_bus_command("unmute"):
+            signal_file = Path(__file__).parent / "live_mute_toggle"
+            signal_file.write_text("unmute")
         self.update_status('listening')
 
     def _on_stop_clicked(self, widget):
-        signal_file = Path(__file__).parent / "live_mute_toggle"
-        signal_file.write_text("stop")
+        if not self._emit_bus_command("stop"):
+            signal_file = Path(__file__).parent / "live_mute_toggle"
+            signal_file.write_text("stop")
         self.update_status('idle')
 
     def _on_restart_clicked(self, widget):

@@ -28,6 +28,7 @@ from pipeline_frames import PipelineFrame, FrameType
 from response_library import ResponseLibrary
 from stream_composer import StreamComposer, AudioSegment, SegmentType
 from task_manager import TaskManager, ClaudeTask, TaskStatus
+from event_bus import EventBus, EventBusWriter, BusEvent, EventType, build_llm_context
 
 # Module-level sentence segmenter for post-tool-buffer and end-of-turn flushing
 _sentence_segmenter = pysbd.Segmenter(language="en", clean=False)
@@ -195,7 +196,9 @@ class LiveSession:
         self._sse_dashboard = sse_dashboard
         self._sse_clients: list[asyncio.StreamWriter] = []
         self._sse_server = None
-        self._sse_rms_counter = 0
+
+        # Event bus (created in run())
+        self._bus: EventBus | None = None
 
         self.running = False
         self.playing_audio = False
@@ -351,23 +354,21 @@ class LiveSession:
     # ── Conversation Logger ──────────────────────────────────────────
 
     def _log_event(self, event_type, **kwargs):
-        """Append a JSONL event to the session log file."""
-        if not self._session_log_path:
-            return
-        entry = {"ts": time.time(), "type": event_type, **kwargs}
-        try:
-            with open(self._session_log_path, "a") as f:
-                f.write(json.dumps(entry) + "\n")
-        except Exception as e:
-            print(f"Live session: Log write error: {e}", flush=True)
+        """Emit an event to the bus (replaces direct JSONL log writes)."""
+        if self._bus:
+            self._bus.emit(event_type, gen=self.generation_id, **kwargs)
 
     def _spawn_learner(self):
-        """Spawn the background learner daemon that watches the conversation log."""
+        """Spawn the background learner daemon that watches the event bus."""
         learner_script = Path(__file__).parent / "learner.py"
         if not learner_script.exists():
             print("Live session: learner.py not found, skipping", flush=True)
             return
-        cmd = [sys.executable, str(learner_script), str(self._session_log_path)]
+        # Pass session dir — learner resolves to events.jsonl
+        session_dir = self._session_log_path.parent if self._session_log_path else None
+        if not session_dir:
+            return
+        cmd = [sys.executable, str(learner_script), str(session_dir)]
         try:
             self._learner_process = subprocess.Popen(
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -655,17 +656,34 @@ class LiveSession:
             except Exception as e:
                 return json.dumps({"error": str(e)})
 
+        elif name == "get_pipeline_events":
+            last_n = int(args.get("last_n", 20))
+            event_type = args.get("event_type", None)
+            since_seconds = float(args.get("since_seconds", 300))
+            since_ts = time.time() - since_seconds if since_seconds > 0 else None
+            if self._bus:
+                events = self._bus.read_recent(last_n=last_n, event_type=event_type,
+                                                since_ts=since_ts)
+                return json.dumps([{
+                    "ts": e.ts, "type": e.type, "gen": e.gen, **e.payload
+                } for e in events])
+            return json.dumps([])
+
         else:
             return json.dumps({"error": f"Unknown tool: {name}"})
 
     # ── Notifications ──────────────────────────────────────────────
 
     async def _on_task_complete(self, task):
-        """Handle task completion — queue notification for delivery."""
+        """Handle task completion — emit bus event + queue notification for delivery."""
         if not self.running:
             return
         duration = (task.completed_at or time.time()) - (task.started_at or task.created_at)
         output_tail = '\n'.join(list(task.output_lines)[-20:])
+        if self._bus:
+            self._bus.emit("task_complete", gen=self.generation_id,
+                          task_id=task.id, task_name=task.name,
+                          duration=f"{duration:.1f}s", output_summary=output_tail[:1500])
         self._notification_queue.append({
             "type": "task_complete",
             "task_id": task.id, "task_name": task.name,
@@ -678,11 +696,15 @@ class LiveSession:
             await self._flush_notifications()
 
     async def _on_task_failed(self, task):
-        """Handle task failure — queue notification for delivery."""
+        """Handle task failure — emit bus event + queue notification for delivery."""
         if not self.running:
             return
         duration = (task.completed_at or time.time()) - (task.started_at or task.created_at)
         output_tail = '\n'.join(list(task.output_lines)[-20:])
+        if self._bus:
+            self._bus.emit("task_failed", gen=self.generation_id,
+                          task_id=task.id, task_name=task.name,
+                          duration=f"{duration:.1f}s", error_output=output_tail[:1500])
         self._notification_queue.append({
             "type": "task_failed",
             "task_id": task.id, "task_name": task.name,
@@ -770,19 +792,30 @@ class LiveSession:
             self.on_status(json.dumps({"status": status, **metadata}))
         else:
             self.on_status(status)
-        self._emit_event("status", status=status, metadata=metadata)
+        if self._bus:
+            self._bus.emit("status", gen=self.generation_id, status=status, metadata=metadata)
 
     # ── SSE Dashboard ─────────────────────────────────────────────
 
     def _emit_event(self, event_type, **data):
-        """Broadcast an SSE event to all connected dashboard clients."""
+        """Emit a pipeline event via the bus (persisted + callbacks)."""
+        if self._bus:
+            self._bus.emit(event_type, gen=self.generation_id, **data)
+
+    def _emit_audio_rms(self, **data):
+        """Ephemeral RMS emission via bus (callbacks only, no disk)."""
+        if self._bus:
+            self._bus.emit_ephemeral("audio_rms", gen=self.generation_id, **data)
+
+    def _sse_broadcast(self, evt: BusEvent):
+        """Bus callback that broadcasts events to SSE clients."""
         if not self._sse_clients:
             return
         envelope = json.dumps({
-            "type": event_type,
-            "ts": time.time(),
-            "gen_id": self.generation_id,
-            **data,
+            "type": evt.type,
+            "ts": evt.ts,
+            "gen_id": evt.gen,
+            **evt.payload,
         })
         msg = f"data: {envelope}\n\n".encode()
         dead = []
@@ -793,13 +826,6 @@ class LiveSession:
                 dead.append(writer)
         for w in dead:
             self._sse_clients.remove(w)
-
-    def _emit_audio_rms(self, **data):
-        """Decimated RMS emission — every 3rd chunk."""
-        self._sse_rms_counter += 1
-        if self._sse_rms_counter % 3 != 0:
-            return
-        self._emit_event("audio_rms", **data)
 
     def _get_queue_depths(self):
         """Return dict of queue sizes for all pipeline queues."""
@@ -896,12 +922,13 @@ class LiveSession:
             )
             print(f"SSE dashboard server at http://127.0.0.1:9847/events", flush=True)
 
-            # Periodic queue depth emission
+            # Periodic queue depth emission (ephemeral — no disk write)
             async def emit_queue_depths():
                 while self.running:
                     await asyncio.sleep(0.5)
-                    if self._sse_clients:
-                        self._emit_event("queue_depths", **self._get_queue_depths())
+                    if self._sse_clients and self._bus:
+                        self._bus.emit_ephemeral("queue_depths", gen=self.generation_id,
+                                                 **self._get_queue_depths())
 
             depth_task = asyncio.create_task(emit_queue_depths())
 
@@ -1900,8 +1927,9 @@ class LiveSession:
         """
         import pasimple
 
-        mute_signal = Path(__file__).parent / "live_mute_toggle"
+        mute_signal = Path(__file__).parent / "live_mute_toggle"  # Legacy fallback
         chunks_sent = 0
+        _last_bus_check_ts = time.time()
         restarts = 0
         loop = asyncio.get_event_loop()
 
@@ -1947,30 +1975,71 @@ class LiveSession:
 
             try:
                 while self.running:
-                    # Check for mute toggle signal from overlay
+                    # Check for commands via bus events
+                    if self._bus:
+                        cmd_events = self._bus.read_recent(last_n=10, event_type="command",
+                                                           since_ts=_last_bus_check_ts)
+                        for cmd_evt in cmd_events:
+                            action = cmd_evt.payload.get("action", "toggle")
+                            if action == "stop":
+                                print("Live session: Stop requested by user", flush=True)
+                                self.running = False
+                                break
+                            elif action == "mute":
+                                self.muted = True
+                                self._set_status("muted")
+                                self._reset_idle_timer()
+                                print("Live session: Muted by user", flush=True)
+                            elif action == "unmute":
+                                self.muted = False
+                                self._set_status("listening")
+                                self._reset_idle_timer()
+                                print("Live session: Unmuted by user", flush=True)
+                            else:  # toggle
+                                self.muted = not self.muted
+                                status = "muted" if self.muted else "listening"
+                                self._set_status(status)
+                                self._reset_idle_timer()
+                                print(f"Live session: {'Muted' if self.muted else 'Unmuted'} by user", flush=True)
+                        if cmd_events:
+                            _last_bus_check_ts = cmd_events[-1].ts
+                        if not self.running:
+                            break
+
+                    # Legacy: Check for mute toggle signal file (backward compat)
                     if mute_signal.exists():
                         try:
                             command = mute_signal.read_text().strip()
                             mute_signal.unlink()
                             if command == "stop":
-                                print("Live session: Stop requested by user", flush=True)
+                                print("Live session: Stop requested by user (signal file)", flush=True)
                                 self.running = False
                                 break
                             elif command == "mute":
                                 self.muted = True
                                 self._set_status("muted")
                                 self._reset_idle_timer()
-                                print("Live session: Muted by user", flush=True)
                             else:
                                 self.muted = not self.muted
                                 status = "muted" if self.muted else "listening"
                                 self._set_status(status)
                                 self._reset_idle_timer()
-                                print(f"Live session: {'Muted' if self.muted else 'Unmuted'} by user", flush=True)
                         except Exception:
                             pass
 
-                    # Check for learner notification
+                    # Check for learner notifications via bus
+                    if self._bus:
+                        learner_events = self._bus.read_recent(last_n=5, event_type="learner_notify",
+                                                                since_ts=_last_bus_check_ts)
+                        for lrn_evt in learner_events:
+                            summary = lrn_evt.payload.get("summary", "")
+                            if summary:
+                                self._notification_queue.append({"type": "learning", "summary": summary})
+                                print(f"Live session: Learner notification: {summary[:80]}...", flush=True)
+                                if not self.playing_audio:
+                                    asyncio.ensure_future(self._flush_notifications())
+
+                    # Legacy: Check for learner notification signal file
                     learner_notify = Path(__file__).parent / "learner_notify"
                     if learner_notify.exists():
                         try:
@@ -1978,7 +2047,7 @@ class LiveSession:
                             learner_notify.unlink()
                             if summary:
                                 self._notification_queue.append({"type": "learning", "summary": summary})
-                                print(f"Live session: Learner notification: {summary[:80]}...", flush=True)
+                                print(f"Live session: Learner notification (file): {summary[:80]}...", flush=True)
                                 if not self.playing_audio:
                                     asyncio.ensure_future(self._flush_notifications())
                         except Exception:
@@ -2257,9 +2326,15 @@ class LiveSession:
                         self._filler_manager(transcript, self._filler_cancel)
                     )
 
-                # Build user message with ambient task context
+                # Build user message with ambient task context + pipeline context
                 task_context = self._build_task_context()
                 user_content = f"{task_context}\n\n{transcript}" if task_context else transcript
+
+                # Inject pipeline context from event bus
+                if self._bus:
+                    pipeline_ctx = build_llm_context(self._bus)
+                    if pipeline_ctx:
+                        user_content = f"{pipeline_ctx}\n\n{user_content}"
 
                 # Prepend barge-in annotation if the AI was interrupted
                 if self._barge_in_annotation:
@@ -2627,14 +2702,12 @@ class LiveSession:
         # 12. Set status to listening
         self._set_status("listening")
 
-        # Log it
+        # Log barge-in event (bus handles both persistence + SSE)
         self._log_event("barge_in",
             spoken_sentences=self._played_sentence_count,
             total_sentences=len(self._spoken_sentences),
             cooldown_until=self._barge_in_cooldown_until
         )
-        self._emit_event("barge_in", spoken_sentences=self._played_sentence_count,
-                         total_sentences=len(self._spoken_sentences))
         print("Barge-in: Interruption complete, listening for user", flush=True)
 
     # ── Main loop ──────────────────────────────────────────────────
@@ -2654,17 +2727,25 @@ class LiveSession:
             except Exception:
                 pass
 
-        # Set up session logging
+        # Set up session logging via event bus
         session_id = time.strftime("%Y%m%d_%H%M%S")
         session_dir = Path("~/Audio/push-to-talk/sessions").expanduser() / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
-        self._session_log_path = session_dir / "conversation.jsonl"
+        self._session_log_path = session_dir / "events.jsonl"
+
+        self._bus = EventBus(session_dir, "live_session", session_id)
+        self._bus.open()
+
+        # Wire SSE dashboard to bus callbacks
+        if self._sse_dashboard:
+            self._bus.on("*", self._sse_broadcast)
+
         self._log_event("session_start", model=self.model, session_id=session_id)
 
-        # Write active session pointer and spawn learner
+        # Write active session pointer (points to session dir, not specific file)
         active_file = Path("~/.local/share/push-to-talk/active_session").expanduser()
         active_file.parent.mkdir(parents=True, exist_ok=True)
-        active_file.write_text(str(self._session_log_path))
+        active_file.write_text(str(session_dir))
         self._spawn_learner()
         self._spawn_clip_factory()
         self._spawn_classifier()
@@ -2691,7 +2772,7 @@ class LiveSession:
             self._audio_out_q,
             _tts_callback,
             lambda: self.generation_id,
-            on_event=self._emit_event if self._sse_dashboard else None,
+            on_event=lambda etype, **d: self._bus.emit(etype, gen=self.generation_id, **d) if self._bus else None,
         )
 
         self._set_status("listening")
@@ -2720,10 +2801,14 @@ class LiveSession:
             print(f"Live session error: {e}", flush=True)
             self._set_status("error")
         finally:
-            self._log_event("session_end")
+            self._log_event("session_end",
+                            duration_s=round(time.time() - self._started_at, 1))
             self.running = False
             if self._composer:
                 self._composer.stop()
+            if self._bus:
+                self._bus.close()
+                self._bus = None
             self._cancel_idle_timer()
             self._unmute_mic()
             self._set_status("idle")

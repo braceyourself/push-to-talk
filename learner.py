@@ -2,11 +2,12 @@
 """
 Background learner daemon for live voice sessions.
 
-Tails the conversation JSONL log, periodically evaluates accumulated turns
+Tails the event bus JSONL log, periodically evaluates accumulated turns
 via `claude -p`, writes discoveries to personality/memories/*.md, and
-signals the live session with a notification summary.
+signals the live session via bus event.
 
-Usage: python learner.py <path-to-conversation.jsonl>
+Usage: python learner.py <path-to-session-dir>
+       python learner.py <path-to-events.jsonl>    (legacy compat)
 """
 
 import sys
@@ -17,13 +18,14 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from event_bus import EventBusWriter
+
 # Evaluation thresholds
 IDLE_SECONDS = 10       # seconds of no new events before evaluating
 MIN_USER_TURNS = 3      # minimum user turns since last eval to trigger
 MIN_SESSION_TURNS = 2   # minimum total user turns to evaluate at all
 
 MEMORIES_DIR = Path(__file__).parent / "personality" / "memories"
-NOTIFY_FILE = Path(__file__).parent / "learner_notify"
 
 CLAUDE_CLI = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
 
@@ -196,9 +198,37 @@ def process_extraction_output(output: str) -> str | None:
     return notification if notification else None
 
 
-def tail_and_evaluate(log_path: Path):
-    """Main loop: tail the JSONL log and evaluate periodically."""
-    print(f"Learner: Watching {log_path}", flush=True)
+def _resolve_bus_path(arg: str) -> Path:
+    """Resolve argument to events.jsonl path.
+
+    Accepts either:
+    - Path to session directory (contains events.jsonl)
+    - Direct path to events.jsonl (or legacy conversation.jsonl)
+    """
+    p = Path(arg)
+    if p.is_dir():
+        return p / "events.jsonl"
+    if p.name == "events.jsonl":
+        return p
+    # Legacy: conversation.jsonl -> try events.jsonl in same dir
+    if p.name == "conversation.jsonl":
+        events_path = p.parent / "events.jsonl"
+        if events_path.exists():
+            return events_path
+    return p  # Fall through — will be whatever was passed
+
+
+def _extract_session_id(bus_path: Path) -> str:
+    """Extract session ID from bus path (parent dir name)."""
+    return bus_path.parent.name
+
+
+def tail_and_evaluate(bus_path: Path):
+    """Main loop: tail the event bus JSONL and evaluate periodically."""
+    print(f"Learner: Watching {bus_path}", flush=True)
+
+    session_id = _extract_session_id(bus_path)
+    bus_writer = EventBusWriter(bus_path, "learner", session_id)
 
     all_turns = []           # All user/assistant turns in session
     pending_turns = []       # Turns since last evaluation
@@ -207,10 +237,10 @@ def tail_and_evaluate(log_path: Path):
     session_ended = False
 
     # Wait for the file to appear
-    while not log_path.exists():
+    while not bus_path.exists():
         time.sleep(0.5)
 
-    with open(log_path, "r") as f:
+    with open(bus_path, "r") as f:
         while True:
             line = f.readline()
 
@@ -256,10 +286,10 @@ def tail_and_evaluate(log_path: Path):
 
                 if notification:
                     try:
-                        NOTIFY_FILE.write_text(notification)
-                        print(f"Learner: Notification written: {notification[:60]}...", flush=True)
+                        bus_writer.emit("learner_notify", summary=notification)
+                        print(f"Learner: Notification emitted: {notification[:60]}...", flush=True)
                     except Exception as e:
-                        print(f"Learner: Failed to write notification: {e}", flush=True)
+                        print(f"Learner: Failed to emit notification: {e}", flush=True)
 
             if session_ended:
                 print("Learner: Session ended, exiting", flush=True)
@@ -272,12 +302,12 @@ def tail_and_evaluate(log_path: Path):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: learner.py <path-to-conversation.jsonl>", file=sys.stderr)
+        print("Usage: learner.py <path-to-session-dir-or-events.jsonl>", file=sys.stderr)
         sys.exit(1)
 
-    log_path = Path(sys.argv[1])
+    bus_path = _resolve_bus_path(sys.argv[1])
     try:
-        tail_and_evaluate(log_path)
+        tail_and_evaluate(bus_path)
     except KeyboardInterrupt:
         print("Learner: Interrupted", flush=True)
     except Exception as e:
