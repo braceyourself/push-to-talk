@@ -258,6 +258,7 @@ def load_config():
         "live_fillers": True,            # Play filler sounds during processing
         "live_barge_in": True,           # Allow speaking over AI response
         "auto_start_listening": True,    # Auto-start live session on service startup
+        "live_auto_mute": True,          # Allow key-based muting (tap/hold to mute)
         "verbal_hooks": [
             # Example hooks - customize these:
             # {"trigger": "open browser", "command": "xdg-open https://google.com"},
@@ -2434,8 +2435,9 @@ class PushToTalk:
                     print("Live: session started (ignoring release)", flush=True)
 
                 elif elapsed < 0.5 and self.live_session:
+                    auto_mute = self.config.get('live_auto_mute', True)
                     # TAP (<500ms): cycle based on state at press time
-                    if press_state == 'listening':
+                    if press_state == 'listening' and auto_mute:
                         self.live_session.set_muted(True)
                         print(f"Live tap ({elapsed_ms}ms): listening → muted", flush=True)
                     elif press_state == 'muted':
@@ -2447,6 +2449,7 @@ class PushToTalk:
                         print(f"Live tap ({elapsed_ms}ms): interrupted → listening", flush=True)
 
                 elif self.live_session:
+                    auto_mute = self.config.get('live_auto_mute', True)
                     if elapsed >= 2.0 and press_state == 'muted':
                         # LONG HOLD (>=2s) from muted: stop session
                         print(f"Live long hold ({elapsed_ms}ms): stopping session", flush=True)
@@ -2455,7 +2458,7 @@ class PushToTalk:
                         # HOLD from muted: keep listening (ensure unmuted)
                         self.live_session.set_muted(False)
                         print(f"Live hold ({elapsed_ms}ms): muted → listening (held)", flush=True)
-                    else:
+                    elif auto_mute:
                         # HOLD (>=500ms) from listening: mute + flush transcript
                         self.live_session.set_muted(True)
                         print(f"Live hold ({elapsed_ms}ms): muted (released)", flush=True)

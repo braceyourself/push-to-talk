@@ -71,6 +71,7 @@ def load_config():
         "interview_context_dirs": [],
         "conversation_project_dir": "",
         "auto_start_listening": True,
+        "live_auto_mute": True,
     }
     try:
         if CONFIG_FILE.exists():
@@ -2229,6 +2230,13 @@ class LiveOverlayWidget(Gtk.Window):
         auto_item.connect('activate', self._on_auto_start_toggled, not auto_start)
         menu.append(auto_item)
 
+        # Key muting toggle
+        auto_mute = config.get('live_auto_mute', True)
+        mute_label = f"\u2713 Key Muting" if auto_mute else "  Key Muting"
+        mute_item = Gtk.MenuItem(label=mute_label)
+        mute_item.connect('activate', self._on_auto_mute_toggled, not auto_mute)
+        menu.append(mute_item)
+
         menu.show_all()
         menu.popup_at_pointer(event)
 
@@ -2265,6 +2273,12 @@ class LiveOverlayWidget(Gtk.Window):
         """Toggle auto-start listening on service startup."""
         config = load_config()
         config['auto_start_listening'] = new_value
+        save_config(config)
+
+    def _on_auto_mute_toggled(self, widget, new_value):
+        """Toggle key-based muting (tap/hold to mute)."""
+        config = load_config()
+        config['live_auto_mute'] = new_value
         save_config(config)
 
     def on_motion(self, widget, event):
