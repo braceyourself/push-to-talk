@@ -84,7 +84,7 @@ if not os.environ.get('XAUTHORITY'):
     if os.path.exists(xauth):
         os.environ['XAUTHORITY'] = xauth
 
-import whisper
+from faster_whisper import WhisperModel
 from pynput import keyboard
 
 # Import OpenAI for TTS (optional)
@@ -212,7 +212,7 @@ INTERRUPT_KEY_OPTIONS = {
 }
 
 # Configuration
-WHISPER_MODEL = "small"  # Options: tiny, base, small, medium, large
+WHISPER_MODEL = "large-v3"  # faster-whisper with int8 quantization
 BASE_DIR = Path(__file__).parent
 VOCAB_FILE = BASE_DIR / "vocabulary.txt"
 STATUS_FILE = BASE_DIR / "status"
@@ -769,8 +769,8 @@ class PushToTalk:
         self.history = deque(maxlen=HISTORY_SIZE)
 
         print("Loading Whisper model...", flush=True)
-        self.model = whisper.load_model(WHISPER_MODEL)
-        print(f"Whisper model '{WHISPER_MODEL}' loaded.", flush=True)
+        self.model = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="int8_float16")
+        print(f"Whisper model '{WHISPER_MODEL}' loaded (faster-whisper, int8_float16).", flush=True)
         print(f"Push-to-Talk ready. Hold {ptt_name} to dictate.", flush=True)
 
         # Ensure mic is unmuted on startup (cleanup from interrupted sessions)

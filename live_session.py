@@ -1108,6 +1108,9 @@ class LiveSession:
                 )
             else:
                 await self._play_filler_audio(clip_pcm, cancel_event)
+            # Log filler phrase as assistant turn in conversation history
+            if response and response.phrase:
+                self._log_event("assistant", text=response.phrase, filler=True)
             if response:
                 barged = cancel_event.is_set()
                 self._response_library.record_usage(response.id, barged_in=barged)
@@ -1337,69 +1340,55 @@ class LiveSession:
             print(f"Whisper fallback error: {e}", flush=True)
 
     def _whisper_transcribe(self, pcm_data: bytes) -> str | None:
-        """Transcribe PCM audio using Whisper (blocking, run in executor)."""
+        """Transcribe PCM audio using faster-whisper (blocking, run in executor)."""
         try:
             import numpy as np
-            import wave as wave_mod
 
             if not self.whisper_model:
-                import whisper
-                self.whisper_model = whisper.load_model("small")
+                from faster_whisper import WhisperModel
+                self.whisper_model = WhisperModel("large-v3", device="cuda", compute_type="int8_float16")
 
-            # Write to temp WAV file for Whisper
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-                tmp_path = tmp.name
-                with wave_mod.open(tmp_path, 'wb') as wf:
-                    wf.setnchannels(CHANNELS)
-                    wf.setsampwidth(BYTES_PER_SAMPLE)
-                    wf.setframerate(SAMPLE_RATE)
-                    wf.writeframes(pcm_data)
+            # Convert PCM bytes to float32 numpy array (faster-whisper expects this)
+            samples = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
 
-            result = self.whisper_model.transcribe(
-                tmp_path, language="en",
+            segments_gen, info = self.whisper_model.transcribe(
+                samples, language="en",
+                beam_size=5,
                 condition_on_previous_text=False,  # Prevent hallucination loops
+                vad_filter=True,  # Built-in Silero VAD — filters silence before transcription
             )
 
             # Multi-layer segment filtering: catches throat clearing, coughs,
             # background noise, and Whisper hallucinations on non-speech audio.
-            segments = result.get("segments", [])
-            if segments:
-                kept = []
-                for s in segments:
-                    no_speech = s.get("no_speech_prob", 0)
-                    avg_logprob = s.get("avg_logprob", 0)
-                    compression = s.get("compression_ratio", 0)
-                    text = s.get("text", "").strip()
+            kept = []
+            any_segments = False
+            for s in segments_gen:
+                any_segments = True
 
-                    # Layer 1: no_speech_prob (high = Whisper thinks no speech)
-                    if no_speech >= 0.6:
-                        print(f"STT: Rejected (no_speech={no_speech:.2f}): \"{text[:40]}\"", flush=True)
-                        continue
+                # Layer 1: no_speech_prob (high = Whisper thinks no speech)
+                if s.no_speech_prob >= 0.6:
+                    print(f"STT: Rejected (no_speech={s.no_speech_prob:.2f}): \"{s.text[:40]}\"", flush=True)
+                    continue
 
-                    # Layer 2: low transcription confidence (catches coughs/clears
-                    # that have acoustic energy but produce gibberish text)
-                    if avg_logprob < -1.0:
-                        print(f"STT: Rejected (logprob={avg_logprob:.2f}): \"{text[:40]}\"", flush=True)
-                        continue
+                # Layer 2: low transcription confidence (catches coughs/clears
+                # that have acoustic energy but produce gibberish text)
+                if s.avg_logprob < -1.0:
+                    print(f"STT: Rejected (logprob={s.avg_logprob:.2f}): \"{s.text[:40]}\"", flush=True)
+                    continue
 
-                    # Layer 3: repetitive hallucination pattern (e.g. "thank you
-                    # thank you thank you" from sustained noise)
-                    if compression > 2.4:
-                        print(f"STT: Rejected (compression={compression:.2f}): \"{text[:40]}\"", flush=True)
-                        continue
+                # Layer 3: repetitive hallucination pattern (e.g. "thank you
+                # thank you thank you" from sustained noise)
+                if s.compression_ratio > 2.4:
+                    print(f"STT: Rejected (compression={s.compression_ratio:.2f}): \"{s.text[:40]}\"", flush=True)
+                    continue
 
-                    kept.append(text)
+                kept.append(s.text.strip())
 
-                text = "".join(kept).strip()
-                if not kept and segments:
-                    # All segments rejected — signal to overlay
-                    self._set_status("stt_rejected")
-                    rejected_text = "".join(s.get("text", "") for s in segments).strip()
-                    print(f"STT: All segments rejected: \"{rejected_text[:60]}\"", flush=True)
-            else:
-                text = result.get("text", "").strip()
+            if not kept and any_segments:
+                # All segments rejected — signal to overlay
+                self._set_status("stt_rejected")
 
-            os.unlink(tmp_path)
+            text = " ".join(kept).strip()
 
             # Note: single-word transcripts are kept — the no_speech_prob
             # filter above is sufficient to catch non-speech sounds.
@@ -1614,6 +1603,8 @@ class LiveSession:
         """Strip markdown formatting for TTS output."""
         import re
         s = text
+        # Filter stage directions: "(quiet)", "(silence)", "(no response)", etc.
+        s = re.sub(r'^\s*\([^)]{1,30}\)\s*$', '', s)
         s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)  # **bold**
         s = re.sub(r'\*(.+?)\*', r'\1', s)        # *italic*
         s = re.sub(r'__(.+?)__', r'\1', s)        # __bold__
@@ -1855,9 +1846,10 @@ class LiveSession:
         except Exception as e:
             print(f"Live session: Error reading CLI response: {e}", flush=True)
 
-        # Log full assistant response
-        if full_response.strip() and self.generation_id == gen_id:
-            self._log_event("assistant", text=full_response.strip())
+        # Log full assistant response (skip stage directions like "(quiet)")
+        logged_response = self._strip_markdown(full_response)
+        if logged_response and self.generation_id == gen_id:
+            self._log_event("assistant", text=logged_response)
 
         # Flush post-tool text now that the turn is complete (use pysbd for proper splitting)
         if saw_tool_use and post_tool_buffer.strip() and self.generation_id == gen_id:

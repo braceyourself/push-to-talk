@@ -2,7 +2,7 @@
 # Install with: pip install -r requirements.txt
 
 # Speech recognition
-openai-whisper
+faster-whisper
 
 # Keyboard listener
 pynput

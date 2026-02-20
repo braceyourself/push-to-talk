@@ -2,91 +2,124 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>Push-to-Talk Live Dashboard</title>
+<title>Push-to-Talk Event Bus Dashboard</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #1a1a2e; color: #e0e0e0; font-family: system-ui, -apple-system, sans-serif; height: 100vh; overflow: hidden; }
+  body { background: #0f0f1a; color: #e0e0e0; font-family: system-ui, -apple-system, sans-serif; height: 100vh; overflow: hidden; }
 
   /* ── Header ── */
   .header {
     display: flex; align-items: center; justify-content: space-between;
     padding: 10px 20px; background: #16213e; border-bottom: 1px solid #0f3460;
   }
-  .header h1 { font-size: 1.1em; font-weight: 600; }
-  .header-right { display: flex; align-items: center; gap: 16px; font-size: 13px; color: #888; }
-  .conn-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .header h1 { font-size: 1.1em; font-weight: 600; color: #c4b5fd; }
+  .header-right { display: flex; align-items: center; gap: 16px; font-size: 12px; color: #888; }
+  .conn-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
   .conn-dot.connected { background: #4ade80; box-shadow: 0 0 6px #4ade80; }
   .conn-dot.disconnected { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
   .gen-id { font-family: monospace; color: #a78bfa; }
+  .session-id { font-family: monospace; color: #555; }
 
   /* ── Layout ── */
-  .main { display: grid; grid-template-rows: auto 1fr; height: calc(100vh - 46px); }
+  .main { display: grid; grid-template-rows: auto auto 1fr; height: calc(100vh - 44px); }
 
   /* ── Pipeline Row ── */
+  .pipeline-section { padding: 14px 16px 6px; }
   .pipeline-row {
     display: flex; align-items: center; justify-content: center; gap: 0;
-    padding: 16px 12px; background: #16213e40; flex-wrap: nowrap;
-    overflow-x: auto; min-height: 0;
+    flex-wrap: nowrap; overflow-x: auto; min-height: 0;
   }
   .stage-node {
-    display: flex; flex-direction: column; align-items: center; gap: 4px;
-    padding: 10px 12px; border-radius: 10px; border: 2px solid; min-width: 80px;
+    display: flex; flex-direction: column; align-items: center; gap: 3px;
+    padding: 8px 10px; border-radius: 8px; border: 1.5px solid; min-width: 72px;
     position: relative; flex-shrink: 0;
     transition: background 0.3s, border-color 0.3s, box-shadow 0.3s;
     background: transparent;
   }
   .stage-node.active {
     background: var(--bg-active);
-    box-shadow: 0 0 20px var(--glow), inset 0 0 12px var(--glow);
+    box-shadow: 0 0 16px var(--glow), inset 0 0 10px var(--glow);
     border-color: var(--color-bright);
   }
   .stage-node.active .stage-name { color: #fff; }
   .stage-node.active .stage-detail { color: #ccc; }
-  .stage-name { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; transition: color 0.3s; }
-  .stage-detail { font-size: 11px; color: #888; font-family: monospace; transition: color 0.3s; }
+  .stage-name { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; transition: color 0.3s; color: #999; }
+  .stage-detail { font-size: 10px; color: #666; font-family: monospace; transition: color 0.3s; max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  .node-mic { border-color: #4ade8060; --color-bright: #4ade80; --bg-active: #4ade8025; --glow: #4ade8040; }
-  .node-stt { border-color: #60a5fa60; --color-bright: #60a5fa; --bg-active: #60a5fa25; --glow: #60a5fa40; }
-  .node-llm { border-color: #a78bfa60; --color-bright: #a78bfa; --bg-active: #a78bfa25; --glow: #a78bfa40; }
-  .node-composer { border-color: #f59e0b60; --color-bright: #f59e0b; --bg-active: #f59e0b25; --glow: #f59e0b40; }
-  .node-playback { border-color: #ec489960; --color-bright: #ec4899; --bg-active: #ec489925; --glow: #ec489940; }
+  .node-mic { border-color: #4ade8040; --color-bright: #4ade80; --bg-active: #4ade8018; --glow: #4ade8030; }
+  .node-stt { border-color: #60a5fa40; --color-bright: #60a5fa; --bg-active: #60a5fa18; --glow: #60a5fa30; }
+  .node-llm { border-color: #a78bfa40; --color-bright: #a78bfa; --bg-active: #a78bfa18; --glow: #a78bfa30; }
+  .node-composer { border-color: #f59e0b40; --color-bright: #f59e0b; --bg-active: #f59e0b18; --glow: #f59e0b30; }
+  .node-playback { border-color: #ec489940; --color-bright: #ec4899; --bg-active: #ec489918; --glow: #ec489930; }
 
   .queue-pill {
     display: flex; align-items: center; justify-content: center;
-    padding: 2px 6px; margin: 0 2px; font-size: 10px; font-family: monospace;
-    border-radius: 8px; background: #1a1a2e; border: 1px solid #333; min-width: 24px; flex-shrink: 0;
+    padding: 1px 5px; margin: 0 1px; font-size: 9px; font-family: monospace;
+    border-radius: 6px; background: #0f0f1a; border: 1px solid #333; min-width: 20px; flex-shrink: 0;
   }
-  .queue-pill.low { border-color: #4ade80; color: #4ade80; }
+  .queue-pill.low { border-color: #4ade8060; color: #4ade80; }
   .queue-pill.mid { border-color: #f59e0b; color: #f59e0b; }
   .queue-pill.high { border-color: #ef4444; color: #ef4444; }
-  .arrow { color: #555; font-size: 14px; margin: 0 1px; flex-shrink: 0; }
+  .arrow { color: #444; font-size: 12px; margin: 0 1px; flex-shrink: 0; }
 
   /* ── RMS Meter ── */
-  .rms-meter { display: flex; align-items: flex-end; gap: 2px; height: 24px; margin-top: 4px; }
-  .rms-bar { width: 6px; background: #4ade80; border-radius: 2px 2px 0 0; transition: height 80ms ease-out; min-height: 2px; }
+  .rms-meter { display: flex; align-items: flex-end; gap: 1px; height: 18px; margin-top: 2px; }
+  .rms-bar { width: 4px; background: #4ade80; border-radius: 1px 1px 0 0; transition: height 80ms ease-out; min-height: 2px; }
+
+  /* ── Event Bus Bar ── */
+  .bus-section {
+    padding: 4px 16px 10px; display: flex; flex-direction: column; gap: 4px;
+  }
+  .bus-bar {
+    display: flex; align-items: center; gap: 0; position: relative;
+  }
+  .bus-line {
+    flex: 1; height: 2px; background: linear-gradient(90deg, #c4b5fd30, #c4b5fd60, #c4b5fd30);
+    position: relative;
+  }
+  .bus-line.active {
+    background: linear-gradient(90deg, #c4b5fd40, #c4b5fd, #c4b5fd40);
+    box-shadow: 0 0 8px #c4b5fd40;
+  }
+  .bus-label {
+    font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
+    color: #c4b5fd60; padding: 0 8px; white-space: nowrap;
+  }
+  .bus-label.active { color: #c4b5fd; }
+  .bus-writers {
+    display: flex; justify-content: center; gap: 20px; padding: 0 8px;
+  }
+  .bus-writer {
+    display: flex; align-items: center; gap: 5px; font-size: 10px; color: #555;
+  }
+  .bus-writer-dot { width: 6px; height: 6px; border-radius: 50%; background: #333; flex-shrink: 0; }
+  .bus-writer.active .bus-writer-dot { box-shadow: 0 0 6px var(--writer-color); }
+  .bus-writer.live_session { --writer-color: #a78bfa; }
+  .bus-writer.live_session .bus-writer-dot { background: #a78bfa40; }
+  .bus-writer.live_session.active .bus-writer-dot { background: #a78bfa; }
+  .bus-writer.learner { --writer-color: #4ade80; }
+  .bus-writer.learner .bus-writer-dot { background: #4ade8040; }
+  .bus-writer.learner.active .bus-writer-dot { background: #4ade80; }
+  .bus-writer.indicator { --writer-color: #f59e0b; }
+  .bus-writer.indicator .bus-writer-dot { background: #f59e0b40; }
+  .bus-writer.indicator.active .bus-writer-dot { background: #f59e0b; }
+  .bus-event-count { font-family: monospace; font-size: 10px; color: #555; padding: 0 8px; }
 
   /* ── Bottom Section ── */
-  .bottom { display: grid; grid-template-columns: 340px 1fr; gap: 0; overflow: hidden; }
+  .bottom { display: grid; grid-template-columns: 300px 1fr; gap: 0; overflow: hidden; }
 
-  /* ── Metrics Panel ── */
-  .metrics { padding: 16px; display: flex; flex-direction: column; gap: 12px; border-right: 1px solid #0f3460; overflow-y: auto; }
-  .metric-card {
-    background: #16213e; border-radius: 8px; padding: 12px 14px; border: 1px solid #0f3460;
-  }
-  .metric-label { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
-  .metric-value { font-size: 28px; font-weight: 700; font-family: monospace; }
-  .metric-value.stt-color { color: #60a5fa; }
-  .metric-value.llm-color { color: #a78bfa; }
-  .metric-value.tts-color { color: #f59e0b; }
-  .sparkline { margin-top: 6px; }
-  .sparkline svg { display: block; }
+  /* ── Left Panel ── */
+  .left-panel { display: flex; flex-direction: column; gap: 0; border-right: 1px solid #0f3460; overflow-y: auto; }
+  .left-panel::-webkit-scrollbar { width: 4px; }
+  .left-panel::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
 
-  /* ── Status indicator ── */
+  /* ── Status + Metrics ── */
+  .status-metrics { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
   .status-card {
-    background: #16213e; border-radius: 8px; padding: 10px 14px; border: 1px solid #0f3460;
-    display: flex; align-items: center; gap: 10px;
+    background: #16213e; border-radius: 6px; padding: 8px 12px; border: 1px solid #0f3460;
+    display: flex; align-items: center; gap: 8px;
   }
-  .status-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+  .status-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
   .status-dot.listening { background: #4ade80; }
   .status-dot.thinking { background: #a78bfa; animation: blink 1s ease-in-out infinite; }
   .status-dot.speaking { background: #f59e0b; }
@@ -94,105 +127,197 @@
   .status-dot.tool_use { background: #60a5fa; }
   .status-dot.idle { background: #555; }
   @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-  .status-text { font-size: 14px; font-weight: 600; text-transform: capitalize; }
+  .status-text { font-size: 13px; font-weight: 600; text-transform: capitalize; }
+  .metrics-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+  .metric-mini {
+    background: #16213e; border-radius: 6px; padding: 6px 8px; border: 1px solid #0f3460; text-align: center;
+  }
+  .metric-mini-label { font-size: 9px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
+  .metric-mini-val { font-size: 18px; font-weight: 700; font-family: monospace; margin-top: 2px; }
+  .metric-mini-val.stt-color { color: #60a5fa; }
+  .metric-mini-val.llm-color { color: #a78bfa; }
+  .metric-mini-val.tts-color { color: #f59e0b; }
+  .sparkline-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+  .sparkline-cell { background: #16213e; border-radius: 6px; padding: 4px; border: 1px solid #0f3460; overflow: hidden; }
+  .sparkline-cell svg { display: block; width: 100%; }
+
+  /* ── Conversation Panel ── */
+  .conversation {
+    flex: 1; display: flex; flex-direction: column; overflow: hidden;
+    border-top: 1px solid #0f3460;
+  }
+  .conv-header {
+    padding: 8px 12px; font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 0.5px;
+    border-bottom: 1px solid #0f346040; flex-shrink: 0;
+  }
+  .conv-content { flex: 1; overflow-y: auto; padding: 6px 10px; }
+  .conv-content::-webkit-scrollbar { width: 4px; }
+  .conv-content::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+  .conv-turn { padding: 5px 8px; margin-bottom: 4px; border-radius: 6px; font-size: 12px; line-height: 1.4; }
+  .conv-turn.user { background: #60a5fa10; border-left: 2px solid #60a5fa40; color: #a0c4f0; }
+  .conv-turn.assistant { background: #a78bfa10; border-left: 2px solid #a78bfa40; color: #c4b5fd; }
+  .conv-turn.filler { background: #a78bfa08; border-left: 2px solid #a78bfa25; color: #8878b0; font-style: italic; }
+  .conv-role { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
+  .conv-role.user { color: #60a5fa; }
+  .conv-role.assistant { color: #a78bfa; }
+  .conv-text { word-wrap: break-word; }
 
   /* ── Event Log ── */
   .event-log { display: flex; flex-direction: column; overflow: hidden; }
-  .log-header { padding: 12px 16px; font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #0f3460; flex-shrink: 0; }
-  .log-content {
-    flex: 1; overflow-y: auto; padding: 8px 16px; font-family: monospace; font-size: 12px;
-    line-height: 1.6;
+  .log-header {
+    padding: 8px 14px; font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 0.5px;
+    border-bottom: 1px solid #0f3460; flex-shrink: 0;
+    display: flex; justify-content: space-between; align-items: center;
   }
-  .log-content::-webkit-scrollbar { width: 6px; }
-  .log-content::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+  .log-filter { display: flex; gap: 4px; }
+  .log-filter-btn {
+    font-size: 9px; padding: 2px 6px; border-radius: 4px; border: 1px solid #333;
+    background: transparent; color: #666; cursor: pointer; font-family: inherit;
+  }
+  .log-filter-btn.active { border-color: #a78bfa; color: #a78bfa; background: #a78bfa15; }
+  .log-content {
+    flex: 1; overflow-y: auto; padding: 4px 14px; font-family: monospace; font-size: 11px;
+    line-height: 1.5;
+  }
+  .log-content::-webkit-scrollbar { width: 4px; }
+  .log-content::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
   .log-entry { white-space: nowrap; }
-  .log-ts { color: #555; }
+  .log-ts { color: #444; }
+  .log-src { font-size: 9px; padding: 0 3px; border-radius: 3px; margin-right: 4px; }
+  .log-src.live_session { color: #a78bfa80; }
+  .log-src.learner { color: #4ade8080; }
+  .log-src.indicator { color: #f59e0b80; }
   .log-type { font-weight: 600; }
   .log-type.status { color: #4ade80; }
-  .log-type.audio_rms { color: #4ade8080; }
+  .log-type.audio_rms { color: #4ade8060; }
   .log-type.stt_start, .log-type.stt_complete { color: #60a5fa; }
   .log-type.llm_send, .log-type.llm_first_token, .log-type.llm_text_delta, .log-type.llm_complete { color: #a78bfa; }
   .log-type.llm_tool_use { color: #60a5fa; }
   .log-type.tts_start, .log-type.tts_complete { color: #f59e0b; }
   .log-type.filler_played { color: #ec4899; }
-  .log-type.barge_in { color: #ef4444; }
-  .log-type.queue_depths { color: #55555580; }
-  .log-type.snapshot { color: #888; }
-  .log-data { color: #888; }
+  .log-type.barge_in { color: #ef4444; font-weight: 700; }
+  .log-type.queue_depths { color: #33333380; }
+  .log-type.snapshot { color: #555; }
+  .log-type.user { color: #60a5fa; }
+  .log-type.assistant { color: #a78bfa; }
+  .log-type.session_start, .log-type.session_end { color: #c4b5fd; font-style: italic; }
+  .log-type.command { color: #f59e0b; }
+  .log-type.learner_notify { color: #4ade80; }
+  .log-type.task_complete { color: #4ade80; }
+  .log-type.task_failed { color: #ef4444; }
+  .log-type.error { color: #ef4444; font-weight: 700; }
+  .log-type.classification { color: #888; }
+  .log-data { color: #555; }
 </style>
 </head>
 <body>
 <div class="header">
-  <h1>Push-to-Talk Live Pipeline</h1>
+  <h1>Event Bus Dashboard</h1>
   <div class="header-right">
     <span><span class="conn-dot disconnected" id="connDot"></span> <span id="connLabel">Disconnected</span></span>
-    <span>gen: <span class="gen-id" id="genId">-</span></span>
+    <span>gen:<span class="gen-id" id="genId">-</span></span>
+    <span class="session-id" id="sessionId"></span>
   </div>
 </div>
 
 <div class="main">
-  <!-- Pipeline Flow -->
-  <div class="pipeline-row">
-    <div class="stage-node node-mic" id="nodeMic">
-      <div class="stage-name">Mic</div>
-      <div class="rms-meter" id="rmsMeter"></div>
-      <div class="stage-detail" id="micDetail">-</div>
-    </div>
-    <span class="arrow">&rarr;</span>
-    <div class="queue-pill low" id="qAudioIn">0</div>
-    <span class="arrow">&rarr;</span>
-    <div class="stage-node node-stt" id="nodeStt">
-      <div class="stage-name">STT</div>
-      <div class="stage-detail" id="sttDetail">-</div>
-    </div>
-    <span class="arrow">&rarr;</span>
-    <div class="queue-pill low" id="qSttOut">0</div>
-    <span class="arrow">&rarr;</span>
-    <div class="stage-node node-llm" id="nodeLlm">
-      <div class="stage-name">LLM</div>
-      <div class="stage-detail" id="llmDetail">-</div>
-    </div>
-    <span class="arrow">&rarr;</span>
-    <div class="queue-pill low" id="qComposer">0</div>
-    <span class="arrow">&rarr;</span>
-    <div class="stage-node node-composer" id="nodeComposer">
-      <div class="stage-name">Composer</div>
-      <div class="stage-detail" id="composerDetail">-</div>
-    </div>
-    <span class="arrow">&rarr;</span>
-    <div class="queue-pill low" id="qAudioOut">0</div>
-    <span class="arrow">&rarr;</span>
-    <div class="stage-node node-playback" id="nodePlayback">
-      <div class="stage-name">Playback</div>
-      <div class="stage-detail" id="playbackDetail">-</div>
+  <!-- Pipeline Flow + Bus -->
+  <div class="pipeline-section">
+    <div class="pipeline-row">
+      <div class="stage-node node-mic" id="nodeMic">
+        <div class="stage-name">Mic</div>
+        <div class="rms-meter" id="rmsMeter"></div>
+        <div class="stage-detail" id="micDetail">-</div>
+      </div>
+      <span class="arrow">&rarr;</span>
+      <div class="queue-pill low" id="qAudioIn">0</div>
+      <span class="arrow">&rarr;</span>
+      <div class="stage-node node-stt" id="nodeStt">
+        <div class="stage-name">STT</div>
+        <div class="stage-detail" id="sttDetail">-</div>
+      </div>
+      <span class="arrow">&rarr;</span>
+      <div class="queue-pill low" id="qSttOut">0</div>
+      <span class="arrow">&rarr;</span>
+      <div class="stage-node node-llm" id="nodeLlm">
+        <div class="stage-name">LLM</div>
+        <div class="stage-detail" id="llmDetail">-</div>
+      </div>
+      <span class="arrow">&rarr;</span>
+      <div class="queue-pill low" id="qComposer">0</div>
+      <span class="arrow">&rarr;</span>
+      <div class="stage-node node-composer" id="nodeComposer">
+        <div class="stage-name">Composer</div>
+        <div class="stage-detail" id="composerDetail">-</div>
+      </div>
+      <span class="arrow">&rarr;</span>
+      <div class="queue-pill low" id="qAudioOut">0</div>
+      <span class="arrow">&rarr;</span>
+      <div class="stage-node node-playback" id="nodePlayback">
+        <div class="stage-name">Playback</div>
+        <div class="stage-detail" id="playbackDetail">-</div>
+      </div>
     </div>
   </div>
 
-  <!-- Bottom: Metrics + Event Log -->
+  <!-- Event Bus Backbone -->
+  <div class="bus-section">
+    <div class="bus-bar">
+      <div class="bus-line" id="busLine"></div>
+      <div class="bus-label" id="busLabel">events.jsonl</div>
+      <div class="bus-line" id="busLine2"></div>
+    </div>
+    <div class="bus-writers">
+      <div class="bus-writer live_session" id="writerPipeline"><div class="bus-writer-dot"></div>pipeline</div>
+      <div class="bus-writer learner" id="writerLearner"><div class="bus-writer-dot"></div>learner</div>
+      <div class="bus-writer indicator" id="writerIndicator"><div class="bus-writer-dot"></div>indicator</div>
+      <div class="bus-event-count" id="busEventCount">0 events</div>
+    </div>
+  </div>
+
+  <!-- Bottom: Left Panel + Event Log -->
   <div class="bottom">
-    <div class="metrics">
-      <div class="status-card">
-        <div class="status-dot idle" id="statusDot"></div>
-        <div class="status-text" id="statusText">Idle</div>
+    <div class="left-panel">
+      <div class="status-metrics">
+        <div class="status-card">
+          <div class="status-dot idle" id="statusDot"></div>
+          <div class="status-text" id="statusText">Idle</div>
+        </div>
+        <div class="metrics-row">
+          <div class="metric-mini">
+            <div class="metric-mini-label">STT</div>
+            <div class="metric-mini-val stt-color" id="metricStt">-</div>
+          </div>
+          <div class="metric-mini">
+            <div class="metric-mini-label">TTFT</div>
+            <div class="metric-mini-val llm-color" id="metricLlm">-</div>
+          </div>
+          <div class="metric-mini">
+            <div class="metric-mini-label">TTS</div>
+            <div class="metric-mini-val tts-color" id="metricTts">-</div>
+          </div>
+        </div>
+        <div class="sparkline-row">
+          <div class="sparkline-cell" id="sparkStt"></div>
+          <div class="sparkline-cell" id="sparkLlm"></div>
+          <div class="sparkline-cell" id="sparkTts"></div>
+        </div>
       </div>
-      <div class="metric-card">
-        <div class="metric-label">STT Latency</div>
-        <div class="metric-value stt-color" id="metricStt">- ms</div>
-        <div class="sparkline" id="sparkStt"></div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-label">First Token</div>
-        <div class="metric-value llm-color" id="metricLlm">- ms</div>
-        <div class="sparkline" id="sparkLlm"></div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-label">TTS Latency</div>
-        <div class="metric-value tts-color" id="metricTts">- ms</div>
-        <div class="sparkline" id="sparkTts"></div>
+      <div class="conversation">
+        <div class="conv-header">Conversation</div>
+        <div class="conv-content" id="convContent"></div>
       </div>
     </div>
     <div class="event-log">
-      <div class="log-header">Event Log</div>
+      <div class="log-header">
+        <span>Event Bus Log</span>
+        <div class="log-filter">
+          <button class="log-filter-btn active" data-filter="all">All</button>
+          <button class="log-filter-btn" data-filter="pipeline">Pipeline</button>
+          <button class="log-filter-btn" data-filter="turns">Turns</button>
+          <button class="log-filter-btn" data-filter="errors">Errors</button>
+        </div>
+      </div>
       <div class="log-content" id="logContent"></div>
     </div>
   </div>
@@ -204,15 +329,24 @@
 
   // ── State ──
   let es = null;
-  const MAX_LOG = 200;
+  const MAX_LOG = 300;
+  const MAX_CONV = 20;
   const SPARK_LEN = 20;
   const sttLatencies = [], llmLatencies = [], ttsLatencies = [];
-  let logCount = 0;
+  let logCount = 0, convCount = 0, busEventTotal = 0;
+  let activeFilter = 'all';
+  const writerTimers = {};
+
+  // Filter categories
+  const FILTER_PIPELINE = new Set(['stt_start','stt_complete','llm_send','llm_first_token','llm_text_delta','llm_tool_use','llm_complete','tts_start','tts_complete','filler_played','barge_in','status','audio_rms']);
+  const FILTER_TURNS = new Set(['user','assistant','session_start','session_end','learner_notify','task_complete','task_failed','command']);
+  const FILTER_ERRORS = new Set(['error','task_failed','barge_in']);
+  const LOG_SUPPRESS = new Set(['queue_depths','audio_rms']);
 
   // ── DOM refs ──
   const $ = id => document.getElementById(id);
   const connDot = $('connDot'), connLabel = $('connLabel'), genId = $('genId');
-  const logContent = $('logContent');
+  const logContent = $('logContent'), convContent = $('convContent');
   const rmsMeter = $('rmsMeter');
 
   // Build RMS bars
@@ -221,6 +355,28 @@
     bar.className = 'rms-bar';
     bar.style.height = '2px';
     rmsMeter.appendChild(bar);
+  }
+
+  // ── Filter buttons ──
+  document.querySelectorAll('.log-filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.log-filter-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      activeFilter = btn.dataset.filter;
+      // Re-filter visible entries
+      logContent.querySelectorAll('.log-entry').forEach(entry => {
+        const type = entry.dataset.type;
+        entry.style.display = shouldShowLog(type) ? '' : 'none';
+      });
+    });
+  });
+
+  function shouldShowLog(type) {
+    if (activeFilter === 'all') return !LOG_SUPPRESS.has(type);
+    if (activeFilter === 'pipeline') return FILTER_PIPELINE.has(type);
+    if (activeFilter === 'turns') return FILTER_TURNS.has(type);
+    if (activeFilter === 'errors') return FILTER_ERRORS.has(type);
+    return true;
   }
 
   // ── Queue pill helpers ──
@@ -235,7 +391,7 @@
   function renderSparkline(containerId, values, color) {
     const el = $(containerId);
     if (!el || values.length < 2) return;
-    const w = 280, h = 30;
+    const w = 80, h = 24;
     const max = Math.max(...values, 1);
     const pts = values.map((v, i) => {
       const x = (i / (SPARK_LEN - 1)) * w;
@@ -243,12 +399,11 @@
       return `${x},${y}`;
     });
     el.innerHTML = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
-      <polyline points="${pts.join(' ')}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <polyline points="${pts.join(' ')}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.7"/>
     </svg>`;
   }
 
-  // ── Activate node (pulse) ──
-  // Track per-node timeout handles so we can extend/clear
+  // ── Activate node ──
   const nodeTimers = {};
   function activateNode(id, ms) {
     const el = $(id);
@@ -264,14 +419,29 @@
       if (nodeTimers[id]) { clearTimeout(nodeTimers[id]); nodeTimers[id] = null; }
     }
   }
-  // Set the primary active stage based on pipeline status
   function setPipelineStage(status) {
     deactivateAllNodes();
     if (status === 'listening') activateNode('nodeMic', 60000);
     else if (status === 'thinking') activateNode('nodeLlm', 60000);
     else if (status === 'speaking') { activateNode('nodeComposer', 60000); activateNode('nodePlayback', 60000); }
     else if (status === 'tool_use') activateNode('nodeLlm', 60000);
-    else if (status === 'muted') {} // nothing lit
+  }
+
+  // ── Bus writer flash ──
+  function flashWriter(src) {
+    const id = src === 'live_session' ? 'writerPipeline' : src === 'learner' ? 'writerLearner' : src === 'indicator' ? 'writerIndicator' : null;
+    if (!id) return;
+    const el = $(id);
+    if (!el) return;
+    el.classList.add('active');
+    if (writerTimers[id]) clearTimeout(writerTimers[id]);
+    writerTimers[id] = setTimeout(() => el.classList.remove('active'), 1500);
+  }
+
+  function flashBusLine() {
+    const l1 = $('busLine'), l2 = $('busLine2'), lbl = $('busLabel');
+    l1.classList.add('active'); l2.classList.add('active'); lbl.classList.add('active');
+    setTimeout(() => { l1.classList.remove('active'); l2.classList.remove('active'); lbl.classList.remove('active'); }, 300);
   }
 
   // ── Status update ──
@@ -281,23 +451,52 @@
     text.textContent = status || 'idle';
   }
 
+  // ── Conversation turn ──
+  function addConvTurn(role, text, extraClass) {
+    const turn = document.createElement('div');
+    turn.className = 'conv-turn ' + (extraClass || role);
+    const maxLen = 200;
+    const displayText = text.length > maxLen ? text.substring(0, maxLen) + '...' : text;
+    const label = extraClass === 'filler' ? 'filler' : role;
+    turn.innerHTML = `<div class="conv-role ${role}">${label}</div><div class="conv-text">${escapeHtml(displayText)}</div>`;
+    convContent.appendChild(turn);
+    convCount++;
+    if (convCount > MAX_CONV) {
+      convContent.removeChild(convContent.firstChild);
+      convCount--;
+    }
+    convContent.scrollTop = convContent.scrollHeight;
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
   // ── Log entry ──
   function addLog(event) {
     const t = new Date(event.ts * 1000);
     const ts = t.toLocaleTimeString('en-US', { hour12: false }) + '.' + String(t.getMilliseconds()).padStart(3, '0');
 
+    // Source tag
+    const src = event.src || '';
+
     let detail = '';
-    const skip = new Set(['type', 'ts', 'gen_id']);
+    const skip = new Set(['type', 'ts', 'gen_id', 'src', 'sid']);
     for (const [k, v] of Object.entries(event)) {
       if (skip.has(k)) continue;
       const sv = typeof v === 'string' ? v : JSON.stringify(v);
-      if (sv.length > 80) detail += ` ${k}=${sv.substring(0, 77)}...`;
+      if (sv.length > 60) detail += ` ${k}=${sv.substring(0, 57)}...`;
       else detail += ` ${k}=${sv}`;
     }
 
     const entry = document.createElement('div');
     entry.className = 'log-entry';
-    entry.innerHTML = `<span class="log-ts">${ts}</span> <span class="log-type ${event.type}">${event.type}</span><span class="log-data">${detail}</span>`;
+    entry.dataset.type = event.type;
+    const srcTag = src ? `<span class="log-src ${src}">${src.replace('live_session','pipe')}</span>` : '';
+    entry.innerHTML = `<span class="log-ts">${ts}</span> ${srcTag}<span class="log-type ${event.type}">${event.type}</span><span class="log-data">${detail}</span>`;
+
+    if (!shouldShowLog(event.type)) entry.style.display = 'none';
+
     logContent.appendChild(entry);
     logCount++;
     if (logCount > MAX_LOG) {
@@ -326,12 +525,11 @@
     audio_rms(e) {
       const bars = rmsMeter.children;
       const rms = e.rms || 0;
-      // Distribute RMS across 8 bars with some randomness for visual appeal
       for (let i = 0; i < bars.length; i++) {
         const factor = 0.5 + Math.random() * 0.5;
-        const h = Math.min(24, Math.max(2, (rms / 500) * 24 * factor));
+        const h = Math.min(18, Math.max(2, (rms / 500) * 18 * factor));
         bars[i].style.height = h + 'px';
-        bars[i].style.background = rms > 200 ? '#4ade80' : rms > 100 ? '#60a5fa' : '#555';
+        bars[i].style.background = rms > 200 ? '#4ade80' : rms > 100 ? '#60a5fa' : '#444';
       }
       $('micDetail').textContent = `RMS: ${Math.round(rms)}`;
       activateNode('nodeMic', 300);
@@ -343,21 +541,21 @@
     stt_complete(e) {
       const ms = e.latency_ms;
       if (ms != null) {
-        $('metricStt').textContent = Math.round(ms) + ' ms';
+        $('metricStt').textContent = Math.round(ms);
         sttLatencies.push(ms);
         if (sttLatencies.length > SPARK_LEN) sttLatencies.shift();
         renderSparkline('sparkStt', sttLatencies, '#60a5fa');
       }
-      if (e.text) $('sttDetail').textContent = e.text.substring(0, 30);
+      if (e.text) $('sttDetail').textContent = e.text.substring(0, 25);
     },
     llm_send(e) {
-      $('llmDetail').textContent = (e.text_preview || '').substring(0, 30);
+      $('llmDetail').textContent = (e.text_preview || '').substring(0, 25);
       activateNode('nodeLlm', 5000);
     },
     llm_first_token(e) {
       const ms = e.latency_ms;
       if (ms != null) {
-        $('metricLlm').textContent = Math.round(ms) + ' ms';
+        $('metricLlm').textContent = Math.round(ms);
         llmLatencies.push(ms);
         if (llmLatencies.length > SPARK_LEN) llmLatencies.shift();
         renderSparkline('sparkLlm', llmLatencies, '#a78bfa');
@@ -374,13 +572,13 @@
       $('llmDetail').textContent = `${e.total_chars || 0}c / ${e.sentences || 0}s`;
     },
     tts_start(e) {
-      $('composerDetail').textContent = (e.text || '').substring(0, 20);
+      $('composerDetail').textContent = (e.text || '').substring(0, 18);
       activateNode('nodeComposer', 2000);
     },
     tts_complete(e) {
       const ms = e.latency_ms;
       if (ms != null) {
-        $('metricTts').textContent = Math.round(ms) + ' ms';
+        $('metricTts').textContent = Math.round(ms);
         ttsLatencies.push(ms);
         if (ttsLatencies.length > SPARK_LEN) ttsLatencies.shift();
         renderSparkline('sparkTts', ttsLatencies, '#f59e0b');
@@ -400,16 +598,43 @@
       updateQueuePill('qComposer', e.composer || 0);
       updateQueuePill('qAudioOut', e.audio_out || 0);
     },
+    user(e) {
+      if (e.text) addConvTurn('user', e.text);
+    },
+    assistant(e) {
+      if (e.text) addConvTurn('assistant', e.text, e.filler ? 'filler' : undefined);
+    },
+    session_start(e) {
+      if (e.session_id) $('sessionId').textContent = e.session_id;
+    },
+    task_complete(e) {
+      $('playbackDetail').textContent = `task done`;
+    },
+    task_failed(e) {
+      $('playbackDetail').textContent = `task fail`;
+    },
+    command(e) {
+      // Flash indicator writer
+    },
+    learner_notify(e) {
+      if (e.summary) addConvTurn('assistant', `[Learned] ${e.summary}`);
+    },
   };
 
   function handleEvent(event) {
     genId.textContent = event.gen_id;
+    busEventTotal++;
+    $('busEventCount').textContent = busEventTotal + ' events';
+
+    // Flash bus visuals
+    flashBusLine();
+    if (event.src) flashWriter(event.src);
+
     const fn = handlers[event.type];
     if (fn) fn(event);
-    // Don't log queue_depths to reduce noise
-    if (event.type !== 'queue_depths') {
-      addLog(event);
-    }
+
+    // Log everything except suppressed types
+    addLog(event);
   }
 
   // ── SSE Connection ──
@@ -443,7 +668,7 @@
   // ── Init ──
   connect();
 
-  // Decay RMS bars when no events
+  // Decay RMS bars
   setInterval(() => {
     const bars = rmsMeter.children;
     for (let i = 0; i < bars.length; i++) {
