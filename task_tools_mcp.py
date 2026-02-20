@@ -21,8 +21,7 @@ TOOLS = [
             "Start a background Claude CLI agent for COMPLEX, MULTI-STEP work only: editing files, "
             "debugging, refactoring, implementing features, or analysis requiring multiple tool calls. "
             "Do NOT use for simple commands or file reads — use run_command or read_file instead, "
-            "they return results instantly. spawn_task takes 10-60+ seconds to start. "
-            "Return immediately with a brief acknowledgment."
+            "they return results instantly. spawn_task takes 10-60+ seconds to start."
         ),
         "inputSchema": {
             "type": "object",
