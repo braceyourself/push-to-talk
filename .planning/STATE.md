@@ -84,8 +84,11 @@ v1.2 execution decisions (09-02):
 
 - Assistant tool creation feature (user idea captured during Phase 8 execution)
 
-Quick tasks completed:
-- quick-001: Personality system restructured into 5 modular files (Russel identity, Clawdbot values)
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 001 | Adapt Clawdbot personality system (Russel identity, soul values, user prefs) | 2026-02-20 | 0f70b4d | [001-adapt-clawdbot-personality-system](./quick/001-adapt-clawdbot-personality-system/) |
 
 ### Blockers/Concerns
 
