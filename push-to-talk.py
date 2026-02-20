@@ -2507,12 +2507,15 @@ class PushToTalk:
         # Restore live session mute state if we muted it for PTT dictation
         if getattr(self, '_ptt_muted_live', False):
             self._ptt_muted_live = False
-            if self.live_session:
+            if self.live_session and self.live_session.running:
                 self.live_session.set_muted(False)
                 print("PTT done, unmuted live session", flush=True)
 
-        # Dismiss indicator immediately - transcription happens in background
-        set_status('idle')
+        # Restore status — go back to 'listening' if live session is active
+        if self.live_session and self.live_session.running:
+            set_status('listening')
+        else:
+            set_status('idle')
         print("Processing...", flush=True)
 
         # Capture temp_file locally to avoid race conditions with new recordings

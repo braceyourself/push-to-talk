@@ -1728,77 +1728,91 @@ class LiveSession:
     # ── Pipeline Stage 1: Audio Capture ────────────────────────────
 
     async def _audio_capture_stage(self):
-        """Record audio from mic via pw-record and push to audio_in queue."""
-        process = await asyncio.create_subprocess_exec(
-            'pw-record', '--format', 's16', '--rate', str(SAMPLE_RATE), '--channels', str(CHANNELS), '-',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-        print("Live session: Audio capture started", flush=True)
+        """Record audio from mic via pw-record and push to audio_in queue.
 
+        Automatically restarts pw-record if it dies unexpectedly.
+        """
         mute_signal = Path(__file__).parent / "live_mute_toggle"
         chunks_sent = 0
+        restarts = 0
 
-        try:
-            while self.running:
-                # Check for mute toggle signal from overlay
-                if mute_signal.exists():
-                    try:
-                        command = mute_signal.read_text().strip()
-                        mute_signal.unlink()
-                        if command == "stop":
-                            print("Live session: Stop requested by user", flush=True)
-                            self.running = False
-                            break
-                        elif command == "mute":
-                            self.muted = True
-                            self._set_status("muted")
-                            self._reset_idle_timer()
-                            print("Live session: Muted by user", flush=True)
-                        else:
-                            self.muted = not self.muted
-                            status = "muted" if self.muted else "listening"
-                            self._set_status(status)
-                            self._reset_idle_timer()
-                            print(f"Live session: {'Muted' if self.muted else 'Unmuted'} by user", flush=True)
-                    except Exception:
-                        pass
+        while self.running:
+            process = await asyncio.create_subprocess_exec(
+                'pw-record', '--format', 's16', '--rate', str(SAMPLE_RATE), '--channels', str(CHANNELS), '-',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            if restarts > 0:
+                print(f"Live session: Audio capture restarted (attempt {restarts + 1})", flush=True)
+            else:
+                print("Live session: Audio capture started", flush=True)
 
-                # Check for learner notification
-                learner_notify = Path(__file__).parent / "learner_notify"
-                if learner_notify.exists():
-                    try:
-                        summary = learner_notify.read_text().strip()
-                        learner_notify.unlink()
-                        if summary:
-                            self._notification_queue.append({"type": "learning", "summary": summary})
-                            print(f"Live session: Learner notification: {summary[:80]}...", flush=True)
-                            if not self.playing_audio:
-                                asyncio.ensure_future(self._flush_notifications())
-                    except Exception:
-                        pass
+            try:
+                while self.running:
+                    # Check for mute toggle signal from overlay
+                    if mute_signal.exists():
+                        try:
+                            command = mute_signal.read_text().strip()
+                            mute_signal.unlink()
+                            if command == "stop":
+                                print("Live session: Stop requested by user", flush=True)
+                                self.running = False
+                                break
+                            elif command == "mute":
+                                self.muted = True
+                                self._set_status("muted")
+                                self._reset_idle_timer()
+                                print("Live session: Muted by user", flush=True)
+                            else:
+                                self.muted = not self.muted
+                                status = "muted" if self.muted else "listening"
+                                self._set_status(status)
+                                self._reset_idle_timer()
+                                print(f"Live session: {'Muted' if self.muted else 'Unmuted'} by user", flush=True)
+                        except Exception:
+                            pass
 
-                audio_data = await process.stdout.read(CHUNK_SIZE)
-                if not audio_data:
-                    await asyncio.sleep(0.01)
-                    continue
+                    # Check for learner notification
+                    learner_notify = Path(__file__).parent / "learner_notify"
+                    if learner_notify.exists():
+                        try:
+                            summary = learner_notify.read_text().strip()
+                            learner_notify.unlink()
+                            if summary:
+                                self._notification_queue.append({"type": "learning", "summary": summary})
+                                print(f"Live session: Learner notification: {summary[:80]}...", flush=True)
+                                if not self.playing_audio:
+                                    asyncio.ensure_future(self._flush_notifications())
+                        except Exception:
+                            pass
 
-                # Always send audio to the STT stage. During playback, the mic
-                # stays live (for VAD barge-in detection) but STT is gated —
-                # audio is consumed for VAD but not accumulated for transcription.
-                await self._audio_in_q.put(PipelineFrame(
-                    type=FrameType.AUDIO_RAW,
-                    generation_id=self.generation_id,
-                    data=audio_data
-                ))
-                chunks_sent += 1
-                if chunks_sent % 200 == 0:
-                    print(f"Live session: Sent {chunks_sent} audio chunks to STT", flush=True)
+                    audio_data = await process.stdout.read(CHUNK_SIZE)
+                    if not audio_data:
+                        # pw-record died — break inner loop to restart
+                        break
 
-        finally:
-            process.terminate()
-            await process.wait()
-            print(f"Live session: Audio capture stopped ({chunks_sent} chunks)", flush=True)
+                    await self._audio_in_q.put(PipelineFrame(
+                        type=FrameType.AUDIO_RAW,
+                        generation_id=self.generation_id,
+                        data=audio_data
+                    ))
+                    chunks_sent += 1
+                    if chunks_sent % 200 == 0:
+                        print(f"Live session: Sent {chunks_sent} audio chunks to STT", flush=True)
+
+            finally:
+                try:
+                    process.terminate()
+                    await process.wait()
+                except Exception:
+                    pass
+
+            if self.running:
+                restarts += 1
+                print(f"Live session: pw-record exited unexpectedly, restarting in 1s...", flush=True)
+                await asyncio.sleep(1)
+
+        print(f"Live session: Audio capture stopped ({chunks_sent} chunks, {restarts} restarts)", flush=True)
 
     # ── Pipeline Stage 2: STT (Whisper local) ───────────────────
 
