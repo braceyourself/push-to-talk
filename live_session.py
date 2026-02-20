@@ -181,7 +181,8 @@ class LiveSession:
 
     def __init__(self, openai_api_key=None, deepgram_api_key=None,
                  voice="ash", model="claude-sonnet-4-5-20250929", on_status=None,
-                 fillers_enabled=True, barge_in_enabled=True, whisper_model=None):
+                 fillers_enabled=True, barge_in_enabled=True, whisper_model=None,
+                 idle_timeout=0):
         self.openai_api_key = openai_api_key
         self.deepgram_api_key = deepgram_api_key
         self.whisper_model = whisper_model
@@ -209,7 +210,7 @@ class LiveSession:
         self.personality_prompt = self._build_personality()
 
         self._idle_timer = None
-        self._idle_timeout = 120  # seconds
+        self._idle_timeout = idle_timeout
 
         # Playback state
         self._playback_buffer = deque()
@@ -765,6 +766,8 @@ class LiveSession:
 
     def _reset_idle_timer(self):
         self._cancel_idle_timer()
+        if self._idle_timeout <= 0:
+            return
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():

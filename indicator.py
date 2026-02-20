@@ -72,6 +72,7 @@ def load_config():
         "conversation_project_dir": "",
         "auto_start_listening": True,
         "live_auto_mute": True,
+        "live_idle_timeout": 0,
     }
     try:
         if CONFIG_FILE.exists():

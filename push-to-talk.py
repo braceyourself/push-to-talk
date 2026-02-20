@@ -259,6 +259,7 @@ def load_config():
         "live_barge_in": True,           # Allow speaking over AI response
         "auto_start_listening": True,    # Auto-start live session on service startup
         "live_auto_mute": True,          # Allow key-based muting (tap/hold to mute)
+        "live_idle_timeout": 0,          # Idle disconnect (seconds). 0 = never (always-on)
         "verbal_hooks": [
             # Example hooks - customize these:
             # {"trigger": "open browser", "command": "xdg-open https://google.com"},
@@ -926,6 +927,7 @@ class PushToTalk:
         model = self.config.get('live_model', 'claude-sonnet-4-5-20250929')
         fillers = self.config.get('live_fillers', True)
         barge_in = self.config.get('live_barge_in', True)
+        idle_timeout = self.config.get('live_idle_timeout', 0)
         self.live_session = LiveSession(
             openai_api_key=openai_key,
             deepgram_api_key=deepgram_key,
@@ -935,6 +937,7 @@ class PushToTalk:
             fillers_enabled=fillers,
             barge_in_enabled=barge_in,
             whisper_model=self.model,
+            idle_timeout=idle_timeout,
         )
 
         # Ensure TaskManager singleton is initialized for this session
