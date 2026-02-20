@@ -1481,6 +1481,39 @@ async def test_read_file_blocks_ssh():
 
 
 # ══════════════════════════════════════════════════════════════════
+# Test Group 20: Configurable idle timeout
+# ══════════════════════════════════════════════════════════════════
+
+@test("Idle timeout: default is 0 (always-on)")
+def test_idle_timeout_default_zero():
+    """LiveSession with no idle_timeout param should default to 0 (never timeout)."""
+    session = make_session()
+    assert session._idle_timeout == 0, f"Default idle_timeout should be 0, got {session._idle_timeout}"
+
+@test("Idle timeout: custom value accepted")
+def test_idle_timeout_custom_value():
+    """LiveSession accepts custom idle_timeout param."""
+    session = make_session(idle_timeout=300)
+    assert session._idle_timeout == 300, f"idle_timeout should be 300, got {session._idle_timeout}"
+
+@test("Idle timeout: timer not scheduled when timeout is 0")
+async def test_idle_timer_not_scheduled_when_zero():
+    """When idle_timeout=0, _reset_idle_timer should not create a timer."""
+    session = make_session(idle_timeout=0)
+    session._reset_idle_timer()
+    assert session._idle_timer is None, "Timer should be None when idle_timeout=0"
+
+@test("Idle timeout: timer IS scheduled when timeout > 0")
+async def test_idle_timer_scheduled_when_positive():
+    """When idle_timeout>0, _reset_idle_timer should create a timer."""
+    session = make_session(idle_timeout=60)
+    session._reset_idle_timer()
+    assert session._idle_timer is not None, "Timer should be created when idle_timeout=60"
+    # Clean up
+    session._cancel_idle_timer()
+
+
+# ══════════════════════════════════════════════════════════════════
 # Run all tests
 # ══════════════════════════════════════════════════════════════════
 
