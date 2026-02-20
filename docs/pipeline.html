@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Push-to-Talk Pipeline</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; font-family: system-ui; overflow: hidden; height: 100vh; }
+  h1 { color: #e0e0e0; text-align: center; padding: 12px 0; font-size: 1.2em; position: relative; z-index: 10; }
+  #controls {
+    position: fixed; top: 12px; right: 20px; z-index: 20;
+    display: flex; gap: 8px; align-items: center;
+  }
+  #controls button {
+    background: #16213e; color: #e0e0e0; border: 1px solid #0f3460;
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 14px;
+  }
+  #controls button:hover { background: #0f3460; }
+  #controls span { color: #888; font-size: 13px; }
+  #canvas {
+    width: 100%; height: calc(100vh - 50px);
+    overflow: hidden; cursor: grab; position: relative;
+  }
+  #canvas.dragging { cursor: grabbing; }
+  #diagram {
+    transform-origin: 0 0;
+    position: absolute;
+    padding: 40px;
+  }
+  .mermaid { display: inline-block; }
+</style>
+</head>
+<body>
+<h1>Push-to-Talk Input Processing Pipeline</h1>
+<div id="controls">
+  <button id="zoomIn" title="Zoom in">+</button>
+  <button id="zoomOut" title="Zoom out">&minus;</button>
+  <button id="fit" title="Fit to screen">Fit</button>
+  <span id="zoomLevel">100%</span>
+  <span style="margin-left:12px; color:#555">Scroll to zoom &middot; Drag to pan</span>
+</div>
+<div id="canvas">
+  <div id="diagram">
+    <pre class="mermaid">
+graph TD
+    subgraph "Stage 1: Audio Capture"
+        MIC["PulseAudio · pasimple<br/>24kHz 16-bit mono"] --> |"daemon thread<br/>call_soon_threadsafe"| AIQ[("audio_in_q<br/>QueueFull → drop")]
+        SIG["live_mute_toggle"] -.-> |"50ms async poll"| MIC
+    end
+
+    subgraph "Stage 2: STT"
+        AIQ --> BRANCH{State?}
+        BRANCH --> |muted| DISCARD["discard"]
+        BRANCH --> |"gated · AI speaking"| VAD["VAD barge-in"]
+        VAD --> |"6 chunks · ~500ms"| BARGE["trigger_barge_in"]
+        BRANCH --> |normal| BUF["Buffer audio + track RMS"]
+
+        BUF --> TRIGGER{Transcribe?}
+        TRIGGER --> |"0.8s silence + speech"| WHISPER
+        TRIGGER --> |"10s safety cap"| WHISPER
+        TRIGGER --> |"flush · mic muted"| WHISPER
+
+        WHISPER["Whisper STT"] --> HALLUC{Hallucination?}
+        HALLUC --> |yes| REJECT["reject"]
+        HALLUC --> |no| SOQ[("stt_out_q")]
+    end
+
+    subgraph "Stage 3: LLM"
+        SOQ --> |END_OF_UTTERANCE| THINK["thinking · mute mic"]
+        SOQ --> |TRANSCRIPT| FORK["Fork parallel"]
+
+        FORK --> FILLER
+        FORK --> CLI
+
+        subgraph "Filler Path · concurrent"
+            FILLER["_filler_manager"] --> CLASS["Classifier IPC · <5ms"]
+            CLASS --> |"heuristic · short"| CAT
+            CLASS --> |"semantic · longer"| CAT
+            CAT["task · question · conversational · social · emotional · ack"]
+            CAT --> TRIV{Trivial?}
+            TRIV --> |yes| SILENCE["silence · no clip"]
+            TRIV --> |no| GATE{"500ms gate"}
+            GATE --> |"LLM first"| NOFILL["cancel filler"]
+            GATE --> |"gate expired"| CLIP["play response clip"]
+        end
+
+        subgraph "LLM Path · main"
+            CLI["Claude CLI · stream-JSON"] --> READ["_read_cli_response"]
+            READ --> |text_delta| SBUF["sentence_buffer"]
+            SBUF --> SENT{"Sentence end?"}
+            SENT --> |yes| COMP["TTS_SENTENCE"]
+            SENT --> |no| SBUF
+
+            READ --> |tool_use| TOOL["reset composer · ack clip · hold text"]
+            TOOL --> PTBUF["post_tool_buffer · suppressed"]
+
+            READ --> |"result · turn end"| FLUSH["flush via pysbd · END_OF_TURN"]
+        end
+    end
+
+    subgraph "StreamComposer"
+        COMP --> SQ[("segment_q")]
+        CLIP --> SQ
+        FLUSH --> SQ
+
+        SQ --> PROC{Segment type?}
+        PROC --> |FILLER_CLIP| EMIT1["PCM + 250ms pause"]
+        PROC --> |TTS_SENTENCE| TTS["Piper TTS · resample"]
+        TTS --> EMIT2["PCM + 150ms pause"]
+        PROC --> |SILENCE| EMIT3["silence bytes"]
+        PROC --> |END_OF_TURN| EOT["pass through"]
+
+        EMIT1 --> AOQ
+        EMIT2 --> AOQ
+        EMIT3 --> AOQ
+        EOT --> AOQ
+
+        PREFETCH["prefetch next TTS"] -.-> TTS
+
+        AOQ[("audio_out_q")]
+    end
+
+    subgraph "Stage 5: Playback"
+        AOQ --> PA["PyAudio output"]
+        PA --> |"playing = true"| VAD
+        PA --> |END_OF_TURN| UNMUTE["unmute · listening"]
+    end
+
+    style BARGE fill:#ff6b6b,color:#fff
+    style WHISPER fill:#4ecdc4,color:#fff
+    style CLASS fill:#45b7d1,color:#fff
+    style TTS fill:#96ceb4,color:#fff
+    style PA fill:#ffeaa7,color:#333
+    style CLIP fill:#dda0dd,color:#333
+    style TOOL fill:#f0ad4e,color:#fff
+    </pre>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    flowchart: { curve: 'basis', padding: 15, htmlLabels: true },
+    themeVariables: {
+      darkMode: true,
+      background: '#1a1a2e',
+      primaryColor: '#16213e',
+      primaryTextColor: '#e0e0e0',
+      primaryBorderColor: '#0f3460',
+      lineColor: '#e94560',
+      secondaryColor: '#533483',
+      tertiaryColor: '#0f3460'
+    }
+  });
+
+  // Pan & zoom
+  const canvas = document.getElementById('canvas');
+  const diagram = document.getElementById('diagram');
+  const zoomLabel = document.getElementById('zoomLevel');
+
+  let scale = 1;
+  let panX = 0, panY = 0;
+  let isDragging = false;
+  let startX, startY;
+
+  function applyTransform() {
+    diagram.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
+    zoomLabel.textContent = Math.round(scale * 100) + '%';
+  }
+
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+    const oldScale = scale;
+    const delta = e.deltaY > 0 ? 0.9 : 1.1;
+    scale = Math.min(Math.max(scale * delta, 0.1), 5);
+    panX = mouseX - (mouseX - panX) * (scale / oldScale);
+    panY = mouseY - (mouseY - panY) * (scale / oldScale);
+    applyTransform();
+  }, { passive: false });
+
+  canvas.addEventListener('mousedown', (e) => {
+    isDragging = true;
+    startX = e.clientX - panX;
+    startY = e.clientY - panY;
+    canvas.classList.add('dragging');
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    panX = e.clientX - startX;
+    panY = e.clientY - startY;
+    applyTransform();
+  });
+
+  window.addEventListener('mouseup', () => {
+    isDragging = false;
+    canvas.classList.remove('dragging');
+  });
+
+  document.getElementById('zoomIn').addEventListener('click', () => {
+    const rect = canvas.getBoundingClientRect();
+    const cx = rect.width / 2, cy = rect.height / 2;
+    const oldScale = scale;
+    scale = Math.min(scale * 1.25, 5);
+    panX = cx - (cx - panX) * (scale / oldScale);
+    panY = cy - (cy - panY) * (scale / oldScale);
+    applyTransform();
+  });
+
+  document.getElementById('zoomOut').addEventListener('click', () => {
+    const rect = canvas.getBoundingClientRect();
+    const cx = rect.width / 2, cy = rect.height / 2;
+    const oldScale = scale;
+    scale = Math.max(scale * 0.8, 0.1);
+    panX = cx - (cx - panX) * (scale / oldScale);
+    panY = cy - (cy - panY) * (scale / oldScale);
+    applyTransform();
+  });
+
+  document.getElementById('fit').addEventListener('click', fitToScreen);
+
+  function fitToScreen() {
+    const svg = diagram.querySelector('svg');
+    if (!svg) return;
+    const rect = canvas.getBoundingClientRect();
+    const svgW = svg.getBoundingClientRect().width / scale;
+    const svgH = svg.getBoundingClientRect().height / scale;
+    const padding = 40;
+    scale = Math.min(
+      (rect.width - padding * 2) / svgW,
+      (rect.height - padding * 2) / svgH,
+      2
+    );
+    panX = (rect.width - svgW * scale) / 2;
+    panY = (rect.height - svgH * scale) / 2;
+    applyTransform();
+  }
+
+  const observer = new MutationObserver(() => {
+    if (diagram.querySelector('svg')) {
+      observer.disconnect();
+      setTimeout(fitToScreen, 100);
+    }
+  });
+  observer.observe(diagram, { childList: true, subtree: true });
+</script>
+</body>
+</html>

@@ -12,6 +12,7 @@ import sys
 import json
 import asyncio
 import subprocess
+import threading
 import time
 import re
 import wave
@@ -40,7 +41,7 @@ _AI_QUESTION_PATTERNS = re.compile(
 # Audio settings
 SAMPLE_RATE = 24000
 CHANNELS = 1
-CHUNK_SIZE = 4096  # bytes per read from pw-record
+CHUNK_SIZE = 4096  # bytes per read from PulseAudio
 BYTES_PER_SAMPLE = 2  # 16-bit PCM
 
 # TTS sentence buffer — accumulate text until a sentence boundary before sending to TTS
@@ -182,13 +183,19 @@ class LiveSession:
     def __init__(self, openai_api_key=None, deepgram_api_key=None,
                  voice="ash", model="claude-sonnet-4-5-20250929", on_status=None,
                  fillers_enabled=True, barge_in_enabled=True, whisper_model=None,
-                 idle_timeout=0):
+                 idle_timeout=0, sse_dashboard=False):
         self.openai_api_key = openai_api_key
         self.deepgram_api_key = deepgram_api_key
         self.whisper_model = whisper_model
         self.voice = voice if voice in TTS_VOICES else "ash"
         self.model = model
         self.on_status = on_status or (lambda s: None)
+
+        # SSE dashboard
+        self._sse_dashboard = sse_dashboard
+        self._sse_clients: list[asyncio.StreamWriter] = []
+        self._sse_server = None
+        self._sse_rms_counter = 0
 
         self.running = False
         self.playing_audio = False
@@ -763,6 +770,152 @@ class LiveSession:
             self.on_status(json.dumps({"status": status, **metadata}))
         else:
             self.on_status(status)
+        self._emit_event("status", status=status, metadata=metadata)
+
+    # ── SSE Dashboard ─────────────────────────────────────────────
+
+    def _emit_event(self, event_type, **data):
+        """Broadcast an SSE event to all connected dashboard clients."""
+        if not self._sse_clients:
+            return
+        envelope = json.dumps({
+            "type": event_type,
+            "ts": time.time(),
+            "gen_id": self.generation_id,
+            **data,
+        })
+        msg = f"data: {envelope}\n\n".encode()
+        dead = []
+        for writer in self._sse_clients:
+            try:
+                writer.write(msg)
+            except (ConnectionError, OSError):
+                dead.append(writer)
+        for w in dead:
+            self._sse_clients.remove(w)
+
+    def _emit_audio_rms(self, **data):
+        """Decimated RMS emission — every 3rd chunk."""
+        self._sse_rms_counter += 1
+        if self._sse_rms_counter % 3 != 0:
+            return
+        self._emit_event("audio_rms", **data)
+
+    def _get_queue_depths(self):
+        """Return dict of queue sizes for all pipeline queues."""
+        depths = {}
+        if self._audio_in_q:
+            depths['audio_in'] = self._audio_in_q.qsize()
+        if self._stt_out_q:
+            depths['stt_out'] = self._stt_out_q.qsize()
+        if self._llm_out_q:
+            depths['llm_out'] = self._llm_out_q.qsize()
+        if self._audio_out_q:
+            depths['audio_out'] = self._audio_out_q.qsize()
+        if self._composer and hasattr(self._composer, '_segment_q'):
+            depths['composer'] = self._composer._segment_q.qsize()
+        return depths
+
+    def _build_state_snapshot(self):
+        """Build initial state snapshot for newly connected SSE clients."""
+        return {
+            "type": "snapshot",
+            "ts": time.time(),
+            "gen_id": self.generation_id,
+            "running": self.running,
+            "muted": self.muted,
+            "playing_audio": self.playing_audio,
+            "stt_gated": self._stt_gated,
+            "model": self.model,
+            "voice": self.voice,
+            "queue_depths": self._get_queue_depths(),
+        }
+
+    async def _sse_server_stage(self):
+        """SSE server stage — serves realtime dashboard events over HTTP."""
+        if not self._sse_dashboard:
+            return
+
+        async def handle_sse_client(reader, writer):
+            # Read and discard the HTTP request
+            try:
+                while True:
+                    line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+                    if line == b"\r\n" or not line:
+                        break
+            except (asyncio.TimeoutError, ConnectionError):
+                writer.close()
+                return
+
+            # Send HTTP response headers
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/event-stream\r\n"
+                b"Cache-Control: no-cache\r\n"
+                b"Connection: keep-alive\r\n"
+                b"Access-Control-Allow-Origin: *\r\n"
+                b"\r\n"
+            )
+            try:
+                await writer.drain()
+            except (ConnectionError, OSError):
+                writer.close()
+                return
+
+            # Send initial snapshot
+            snapshot = self._build_state_snapshot()
+            msg = f"data: {json.dumps(snapshot)}\n\n".encode()
+            try:
+                writer.write(msg)
+                await writer.drain()
+            except (ConnectionError, OSError):
+                writer.close()
+                return
+
+            self._sse_clients.append(writer)
+            print(f"SSE: Client connected ({len(self._sse_clients)} total)", flush=True)
+
+            # Keep connection alive with periodic pings
+            try:
+                while self.running:
+                    await asyncio.sleep(15)
+                    try:
+                        writer.write(b": keepalive\n\n")
+                        await writer.drain()
+                    except (ConnectionError, OSError):
+                        break
+            finally:
+                if writer in self._sse_clients:
+                    self._sse_clients.remove(writer)
+                writer.close()
+                print(f"SSE: Client disconnected ({len(self._sse_clients)} total)", flush=True)
+
+        try:
+            self._sse_server = await asyncio.start_server(
+                handle_sse_client, '127.0.0.1', 9847
+            )
+            print(f"SSE dashboard server at http://127.0.0.1:9847/events", flush=True)
+
+            # Periodic queue depth emission
+            async def emit_queue_depths():
+                while self.running:
+                    await asyncio.sleep(0.5)
+                    if self._sse_clients:
+                        self._emit_event("queue_depths", **self._get_queue_depths())
+
+            depth_task = asyncio.create_task(emit_queue_depths())
+
+            # Keep server running
+            while self.running:
+                await asyncio.sleep(0.5)
+
+        finally:
+            if self._sse_server:
+                self._sse_server.close()
+                await self._sse_server.wait_closed()
+            for writer in list(self._sse_clients):
+                writer.close()
+            self._sse_clients.clear()
 
     def _reset_idle_timer(self):
         self._cancel_idle_timer()
@@ -1502,6 +1655,7 @@ class LiveSession:
         full_response = ""
         first_text_time = None
         saw_tool_use = False  # Track if model is making tool calls
+        sse_char_counter = 0  # for decimated text delta events
 
         # Reset sentence tracking for this turn
         self._spoken_sentences = []
@@ -1604,6 +1758,7 @@ class LiveSession:
                                 print(f"  [tool] Suppressed inter-tool text: \"{post_tool_buffer.strip()[:60]}\"", flush=True)
                                 post_tool_buffer = ""
                             self._set_status("tool_use", {"intent": intent})
+                            self._emit_event("llm_tool_use", tool_name=bare_name, intent=intent)
 
                     elif inner_type == "content_block_delta":
                         delta = event.get("delta", {})
@@ -1611,8 +1766,14 @@ class LiveSession:
                             text = delta.get("text", "")
                             if first_text_time is None:
                                 first_text_time = time.time()
-                                print(f"\n  [timing] first token: {first_text_time - (self._last_send_time or first_text_time):.2f}s", flush=True)
+                                ft_ms = (first_text_time - (self._last_send_time or first_text_time)) * 1000
+                                self._emit_event("llm_first_token", latency_ms=round(ft_ms, 1))
+                                print(f"\n  [timing] first token: {ft_ms/1000:.2f}s", flush=True)
                             full_response += text
+                            sse_char_counter += len(text)
+                            if sse_char_counter >= 50:
+                                self._emit_event("llm_text_delta", chars=sse_char_counter, total_chars=len(full_response))
+                                sse_char_counter = 0
                             print(text, end="", flush=True)
 
                             if saw_tool_use:
@@ -1658,6 +1819,9 @@ class LiveSession:
 
                 elif event_type == "result":
                     # CLI finished processing this message (including any tool use rounds)
+                    total_ms = (time.time() - (first_text_time or time.time())) * 1000
+                    self._emit_event("llm_complete", total_chars=len(full_response),
+                                     sentences=len(self._spoken_sentences), latency_ms=round(total_ms, 1))
                     print("", flush=True)  # newline after streaming
                     break
 
@@ -1728,24 +1892,58 @@ class LiveSession:
     # ── Pipeline Stage 1: Audio Capture ────────────────────────────
 
     async def _audio_capture_stage(self):
-        """Record audio from mic via pw-record and push to audio_in queue.
+        """Record audio from mic via PulseAudio Simple API and push to audio_in queue.
 
-        Automatically restarts pw-record if it dies unexpectedly.
+        Uses a daemon thread for blocking pa.read() calls, with an async loop
+        for signal file polling and thread health monitoring.
+        Automatically reconnects if PulseAudio errors occur.
         """
+        import pasimple
+
         mute_signal = Path(__file__).parent / "live_mute_toggle"
         chunks_sent = 0
         restarts = 0
+        loop = asyncio.get_event_loop()
 
         while self.running:
-            process = await asyncio.create_subprocess_exec(
-                'pw-record', '--format', 's16', '--rate', str(SAMPLE_RATE), '--channels', str(CHANNELS), '-',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL
-            )
+            stop_event = threading.Event()
+            error_holder = [None]
+
+            def _enqueue_audio(frame):
+                try:
+                    self._audio_in_q.put_nowait(frame)
+                except asyncio.QueueFull:
+                    pass  # Drop frame rather than block
+
+            def record_thread():
+                try:
+                    with pasimple.PaSimple(
+                        pasimple.PA_STREAM_RECORD,
+                        pasimple.PA_SAMPLE_S16LE,
+                        CHANNELS, SAMPLE_RATE,
+                        app_name='push-to-talk',
+                    ) as pa:
+                        while not stop_event.is_set():
+                            data = pa.read(CHUNK_SIZE)
+                            loop.call_soon_threadsafe(
+                                _enqueue_audio,
+                                PipelineFrame(
+                                    type=FrameType.AUDIO_RAW,
+                                    generation_id=self.generation_id,
+                                    data=data
+                                )
+                            )
+                except Exception as e:
+                    if not stop_event.is_set():
+                        error_holder[0] = e
+
+            thread = threading.Thread(target=record_thread, daemon=True)
+            thread.start()
+
             if restarts > 0:
                 print(f"Live session: Audio capture restarted (attempt {restarts + 1})", flush=True)
             else:
-                print("Live session: Audio capture started", flush=True)
+                print("Live session: Audio capture started (PulseAudio)", flush=True)
 
             try:
                 while self.running:
@@ -1786,30 +1984,25 @@ class LiveSession:
                         except Exception:
                             pass
 
-                    audio_data = await process.stdout.read(CHUNK_SIZE)
-                    if not audio_data:
-                        # pw-record died — break inner loop to restart
+                    # Check thread health
+                    if not thread.is_alive():
+                        if error_holder[0]:
+                            print(f"Live session: Audio capture error: {error_holder[0]}", flush=True)
                         break
 
-                    await self._audio_in_q.put(PipelineFrame(
-                        type=FrameType.AUDIO_RAW,
-                        generation_id=self.generation_id,
-                        data=audio_data
-                    ))
-                    chunks_sent += 1
-                    if chunks_sent % 200 == 0:
-                        print(f"Live session: Sent {chunks_sent} audio chunks to STT", flush=True)
+                    # Track chunks for debug logging
+                    qsize = self._audio_in_q.qsize()
+                    if qsize > chunks_sent + 200:
+                        chunks_sent = qsize
+                        print(f"Live session: ~{chunks_sent} audio chunks captured", flush=True)
 
+                    await asyncio.sleep(0.05)  # 50ms poll
             finally:
-                try:
-                    process.terminate()
-                    await process.wait()
-                except Exception:
-                    pass
+                stop_event.set()
+                thread.join(timeout=2)
 
             if self.running:
                 restarts += 1
-                print(f"Live session: pw-record exited unexpectedly, restarting in 1s...", flush=True)
                 await asyncio.sleep(1)
 
         print(f"Live session: Audio capture stopped ({chunks_sent} chunks, {restarts} restarts)", flush=True)
@@ -1943,6 +2136,11 @@ class LiveSession:
                 samples = np.frombuffer(frame.data, dtype=np.int16)
                 rms = np.sqrt(np.mean(samples.astype(np.float64) ** 2))
 
+                # SSE: decimated audio RMS
+                buf_seconds_approx = len(audio_buffer) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+                self._emit_audio_rms(rms=round(float(rms), 1), has_speech=has_speech,
+                                     speech_chunks=speech_chunk_count, buf_seconds=round(buf_seconds_approx, 2))
+
                 # Track whether we've seen real speech energy
                 if rms > SPEECH_ENERGY_MIN:
                     speech_chunk_count += 1
@@ -1981,6 +2179,9 @@ class LiveSession:
                     pcm_data = bytes(audio_buffer)
                     actual_seconds = len(pcm_data) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
                     print(f"STT: Transcribing {actual_seconds:.1f}s buffer (peak RMS: {peak_rms:.0f}, trigger: {trigger_reason})", flush=True)
+                    self._emit_event("stt_start", trigger=trigger_reason,
+                                     buf_seconds=round(actual_seconds, 2), peak_rms=round(peak_rms, 0))
+                    stt_t0 = time.time()
                     audio_buffer.clear()
                     silence_start = None
                     has_speech = False
@@ -1991,7 +2192,10 @@ class LiveSession:
                     transcript = await asyncio.get_event_loop().run_in_executor(
                         None, self._whisper_transcribe, pcm_data
                     )
+                    stt_ms = (time.time() - stt_t0) * 1000
                     if transcript and not _is_hallucination(transcript):
+                        self._emit_event("stt_complete", text=transcript[:60],
+                                         latency_ms=round(stt_ms, 1), rejected=False)
                         print(f"STT [whisper]: {transcript}", flush=True)
                         await self._stt_out_q.put(PipelineFrame(
                             type=FrameType.END_OF_UTTERANCE,
@@ -2004,6 +2208,8 @@ class LiveSession:
                         ))
                         self._post_barge_in = False
                     elif transcript:
+                        self._emit_event("stt_complete", text=transcript[:60],
+                                         latency_ms=round(stt_ms, 1), rejected=True)
                         print(f"STT: Rejected hallucination: \"{transcript}\"", flush=True)
 
         except Exception as e:
@@ -2065,6 +2271,7 @@ class LiveSession:
 
                 # Send to CLI and read response
                 await self._send_to_cli(user_content)
+                self._emit_event("llm_send", text_preview=transcript[:60])
                 t_sent = time.time()
                 print(f"  [timing] CLI send: {t_sent - t_start:.2f}s", flush=True)
 
@@ -2426,6 +2633,8 @@ class LiveSession:
             total_sentences=len(self._spoken_sentences),
             cooldown_until=self._barge_in_cooldown_until
         )
+        self._emit_event("barge_in", spoken_sentences=self._played_sentence_count,
+                         total_sentences=len(self._spoken_sentences))
         print("Barge-in: Interruption complete, listening for user", flush=True)
 
     # ── Main loop ──────────────────────────────────────────────────
@@ -2482,6 +2691,7 @@ class LiveSession:
             self._audio_out_q,
             _tts_callback,
             lambda: self.generation_id,
+            on_event=self._emit_event if self._sse_dashboard else None,
         )
 
         self._set_status("listening")
@@ -2502,6 +2712,7 @@ class LiveSession:
                 self._composer.run(),  # Composer replaces _tts_stage
                 self._playback_stage(),
                 interrupt_loop(),
+                self._sse_server_stage(),
             ]
 
             await asyncio.gather(*stages, return_exceptions=True)

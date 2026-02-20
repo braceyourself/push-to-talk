@@ -1514,6 +1514,566 @@ async def test_idle_timer_scheduled_when_positive():
 
 
 # ══════════════════════════════════════════════════════════════════
+# Test Group 21: PulseAudio audio capture (pasimple)
+# ══════════════════════════════════════════════════════════════════
+
+@test("Audio capture creates PulseAudio stream with correct params")
+async def test_audio_capture_pasimple_params():
+    """Verify PaSimple is called with PA_STREAM_RECORD, S16LE, 1ch, 24kHz."""
+    session = make_session()
+    session.running = True
+    session.generation_id = 1
+    session._audio_in_q = asyncio.Queue(maxsize=100)
+
+    mock_pa_instance = MagicMock()
+    # read() returns some data once, then we stop the session
+    call_count = 0
+    def read_side_effect(size):
+        nonlocal call_count
+        call_count += 1
+        if call_count > 2:
+            session.running = False
+            raise Exception("stopped")
+        return b'\x00' * size
+    mock_pa_instance.read = read_side_effect
+    mock_pa_instance.__enter__ = MagicMock(return_value=mock_pa_instance)
+    mock_pa_instance.__exit__ = MagicMock(return_value=False)
+
+    mock_pa_class = MagicMock(return_value=mock_pa_instance)
+
+    with patch.dict('sys.modules', {'pasimple': MagicMock(
+        PaSimple=mock_pa_class,
+        PA_STREAM_RECORD=1,
+        PA_SAMPLE_S16LE=3,
+    )}):
+        await asyncio.wait_for(session._audio_capture_stage(), timeout=5.0)
+
+    mock_pa_class.assert_called()
+    call_args = mock_pa_class.call_args
+    assert call_args[0][0] == 1, "First arg should be PA_STREAM_RECORD"
+    assert call_args[0][1] == 3, "Second arg should be PA_SAMPLE_S16LE"
+    assert call_args[0][2] == 1, "channels should be 1"
+    assert call_args[0][3] == 24000, "rate should be 24000"
+    assert call_args[1].get('app_name') == 'push-to-talk' or \
+           (len(call_args[0]) > 4 and call_args[0][4] == 'push-to-talk'), \
+           "app_name should be 'push-to-talk'"
+
+
+@test("Audio capture: frames arrive in queue")
+async def test_audio_capture_frames_in_queue():
+    """Mock pa.read() to return known data, verify PipelineFrames appear in _audio_in_q."""
+    session = make_session()
+    session.running = True
+    session.generation_id = 42
+    session._audio_in_q = asyncio.Queue(maxsize=100)
+
+    test_data = b'\x01\x02' * 2048
+    call_count = 0
+    mock_pa_instance = MagicMock()
+    def read_side_effect(size):
+        nonlocal call_count
+        call_count += 1
+        if call_count > 3:
+            session.running = False
+            raise Exception("stopped")
+        return test_data
+    mock_pa_instance.read = read_side_effect
+    mock_pa_instance.__enter__ = MagicMock(return_value=mock_pa_instance)
+    mock_pa_instance.__exit__ = MagicMock(return_value=False)
+
+    with patch.dict('sys.modules', {'pasimple': MagicMock(
+        PaSimple=MagicMock(return_value=mock_pa_instance),
+        PA_STREAM_RECORD=1,
+        PA_SAMPLE_S16LE=3,
+    )}):
+        await asyncio.wait_for(session._audio_capture_stage(), timeout=5.0)
+        # Let event loop process pending call_soon_threadsafe callbacks
+        await asyncio.sleep(0.1)
+
+    # Check that frames arrived
+    frames = []
+    while not session._audio_in_q.empty():
+        frames.append(session._audio_in_q.get_nowait())
+
+    assert len(frames) >= 1, f"Expected at least 1 frame, got {len(frames)}"
+    assert frames[0].type == FrameType.AUDIO_RAW, "Frame should be AUDIO_RAW"
+    assert frames[0].data == test_data, "Frame data should match what pa.read() returned"
+    assert frames[0].generation_id == 42, "generation_id should match session"
+
+
+@test("Audio capture: reconnects on PulseAudio error")
+async def test_audio_capture_reconnects_on_error():
+    """PaSimple raises on first call, succeeds on second — verify restart."""
+    session = make_session()
+    session.running = True
+    session.generation_id = 1
+    session._audio_in_q = asyncio.Queue(maxsize=100)
+
+    construct_count = 0
+
+    def make_pa(*args, **kwargs):
+        nonlocal construct_count
+        construct_count += 1
+        mock = MagicMock()
+        if construct_count == 1:
+            # First construction: raise immediately on read
+            mock.__enter__ = MagicMock(return_value=mock)
+            mock.__exit__ = MagicMock(return_value=False)
+            mock.read = MagicMock(side_effect=Exception("PulseAudio connection failed"))
+        else:
+            # Second construction: return data then stop
+            call_count = 0
+            def read_ok(size):
+                nonlocal call_count
+                call_count += 1
+                if call_count > 1:
+                    session.running = False
+                    raise Exception("stopped")
+                return b'\x00' * size
+            mock.__enter__ = MagicMock(return_value=mock)
+            mock.__exit__ = MagicMock(return_value=False)
+            mock.read = read_ok
+        return mock
+
+    with patch.dict('sys.modules', {'pasimple': MagicMock(
+        PaSimple=make_pa,
+        PA_STREAM_RECORD=1,
+        PA_SAMPLE_S16LE=3,
+    )}):
+        await asyncio.wait_for(session._audio_capture_stage(), timeout=10.0)
+
+    assert construct_count >= 2, f"PaSimple should be constructed at least twice (reconnect), got {construct_count}"
+
+
+@test("Audio capture: stops cleanly on running=False")
+async def test_audio_capture_stops_cleanly():
+    """Set running=False mid-capture — method should return promptly."""
+    session = make_session()
+    session.running = True
+    session.generation_id = 1
+    session._audio_in_q = asyncio.Queue(maxsize=100)
+
+    call_count = 0
+    mock_pa_instance = MagicMock()
+    def read_side_effect(size):
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 5:
+            session.running = False
+        time.sleep(0.01)  # Simulate blocking read so event loop isn't flooded
+        return b'\x00' * size
+    mock_pa_instance.read = read_side_effect
+    mock_pa_instance.__enter__ = MagicMock(return_value=mock_pa_instance)
+    mock_pa_instance.__exit__ = MagicMock(return_value=False)
+
+    with patch.dict('sys.modules', {'pasimple': MagicMock(
+        PaSimple=MagicMock(return_value=mock_pa_instance),
+        PA_STREAM_RECORD=1,
+        PA_SAMPLE_S16LE=3,
+    )}):
+        # Should complete without timeout
+        await asyncio.wait_for(session._audio_capture_stage(), timeout=5.0)
+
+    # If we get here without timeout, the test passes
+    assert session.running == False
+
+
+@test("Audio capture: queue overflow drops frames gracefully")
+async def test_audio_capture_queue_overflow():
+    """Fill _audio_in_q, verify capture thread doesn't crash."""
+    session = make_session()
+    session.running = True
+    session.generation_id = 1
+    # Replace queue with a tiny one
+    session._audio_in_q = asyncio.Queue(maxsize=1)
+    # Pre-fill the queue
+    await session._audio_in_q.put(PipelineFrame(type=FrameType.AUDIO_RAW, generation_id=0, data=b'old'))
+
+    call_count = 0
+    mock_pa_instance = MagicMock()
+    def read_side_effect(size):
+        nonlocal call_count
+        call_count += 1
+        if call_count > 10:
+            session.running = False
+            raise Exception("stopped")
+        time.sleep(0.01)  # Simulate blocking read so event loop isn't flooded
+        return b'\x00' * size
+    mock_pa_instance.read = read_side_effect
+    mock_pa_instance.__enter__ = MagicMock(return_value=mock_pa_instance)
+    mock_pa_instance.__exit__ = MagicMock(return_value=False)
+
+    with patch.dict('sys.modules', {'pasimple': MagicMock(
+        PaSimple=MagicMock(return_value=mock_pa_instance),
+        PA_STREAM_RECORD=1,
+        PA_SAMPLE_S16LE=3,
+    )}):
+        # Should not crash despite full queue
+        await asyncio.wait_for(session._audio_capture_stage(), timeout=5.0)
+
+    # Capture ran and didn't crash — call_count tells us the thread ran
+    assert call_count > 1, f"Capture thread should have called read() multiple times, got {call_count}"
+
+
+# ══════════════════════════════════════════════════════════════════
+# Test Group 22: SSE Dashboard Server
+# ══════════════════════════════════════════════════════════════════
+
+@test("SSE server starts on configured port")
+async def test_sse_server_starts():
+    """Binds, accepts connections, returns 200 + SSE headers."""
+    session = make_session(sse_dashboard=True)
+    session.running = True
+    session.generation_id = 1
+    session._audio_in_q = asyncio.Queue(maxsize=100)
+    session._stt_out_q = asyncio.Queue(maxsize=50)
+    session._llm_out_q = asyncio.Queue(maxsize=50)
+    session._audio_out_q = asyncio.Queue(maxsize=200)
+
+    # Start the SSE server stage
+    server_task = asyncio.create_task(session._sse_server_stage())
+    await asyncio.sleep(0.1)  # Let server bind
+
+    try:
+        # Connect as a client
+        reader, writer = await asyncio.open_connection('127.0.0.1', 9847)
+
+        # Send HTTP request
+        writer.write(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await writer.drain()
+
+        # Read the HTTP response headers
+        headers = b""
+        while b"\r\n\r\n" not in headers:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            headers += chunk
+            if not chunk:
+                break
+
+        headers_str = headers.decode()
+        assert "200" in headers_str, f"Expected 200 status, got: {headers_str[:100]}"
+        assert "text/event-stream" in headers_str, f"Expected SSE content type, got: {headers_str[:200]}"
+        assert "Access-Control-Allow-Origin" in headers_str, "Expected CORS header"
+
+        writer.close()
+    finally:
+        session.running = False
+        server_task.cancel()
+        try:
+            await server_task
+        except asyncio.CancelledError:
+            pass
+
+
+@test("SSE server sends snapshot on connect")
+async def test_sse_server_snapshot():
+    """First message is type: snapshot with running/muted/queue_depths."""
+    session = make_session(sse_dashboard=True)
+    session.running = True
+    session.generation_id = 5
+    session.muted = True
+    session._audio_in_q = asyncio.Queue(maxsize=100)
+    session._stt_out_q = asyncio.Queue(maxsize=50)
+    session._llm_out_q = asyncio.Queue(maxsize=50)
+    session._audio_out_q = asyncio.Queue(maxsize=200)
+
+    server_task = asyncio.create_task(session._sse_server_stage())
+    await asyncio.sleep(0.1)
+
+    try:
+        reader, writer = await asyncio.open_connection('127.0.0.1', 9847)
+        writer.write(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await writer.drain()
+
+        # Read response including first SSE data line
+        data = b""
+        deadline = asyncio.get_event_loop().time() + 3.0
+        while asyncio.get_event_loop().time() < deadline:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            data += chunk
+            if b"\ndata:" in data or b"\ndata: " in data:
+                # Read a bit more to get the full data line
+                try:
+                    more = await asyncio.wait_for(reader.read(4096), timeout=0.3)
+                    data += more
+                except asyncio.TimeoutError:
+                    pass
+                break
+
+        text = data.decode()
+        # Find the first data: line after the headers
+        data_lines = [l for l in text.split('\n') if l.startswith('data:')]
+        assert len(data_lines) >= 1, f"Expected at least one data: line, got: {text[-300:]}"
+
+        snapshot = json.loads(data_lines[0].split('data:', 1)[1].strip())
+        assert snapshot['type'] == 'snapshot', f"Expected snapshot, got {snapshot.get('type')}"
+        assert snapshot['running'] == True
+        assert snapshot['muted'] == True
+        assert 'queue_depths' in snapshot
+
+        writer.close()
+    finally:
+        session.running = False
+        server_task.cancel()
+        try:
+            await server_task
+        except asyncio.CancelledError:
+            pass
+
+
+@test("SSE server not started when disabled")
+async def test_sse_server_disabled():
+    """sse_dashboard=False → no server, connection refused."""
+    session = make_session()  # default: sse_dashboard=False
+    assert session._sse_dashboard == False
+    assert session._sse_clients == []
+
+    # _sse_server_stage should return immediately
+    task = asyncio.create_task(session._sse_server_stage())
+    await asyncio.sleep(0.05)
+    assert task.done(), "Stage should complete immediately when disabled"
+
+
+@test("_emit_event no-op with no clients")
+async def test_emit_event_no_clients():
+    """Returns immediately, no error."""
+    session = make_session(sse_dashboard=True)
+    session.generation_id = 1
+    # No clients connected
+    assert len(session._sse_clients) == 0
+    # Should not raise
+    session._emit_event("test", foo="bar")
+
+
+@test("_emit_event broadcasts to clients")
+async def test_emit_event_broadcasts():
+    """Mock writers receive JSON with type/ts/gen_id."""
+    session = make_session(sse_dashboard=True)
+    session.generation_id = 42
+
+    # Create mock writers
+    writer1 = MagicMock()
+    writer1.write = MagicMock()
+    writer1.is_closing = MagicMock(return_value=False)
+    writer2 = MagicMock()
+    writer2.write = MagicMock()
+    writer2.is_closing = MagicMock(return_value=False)
+    session._sse_clients = [writer1, writer2]
+
+    session._emit_event("status", status="listening")
+
+    # Both writers should have received data
+    assert writer1.write.called, "Writer 1 should receive data"
+    assert writer2.write.called, "Writer 2 should receive data"
+
+    # Parse the SSE data
+    raw = writer1.write.call_args[0][0].decode()
+    assert raw.startswith("data: "), f"Expected SSE format, got: {raw[:50]}"
+    payload = json.loads(raw.split("data: ", 1)[1].strip())
+    assert payload['type'] == 'status'
+    assert payload['gen_id'] == 42
+    assert payload['status'] == 'listening'
+    assert 'ts' in payload
+
+
+@test("_emit_event removes dead clients")
+async def test_emit_event_prunes_dead():
+    """Writer that raises gets pruned."""
+    session = make_session(sse_dashboard=True)
+    session.generation_id = 1
+
+    # One good writer, one dead
+    good_writer = MagicMock()
+    good_writer.write = MagicMock()
+    good_writer.is_closing = MagicMock(return_value=False)
+
+    dead_writer = MagicMock()
+    dead_writer.write = MagicMock(side_effect=ConnectionError("broken pipe"))
+    dead_writer.is_closing = MagicMock(return_value=False)
+
+    session._sse_clients = [good_writer, dead_writer]
+
+    session._emit_event("test")
+
+    assert len(session._sse_clients) == 1, f"Dead client should be pruned, got {len(session._sse_clients)}"
+    assert session._sse_clients[0] is good_writer
+
+
+@test("_emit_event envelope has required fields")
+async def test_emit_event_envelope():
+    """Every event has type, ts, gen_id."""
+    session = make_session(sse_dashboard=True)
+    session.generation_id = 7
+
+    writer = MagicMock()
+    writer.write = MagicMock()
+    writer.is_closing = MagicMock(return_value=False)
+    session._sse_clients = [writer]
+
+    session._emit_event("audio_rms", rms=150.5)
+
+    raw = writer.write.call_args[0][0].decode()
+    payload = json.loads(raw.split("data: ", 1)[1].strip())
+    assert 'type' in payload, "Missing 'type'"
+    assert 'ts' in payload, "Missing 'ts'"
+    assert 'gen_id' in payload, "Missing 'gen_id'"
+    assert payload['type'] == 'audio_rms'
+    assert payload['rms'] == 150.5
+
+
+# ══════════════════════════════════════════════════════════════════
+# Test Group 23: Event Decimation
+# ══════════════════════════════════════════════════════════════════
+
+@test("audio_rms decimated to every 3rd chunk")
+async def test_audio_rms_decimation():
+    """9 emission attempts → 3 actual events sent."""
+    session = make_session(sse_dashboard=True)
+    session.generation_id = 1
+    session._sse_rms_counter = 0
+
+    writer = MagicMock()
+    writer.write = MagicMock()
+    writer.is_closing = MagicMock(return_value=False)
+    session._sse_clients = [writer]
+
+    for i in range(9):
+        session._emit_audio_rms(rms=100 + i, has_speech=False, speech_chunks=0, buf_seconds=1.0)
+
+    assert writer.write.call_count == 3, f"Expected 3 events (every 3rd), got {writer.write.call_count}"
+
+
+@test("Queue depth helper returns all 5 queues")
+def test_queue_depth_helper():
+    """audio_in, stt_out, llm_out, audio_out, composer present."""
+    session = make_session(sse_dashboard=True)
+    session._audio_in_q = asyncio.Queue(maxsize=100)
+    session._stt_out_q = asyncio.Queue(maxsize=50)
+    session._llm_out_q = asyncio.Queue(maxsize=50)
+    session._audio_out_q = asyncio.Queue(maxsize=200)
+
+    from stream_composer import StreamComposer
+    session._composer = StreamComposer(
+        session._audio_out_q,
+        AsyncMock(return_value=b'\x00' * 100),
+        lambda: 1,
+    )
+
+    depths = session._get_queue_depths()
+    assert 'audio_in' in depths, "Missing audio_in"
+    assert 'stt_out' in depths, "Missing stt_out"
+    assert 'llm_out' in depths, "Missing llm_out"
+    assert 'audio_out' in depths, "Missing audio_out"
+    assert 'composer' in depths, "Missing composer"
+    assert len(depths) == 5, f"Expected 5 queues, got {len(depths)}"
+
+
+# ══════════════════════════════════════════════════════════════════
+# Test Group 24: StreamComposer Callback
+# ══════════════════════════════════════════════════════════════════
+
+@test("StreamComposer on_event fires for tts_start and tts_complete")
+async def test_composer_on_event_tts():
+    """Capture callback, verify event types."""
+    from stream_composer import StreamComposer, AudioSegment, SegmentType
+
+    events = []
+    def capture_event(event_type, **data):
+        events.append({"type": event_type, **data})
+
+    mock_tts = AsyncMock(return_value=b'\x00' * 4800)
+    audio_out_q = asyncio.Queue()
+    gen_id = 1
+
+    composer = StreamComposer(
+        audio_out_q, mock_tts, lambda: gen_id,
+        on_event=capture_event,
+    )
+
+    # Enqueue a TTS sentence and EOT
+    await composer.enqueue(AudioSegment(SegmentType.TTS_SENTENCE, data="Hello world."))
+    await composer.enqueue_end_of_turn()
+
+    # Run composer briefly
+    run_task = asyncio.create_task(composer.run())
+    await asyncio.sleep(0.3)
+    composer.stop()
+    try:
+        await asyncio.wait_for(run_task, timeout=2.0)
+    except asyncio.TimeoutError:
+        run_task.cancel()
+
+    event_types = [e['type'] for e in events]
+    assert 'tts_start' in event_types, f"Expected tts_start, got {event_types}"
+    assert 'tts_complete' in event_types, f"Expected tts_complete, got {event_types}"
+
+
+@test("StreamComposer on_event=None doesn't crash")
+async def test_composer_no_callback():
+    """Existing behavior unchanged — no callback, no crash."""
+    from stream_composer import StreamComposer, AudioSegment, SegmentType
+
+    mock_tts = AsyncMock(return_value=b'\x00' * 4800)
+    audio_out_q = asyncio.Queue()
+
+    composer = StreamComposer(
+        audio_out_q, mock_tts, lambda: 1,
+        # No on_event — default
+    )
+
+    await composer.enqueue(AudioSegment(SegmentType.TTS_SENTENCE, data="Test."))
+    await composer.enqueue_end_of_turn()
+
+    run_task = asyncio.create_task(composer.run())
+    await asyncio.sleep(0.3)
+    composer.stop()
+    try:
+        await asyncio.wait_for(run_task, timeout=2.0)
+    except asyncio.TimeoutError:
+        run_task.cancel()
+
+    # If we got here without exception, the test passes
+
+
+@test("StreamComposer on_event fires filler_played")
+async def test_composer_on_event_filler():
+    """on_event fires filler_played with sufficient flag."""
+    from stream_composer import StreamComposer, AudioSegment, SegmentType
+
+    events = []
+    def capture_event(event_type, **data):
+        events.append({"type": event_type, **data})
+
+    mock_tts = AsyncMock(return_value=b'\x00' * 100)
+    audio_out_q = asyncio.Queue()
+
+    composer = StreamComposer(
+        audio_out_q, mock_tts, lambda: 1,
+        on_event=capture_event,
+    )
+
+    await composer.enqueue(AudioSegment(
+        SegmentType.FILLER_CLIP,
+        data=b'\x00' * 2400,
+        metadata={"sufficient": True},
+    ))
+    await composer.enqueue_end_of_turn()
+
+    run_task = asyncio.create_task(composer.run())
+    await asyncio.sleep(0.3)
+    composer.stop()
+    try:
+        await asyncio.wait_for(run_task, timeout=2.0)
+    except asyncio.TimeoutError:
+        run_task.cancel()
+
+    event_types = [e['type'] for e in events]
+    assert 'filler_played' in event_types, f"Expected filler_played, got {event_types}"
+    filler_event = [e for e in events if e['type'] == 'filler_played'][0]
+    assert filler_event['sufficient'] == True
+
+
+# ══════════════════════════════════════════════════════════════════
 # Run all tests
 # ══════════════════════════════════════════════════════════════════
 

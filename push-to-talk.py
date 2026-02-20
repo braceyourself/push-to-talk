@@ -928,6 +928,7 @@ class PushToTalk:
         fillers = self.config.get('live_fillers', True)
         barge_in = self.config.get('live_barge_in', True)
         idle_timeout = self.config.get('live_idle_timeout', 0)
+        sse_dashboard = self.config.get('live_sse_dashboard', False)
         self.live_session = LiveSession(
             openai_api_key=openai_key,
             deepgram_api_key=deepgram_key,
@@ -938,6 +939,7 @@ class PushToTalk:
             barge_in_enabled=barge_in,
             whisper_model=self.model,
             idle_timeout=idle_timeout,
+            sse_dashboard=sse_dashboard,
         )
 
         # Ensure TaskManager singleton is initialized for this session

@@ -60,11 +60,13 @@ class StreamComposer:
         tts_fn: Callable[[str], Awaitable[bytes | None]],
         get_generation_id: Callable[[], int],
         sample_rate: int = 24000,
+        on_event: Callable[..., None] | None = None,
     ):
         self._audio_out_q = audio_out_q
         self._tts_fn = tts_fn
         self._get_gen_id = get_generation_id
         self._sample_rate = sample_rate
+        self._on_event = on_event or (lambda event_type, **data: None)
 
         # Internal segment queue (AudioSegment | None sentinel)
         self._segment_q: asyncio.Queue[AudioSegment | None] = asyncio.Queue()
@@ -257,8 +259,10 @@ class StreamComposer:
 
     async def _process_filler_clip(self, segment: AudioSegment, gen_id: int) -> None:
         """Emit filler clip PCM followed by post-clip pause."""
-        if segment.metadata.get("sufficient"):
+        sufficient = segment.metadata.get("sufficient", False)
+        if sufficient:
             self._filler_sufficient = True
+        self._on_event("filler_played", sufficient=sufficient)
         if isinstance(segment.data, bytes) and segment.data:
             await self._emit_pcm(segment.data, FrameType.FILLER, gen_id)
         await self._emit_silence(self.post_clip_pause, gen_id)
@@ -272,6 +276,10 @@ class StreamComposer:
         # Filler already served as the response — drop LLM TTS
         if self._filler_sufficient:
             return
+
+        import time as _time
+        tts_start_time = _time.time()
+        self._on_event("tts_start", text=text[:60])
 
         pcm: bytes | None = None
 
@@ -299,6 +307,10 @@ class StreamComposer:
             except Exception as e:
                 logger.error("TTS generation failed for %r: %s", text[:40], e)
                 pcm = None
+
+        latency_ms = (_time.time() - tts_start_time) * 1000
+        self._on_event("tts_complete", latency_ms=round(latency_ms, 1),
+                       pcm_bytes=len(pcm) if pcm else 0)
 
         if pcm:
             await self._emit_pcm(pcm, FrameType.TTS_AUDIO, gen_id)

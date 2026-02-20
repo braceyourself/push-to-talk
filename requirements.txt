@@ -23,6 +23,9 @@ numpy
 # Streaming STT
 deepgram-sdk>=3.0
 
+# Audio capture (PulseAudio Simple API via PipeWire compat)
+pasimple
+
 # Audio playback (callback mode)
 pyaudio>=0.2.14
 
