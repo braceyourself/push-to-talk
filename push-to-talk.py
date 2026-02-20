@@ -789,6 +789,15 @@ class PushToTalk:
             print("Auto-starting live session (auto_start_listening=true)", flush=True)
             self.start_live_session()
 
+    def _transcribe_file(self, audio_path: str, initial_prompt: str = None) -> str:
+        """Transcribe an audio file using faster-whisper. Returns stripped text."""
+        kwargs = dict(language='en', beam_size=5, condition_on_previous_text=False)
+        if initial_prompt:
+            kwargs['initial_prompt'] = initial_prompt
+        with self.model_lock:
+            segments_gen, info = self.model.transcribe(audio_path, **kwargs)
+            return " ".join(s.text.strip() for s in segments_gen).strip()
+
     def _watch_config(self):
         """Watch config.json for ai_mode changes and live restart signals."""
         config_path = str(CONFIG_FILE)
@@ -1113,15 +1122,7 @@ class PushToTalk:
                 else:
                     prompt = context
 
-            with self.model_lock:
-                result = self.model.transcribe(
-                    converted_file,
-                    language='en',
-                    fp16=False,
-                    initial_prompt=prompt
-                )
-
-            text = result['text'].strip()
+            text = self._transcribe_file(converted_file, initial_prompt=prompt)
 
             if text:
                 print(f"Transcribed: {text}", flush=True)
@@ -1375,14 +1376,7 @@ class PushToTalk:
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
             # Transcribe
-            with self.model_lock:
-                result = self.model.transcribe(
-                    converted_file,
-                    language='en',
-                    fp16=False
-                )
-
-            text = result['text'].strip()
+            text = self._transcribe_file(converted_file)
             if text:
                 # Check for mode-switching voice commands in stream mode
                 text_lower = text.lower().strip().rstrip('.,!?')
@@ -1502,14 +1496,7 @@ class PushToTalk:
                 converted_file
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-            with self.model_lock:
-                result = self.model.transcribe(
-                    converted_file,
-                    language='en',
-                    fp16=False
-                )
-
-            followup = result['text'].strip()
+            followup = self._transcribe_file(converted_file)
 
             if followup and len(followup) > 3:
                 self.save_audio(temp_file.name, 'followup', followup)
@@ -1564,14 +1551,7 @@ class PushToTalk:
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
             # Transcribe
-            with self.model_lock:
-                result = self.model.transcribe(
-                    converted_file,
-                    language='en',
-                    fp16=False
-                )
-
-            question = result['text'].strip()
+            question = self._transcribe_file(converted_file)
 
             if question:
                 print(f"AI Question: {question}", flush=True)
@@ -1961,14 +1941,7 @@ class PushToTalk:
                 converted_file
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-            with self.model_lock:
-                result = self.model.transcribe(
-                    converted_file,
-                    language='en',
-                    fp16=False
-                )
-
-            text = result['text'].strip()
+            text = self._transcribe_file(converted_file)
 
             if text:
                 print(f"Interview answer transcribed: {text}", flush=True)
@@ -2147,14 +2120,7 @@ class PushToTalk:
                 converted_file
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-            with self.model_lock:
-                result = self.model.transcribe(
-                    converted_file,
-                    language='en',
-                    fp16=False
-                )
-
-            followup = result['text'].strip()
+            followup = self._transcribe_file(converted_file)
 
             for f in [temp_file.name, converted_file]:
                 try:
@@ -2200,14 +2166,7 @@ class PushToTalk:
                 converted_file
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-            with self.model_lock:
-                result = self.model.transcribe(
-                    converted_file,
-                    language='en',
-                    fp16=False
-                )
-
-            text = result['text'].strip()
+            text = self._transcribe_file(converted_file)
 
             if text:
                 print(f"Conversation transcribed: {text}", flush=True)
