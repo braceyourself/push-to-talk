@@ -61,7 +61,86 @@ TOOL_INTENT_MAP = {
     "get_task_status": "Checking task progress",
     "get_task_result": "Getting task results",
     "cancel_task": "Cancelling a task",
+    "run_command": "Running a command",
+    "read_file": "Reading a file",
 }
+
+# ── Security guards (mirror protect-reads.sh / protect-bash.sh) ──
+
+_SENSITIVE_FILENAMES = {'.npmrc', '.netrc', '.pypirc', '.git-credentials'}
+
+def _is_sensitive_path(path: str) -> 'tuple[bool, str]':
+    """Check if a file path points to sensitive content. Mirrors protect-reads.sh."""
+    p = path.rstrip('/')
+    basename = os.path.basename(p)
+    parts = p.split('/')
+
+    # .env and .env.* files
+    if basename == '.env' or basename.startswith('.env.'):
+        return True, "Environment file"
+
+    # credentials, secret, password in filename
+    lower = basename.lower()
+    for word in ('credentials', 'secret', 'password'):
+        if word in lower:
+            return True, f"Filename contains '{word}'"
+
+    # .password-store directory
+    if '.password-store' in parts:
+        return True, "Password store"
+
+    # /proc/*/environ
+    if '/proc/' in p and p.endswith('/environ'):
+        return True, "Process environment"
+
+    # RC/credential files
+    if basename in _SENSITIVE_FILENAMES:
+        return True, f"Credential file ({basename})"
+
+    # Cloud/SSH directories
+    if '/.aws/' in p or ('/.ssh/' in p and ('id_' in basename or basename == 'authorized_keys')):
+        return True, "Cloud/SSH credential"
+    if '/.gcloud/' in p:
+        return True, "GCloud credential"
+
+    # Key file extensions
+    for ext in ('.pem', '.p12', '.pfx', '.key'):
+        if p.endswith(ext):
+            return True, f"Key file ({ext})"
+
+    return False, ""
+
+
+_COMMAND_READ_CMDS = re.compile(r'\b(cat|head|tail|less|more)\b')
+_COMMAND_SENSITIVE_ARGS = re.compile(
+    r'(\.env\b|credentials|secret|password|\.pem\b|\.key\b|/proc/\S+/environ)'
+)
+
+def _is_sensitive_command(command: str) -> 'tuple[bool, str]':
+    """Check if a shell command accesses sensitive content. Mirrors protect-bash.sh."""
+    cmd = command.strip()
+
+    # printenv
+    if re.match(r'\bprintenv\b', cmd):
+        return True, "printenv exposes environment variables"
+
+    # pass show
+    if re.match(r'\bpass\s+show\b', cmd):
+        return True, "pass show exposes passwords"
+
+    # gpg --decrypt / gpg -d
+    if re.search(r'\bgpg\s+(--decrypt|-d)\b', cmd):
+        return True, "gpg decrypt exposes encrypted content"
+
+    # /proc/*/environ anywhere in command
+    if re.search(r'/proc/\S+/environ', cmd):
+        return True, "Accessing process environment"
+
+    # cat/head/tail/less/more + sensitive file pattern
+    if _COMMAND_READ_CMDS.search(cmd) and _COMMAND_SENSITIVE_ARGS.search(cmd):
+        return True, "Reading sensitive file"
+
+    return False, ""
 
 
 class CircuitBreaker:
@@ -189,6 +268,9 @@ class LiveSession:
 
         # CLI session persistence — resume conversations across restarts
         self._cli_session_id = None
+
+        # Speech activity tracking — filler manager checks this to avoid playing over speech
+        self._last_speech_energy_time = 0.0
 
         # Circuit breakers for service fallback
         self._stt_breaker = CircuitBreaker("STT/Deepgram")
@@ -477,6 +559,82 @@ class LiveSession:
             else:
                 return json.dumps({"success": False, "message": f"Task '{task.name}' is not running"})
 
+        elif name == "run_command":
+            command = args.get("command", "").strip()
+            if not command:
+                return json.dumps({"error": "No command provided"})
+            blocked, reason = _is_sensitive_command(command)
+            if blocked:
+                print(f"Live session: Blocked command: {command!r} — {reason}", flush=True)
+                return json.dumps({"error": f"Blocked: {reason}"})
+            working_dir = args.get("working_dir", None)
+            timeout = min(int(args.get("timeout", 30)), 120)
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=working_dir,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+                MAX_OUTPUT = 10240  # 10KB
+                stdout_str = stdout.decode(errors='replace')
+                if len(stdout_str) > MAX_OUTPUT:
+                    stdout_str = stdout_str[:MAX_OUTPUT] + "\n[...truncated]"
+                result = {"exit_code": proc.returncode, "stdout": stdout_str}
+                if stderr:
+                    stderr_str = stderr.decode(errors='replace')
+                    if len(stderr_str) > MAX_OUTPUT:
+                        stderr_str = stderr_str[:MAX_OUTPUT] + "\n[...truncated]"
+                    result["stderr"] = stderr_str
+                return json.dumps(result)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return json.dumps({"error": f"Command timed out after {timeout}s"})
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+
+        elif name == "read_file":
+            file_path = args.get("path", "")
+            if not file_path:
+                return json.dumps({"error": "No path provided"})
+            blocked, reason = _is_sensitive_path(file_path)
+            if blocked:
+                print(f"Live session: Blocked file read: {file_path!r} — {reason}", flush=True)
+                return json.dumps({"error": f"Blocked: {reason}"})
+            try:
+                p = Path(file_path)
+                if p.is_dir():
+                    return json.dumps({"error": f"Path is a directory: {file_path}"})
+                if not p.exists():
+                    return json.dumps({"error": f"File not found: {file_path}"})
+                offset = int(args.get("offset", 0))
+                limit = int(args.get("limit", 0))
+                MAX_OUTPUT = 10240
+                with open(p, 'r', errors='replace') as f:
+                    lines = f.readlines()
+                total_lines = len(lines)
+                if offset > 0:
+                    lines = lines[offset:]
+                if limit > 0:
+                    lines = lines[:limit]
+                content = ''.join(lines)
+                if len(content) > MAX_OUTPUT:
+                    content = content[:MAX_OUTPUT] + "\n[...truncated]"
+                result = {
+                    "content": content,
+                    "total_lines": total_lines,
+                    "showing": f"lines {offset+1}-{offset+len(lines)} of {total_lines}"
+                }
+                return json.dumps(result)
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+
         elif name == "send_notification":
             title = args.get("title", "Notification")
             body = args.get("body", "")
@@ -749,6 +907,11 @@ class LiveSession:
             pass
 
         if cancel_event.is_set():
+            return
+
+        # Step 6b: Skip if user is still speaking (speech energy within last 500ms)
+        if time.time() - self._last_speech_energy_time < 0.5:
+            print("  [filler] Skipped — user still speaking", flush=True)
             return
 
         # Step 7: Play clip via composer (or direct if composer not available)
@@ -1766,6 +1929,7 @@ class LiveSession:
                 # Track whether we've seen real speech energy
                 if rms > SPEECH_ENERGY_MIN:
                     speech_chunk_count += 1
+                    self._last_speech_energy_time = time.time()
                     if speech_chunk_count >= SPEECH_CHUNKS_MIN:
                         has_speech = True
                 if rms > peak_rms:

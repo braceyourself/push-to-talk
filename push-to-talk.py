@@ -257,6 +257,7 @@ def load_config():
         "live_tts": "openai",            # "openai" or "piper"
         "live_fillers": True,            # Play filler sounds during processing
         "live_barge_in": True,           # Allow speaking over AI response
+        "auto_start_listening": True,    # Auto-start live session on service startup
         "verbal_hooks": [
             # Example hooks - customize these:
             # {"trigger": "open browser", "command": "xdg-open https://google.com"},
@@ -781,6 +782,11 @@ class PushToTalk:
         self.config_watcher_thread = threading.Thread(target=self._watch_config, daemon=True)
         self.config_watcher_thread.start()
 
+        # Auto-start live session if configured
+        if self.config.get('auto_start_listening', True) and self.config.get('ai_mode') == 'live':
+            print("Auto-starting live session (auto_start_listening=true)", flush=True)
+            self.start_live_session()
+
     def _watch_config(self):
         """Watch config.json for ai_mode changes and live restart signals."""
         config_path = str(CONFIG_FILE)
@@ -943,6 +949,7 @@ class PushToTalk:
             finally:
                 loop.close()
                 self.live_session = None
+                set_status('idle')
 
         self.live_thread = threading.Thread(target=run_session, daemon=True)
         self.live_thread.start()
@@ -2281,8 +2288,11 @@ class PushToTalk:
                 self._live_press_processed = True  # Release handler checks this
                 self._live_key_press_time = time.time()
                 self._live_starting_session = False
-                if not self.live_session:
-                    # Idle → start session
+                if not self.live_session or not self.live_session.running:
+                    # Idle or dead session (idle timeout) → start new session
+                    if self.live_session and not self.live_session.running:
+                        print("Live: dead session detected, starting fresh", flush=True)
+                        self.live_session = None
                     self._live_starting_session = True
                     self.start_live_session()
                 elif self.live_session.playing_audio:
@@ -2295,11 +2305,15 @@ class PushToTalk:
                 else:
                     # Record state at press time for release handler
                     self._live_press_state = 'muted' if self.live_session.muted else 'listening'
+                    print(f"Live press: state={self._live_press_state}, muted={self.live_session.muted}, running={self.live_session.running}", flush=True)
                     # Optimistic unmute: if muted, unmute now for hold-to-talk.
                     # If this turns out to be a tap, release handler reverts it.
                     if self.live_session.muted:
                         self.live_session.set_muted(False)
+                        print(f"Live press: unmuted (optimistic), muted now={self.live_session.muted}", flush=True)
                 return
+        elif key == self.ai_key and self.ctrl_r_pressed:
+            print(f"Live: ai_key blocked by ctrl_r_pressed", flush=True)
 
         # Check for AI assistant mode (both modifiers held)
         if self.ctrl_r_pressed and self.shift_r_pressed and not self.recording:
@@ -2425,9 +2439,11 @@ class PushToTalk:
                         self.live_session.set_muted(True)
                         print(f"Live tap ({elapsed_ms}ms): listening → muted", flush=True)
                     elif press_state == 'muted':
-                        # Tap from muted → back to listening (optimistic unmute already applied on press)
+                        # Ensure unmute (press handler does optimistic unmute, but reinforce here)
+                        self.live_session.set_muted(False)
                         print(f"Live tap ({elapsed_ms}ms): muted → listening", flush=True)
                     elif press_state == 'interrupted':
+                        self.live_session.set_muted(False)
                         print(f"Live tap ({elapsed_ms}ms): interrupted → listening", flush=True)
 
                 elif self.live_session:
@@ -2435,8 +2451,12 @@ class PushToTalk:
                         # LONG HOLD (>=2s) from muted: stop session
                         print(f"Live long hold ({elapsed_ms}ms): stopping session", flush=True)
                         self.stop_live_session()
+                    elif press_state == 'muted':
+                        # HOLD from muted: keep listening (ensure unmuted)
+                        self.live_session.set_muted(False)
+                        print(f"Live hold ({elapsed_ms}ms): muted → listening (held)", flush=True)
                     else:
-                        # HOLD (>=500ms): mute + flush transcript
+                        # HOLD (>=500ms) from listening: mute + flush transcript
                         self.live_session.set_muted(True)
                         print(f"Live hold ({elapsed_ms}ms): muted (released)", flush=True)
 

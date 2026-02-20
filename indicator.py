@@ -70,6 +70,7 @@ def load_config():
         "interview_topic": "",
         "interview_context_dirs": [],
         "conversation_project_dir": "",
+        "auto_start_listening": True,
     }
     try:
         if CONFIG_FILE.exists():
@@ -151,7 +152,7 @@ class SettingsWindow(Gtk.Window):
 
         self.set_default_size(450, 400)
         self.set_position(Gtk.WindowPosition.CENTER)
-        self.set_resizable(False)
+        self.set_resizable(True)
 
         # Main container
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -1816,6 +1817,7 @@ class LiveOverlayWidget(Gtk.Window):
     DOT_COLORS = {
         'listening':    (0.29, 0.85, 0.50),   # #4ade80 green
         'speaking':     (0.38, 0.65, 0.98),   # #60a5fa blue
+        'hearing':      (0.56, 0.75, 0.99),   # #8fbffd lighter blue
         'processing':   (1.0,  0.8,  0.0),    # yellow
         'idle':         (0.42, 0.45, 0.50),   # #6b7280 gray
         'disconnected': (0.42, 0.45, 0.50),   # #6b7280 gray
@@ -1828,6 +1830,7 @@ class LiveOverlayWidget(Gtk.Window):
     STATUS_LABELS = {
         'listening':    'Listening',
         'speaking':     'Speaking',
+        'hearing':      'Hearing you...',
         'processing':   'Processing',
         'idle':         'Idle',
         'disconnected': 'Disconnected',
@@ -1861,6 +1864,7 @@ class LiveOverlayWidget(Gtk.Window):
         self.status = 'idle'
         self.status_history = []  # [(HH:MM:SS, status), ...] capped at 50
         self.expanded = False
+        self._expand_up = False  # True when near bottom of screen
         self._rejection_flash = False
         self.tool_intent = None
 
@@ -1907,14 +1911,40 @@ class LiveOverlayWidget(Gtk.Window):
     HISTORY_MAX_VISIBLE = 10
 
     def _resize_window(self):
-        """Resize window based on expanded state."""
+        """Resize window based on expanded state, opening up or down depending on screen position."""
+        was_expanded = hasattr(self, '_last_total_h') and self._last_total_h > self.OVERLAY_HEIGHT
         if self.expanded and self.status_history:
             visible = min(len(self.status_history), self.HISTORY_MAX_VISIBLE)
-            total_h = self.OVERLAY_HEIGHT + 4 + visible * self.HISTORY_ROW_HEIGHT + 8
+            history_h = 4 + visible * self.HISTORY_ROW_HEIGHT + 8
+            total_h = self.OVERLAY_HEIGHT + history_h
         else:
             total_h = self.OVERLAY_HEIGHT
+            history_h = 0
+        size_changed = total_h != getattr(self, '_last_total_h', self.OVERLAY_HEIGHT)
+        self._last_total_h = total_h
+        if not size_changed:
+            return
         self.set_size_request(self.OVERLAY_WIDTH, total_h)
         self.resize(self.OVERLAY_WIDTH, total_h)
+        if self.expanded:
+            display = Gdk.Display.get_default()
+            monitor = display.get_monitor_at_point(self.pos_x, self.pos_y)
+            if monitor:
+                g = monitor.get_geometry()
+                # Would expanding downward overflow the screen?
+                bottom_overflow = (self.pos_y + total_h) > (g.y + g.height)
+                self._expand_up = bottom_overflow
+                if bottom_overflow:
+                    # Grow upward: anchor status bar at pos_y, history above
+                    self.move(self.pos_x, self.pos_y - history_h)
+                else:
+                    # Grow downward normally
+                    self.move(self.pos_x, self.pos_y)
+            else:
+                self._expand_up = False
+        elif was_expanded:
+            self._expand_up = False
+            self.move(self.pos_x, self.pos_y)
 
     def _draw_rounded_rect(self, cr, x, y, w, h, r):
         """Draw a rounded rectangle path."""
@@ -1955,9 +1985,13 @@ class LiveOverlayWidget(Gtk.Window):
         cr.set_line_width(1)
         cr.stroke()
 
+        # When expanding upward, status bar is at the bottom of the window
+        expand_up = self.expanded and self._expand_up
+        status_bar_y = (height - self.OVERLAY_HEIGHT) if expand_up else 0
+
         # Draw status dot
         dot_x = 22
-        dot_y = self.OVERLAY_HEIGHT / 2
+        dot_y = status_bar_y + self.OVERLAY_HEIGHT / 2
         dot_color = self.DOT_COLORS.get(self.status, self.DOT_COLORS['idle'])
         dot_alpha = 0.3 if self._rejection_flash else 1.0
         cr.set_source_rgba(dot_color[0], dot_color[1], dot_color[2], dot_alpha)
@@ -1975,20 +2009,26 @@ class LiveOverlayWidget(Gtk.Window):
         cr.set_source_rgba(0.9, 0.9, 0.9, 1.0)
         cr.select_font_face("Sans", 0, 0)
         cr.set_font_size(13)
-        cr.move_to(38, self.OVERLAY_HEIGHT / 2 + 5)
+        cr.move_to(38, status_bar_y + self.OVERLAY_HEIGHT / 2 + 5)
         cr.show_text(label)
 
         # Draw chevron indicator (right side of header)
         if self.status_history:
             chev_x = width - 18
-            chev_y = self.OVERLAY_HEIGHT / 2
+            chev_y = status_bar_y + self.OVERLAY_HEIGHT / 2
             cr.set_source_rgba(0.5, 0.5, 0.5, 0.7)
             cr.set_line_width(1.5)
             if self.expanded:
-                # Chevron up
-                cr.move_to(chev_x - 4, chev_y + 2)
-                cr.line_to(chev_x, chev_y - 2)
-                cr.line_to(chev_x + 4, chev_y + 2)
+                if expand_up:
+                    # Chevron down (history is above)
+                    cr.move_to(chev_x - 4, chev_y - 2)
+                    cr.line_to(chev_x, chev_y + 2)
+                    cr.line_to(chev_x + 4, chev_y - 2)
+                else:
+                    # Chevron up (history is below)
+                    cr.move_to(chev_x - 4, chev_y + 2)
+                    cr.line_to(chev_x, chev_y - 2)
+                    cr.line_to(chev_x + 4, chev_y + 2)
             else:
                 # Chevron down
                 cr.move_to(chev_x - 4, chev_y - 2)
@@ -1998,17 +2038,30 @@ class LiveOverlayWidget(Gtk.Window):
 
         # Draw history panel when expanded
         if self.expanded and self.status_history:
-            # Separator line
-            sep_y = self.OVERLAY_HEIGHT + 2
-            cr.set_source_rgba(0.3, 0.3, 0.3, 0.6)
-            cr.set_line_width(0.5)
-            cr.move_to(10, sep_y)
-            cr.line_to(width - 10, sep_y)
-            cr.stroke()
-
-            # Draw history entries (most recent first)
             entries = list(reversed(self.status_history))[:self.HISTORY_MAX_VISIBLE]
-            row_y = self.OVERLAY_HEIGHT + 8
+
+            if expand_up:
+                # History above status bar: separator just above status bar
+                sep_y = status_bar_y - 2
+                cr.set_source_rgba(0.3, 0.3, 0.3, 0.6)
+                cr.set_line_width(0.5)
+                cr.move_to(10, sep_y)
+                cr.line_to(width - 10, sep_y)
+                cr.stroke()
+
+                # Draw entries from top of window downward
+                row_y = 8
+            else:
+                # History below status bar
+                sep_y = self.OVERLAY_HEIGHT + 2
+                cr.set_source_rgba(0.3, 0.3, 0.3, 0.6)
+                cr.set_line_width(0.5)
+                cr.move_to(10, sep_y)
+                cr.line_to(width - 10, sep_y)
+                cr.stroke()
+
+                row_y = self.OVERLAY_HEIGHT + 8
+
             for ts, st in entries:
                 # Parse enriched status (may be "tool_use: intent text")
                 if ': ' in st and st.startswith('tool_use'):
@@ -2069,20 +2122,23 @@ class LiveOverlayWidget(Gtk.Window):
         elif status != 'tool_use':
             self.tool_intent = None
 
-        if status != self.status or (status == 'tool_use' and self.tool_intent):
-            timestamp = time.strftime("%H:%M:%S")
+        skip_history = False
 
-            # Coalesce consecutive tool_use entries in history
-            if (status == 'tool_use' and self.status_history
-                    and self.status_history[-1][1].startswith('tool_use')):
-                # Update the last entry instead of appending
-                display = f"tool_use: {self.tool_intent}" if self.tool_intent else "tool_use"
-                self.status_history[-1] = (timestamp, display)
-            else:
-                display = f"tool_use: {self.tool_intent}" if (status == 'tool_use' and self.tool_intent) else status
-                self.status_history.append((timestamp, display))
-                if len(self.status_history) > 50:
-                    self.status_history = self.status_history[-50:]
+        if status != self.status or (status == 'tool_use' and self.tool_intent):
+            if not skip_history:
+                timestamp = time.strftime("%H:%M:%S")
+
+                # Coalesce consecutive tool_use entries in history
+                if (status == 'tool_use' and self.status_history
+                        and self.status_history[-1][1].startswith('tool_use')):
+                    # Update the last entry instead of appending
+                    display = f"tool_use: {self.tool_intent}" if self.tool_intent else "tool_use"
+                    self.status_history[-1] = (timestamp, display)
+                else:
+                    display = f"tool_use: {self.tool_intent}" if (status == 'tool_use' and self.tool_intent) else status
+                    self.status_history.append((timestamp, display))
+                    if len(self.status_history) > 50:
+                        self.status_history = self.status_history[-50:]
 
         self.status = status
         self._resize_window()
@@ -2119,7 +2175,7 @@ class LiveOverlayWidget(Gtk.Window):
         menu = Gtk.Menu()
 
         # Session controls
-        if self.status in ('listening', 'thinking', 'tool_use', 'speaking'):
+        if self.status in ('listening', 'thinking', 'tool_use', 'speaking', 'hearing'):
             mute_item = Gtk.MenuItem(label='Mute')
             mute_item.connect('activate', self._on_mute_clicked)
             menu.append(mute_item)
@@ -2136,6 +2192,10 @@ class LiveOverlayWidget(Gtk.Window):
             stop_item = Gtk.MenuItem(label='Stop Session')
             stop_item.connect('activate', self._on_stop_clicked)
             menu.append(stop_item)
+
+        restart_svc_item = Gtk.MenuItem(label='Restart Service')
+        restart_svc_item.connect('activate', self._on_restart_service_clicked)
+        menu.append(restart_svc_item)
 
         menu.append(Gtk.SeparatorMenuItem())
 
@@ -2160,6 +2220,15 @@ class LiveOverlayWidget(Gtk.Window):
             item.connect('activate', self._on_model_selected, model_id)
             menu.append(item)
 
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Auto-start toggle
+        auto_start = config.get('auto_start_listening', True)
+        auto_label = f"\u2713 Auto-Start Listening" if auto_start else "  Auto-Start Listening"
+        auto_item = Gtk.MenuItem(label=auto_label)
+        auto_item.connect('activate', self._on_auto_start_toggled, not auto_start)
+        menu.append(auto_item)
+
         menu.show_all()
         menu.popup_at_pointer(event)
 
@@ -2183,10 +2252,19 @@ class LiveOverlayWidget(Gtk.Window):
         status_file.write_text("restart_live")
         self.update_status('listening')
 
+    def _on_restart_service_clicked(self, widget):
+        subprocess.Popen(['systemctl', '--user', 'restart', 'push-to-talk.service'])
+
     def _on_model_selected(self, widget, model_id):
         """Handle model selection from context menu."""
         config = load_config()
         config['live_model'] = model_id
+        save_config(config)
+
+    def _on_auto_start_toggled(self, widget, new_value):
+        """Toggle auto-start listening on service startup."""
+        config = load_config()
+        config['auto_start_listening'] = new_value
         save_config(config)
 
     def on_motion(self, widget, event):
@@ -2198,10 +2276,25 @@ class LiveOverlayWidget(Gtk.Window):
             if not self.dragging:
                 if abs(dx) > self.drag_threshold or abs(dy) > self.drag_threshold:
                     self.dragging = True
+                    # Collapse panel before dragging
+                    if self.expanded:
+                        self.expanded = False
+                        self._resize_window()
+                        self.queue_draw()
 
             if self.dragging:
-                self.pos_x = int(self.pos_x + dx)
-                self.pos_y = int(self.pos_y + dy)
+                new_x = int(self.pos_x + dx)
+                new_y = int(self.pos_y + dy)
+                # Clamp to monitor edges
+                display = Gdk.Display.get_default()
+                monitor = display.get_monitor_at_point(new_x, new_y)
+                if monitor:
+                    g = monitor.get_geometry()
+                    w, h = self.get_size()
+                    new_x = max(g.x, min(new_x, g.x + g.width - w))
+                    new_y = max(g.y, min(new_y, g.y + g.height - h))
+                self.pos_x = new_x
+                self.pos_y = new_y
                 self.move(self.pos_x, self.pos_y)
                 self.drag_start_x = event.x_root
                 self.drag_start_y = event.y_root

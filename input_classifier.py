@@ -283,9 +283,9 @@ def _infer_subcategory(category: str, text: str) -> str:
 def classify(text: str, semantic: "SemanticFallback | None" = None) -> ClassifiedInput:
     """Classify user input into a category.
 
-    Heuristic patterns run first (<1ms). If confident (>=0.5), returns
-    immediately. Otherwise falls back to semantic similarity if available.
-    Higher confidence wins when heuristic and semantic disagree.
+    Semantic similarity is the primary classifier (~0.1ms via model2vec).
+    Minimal heuristics handle clear-cut cases: short acknowledgments and
+    explicit question marks.
     """
     text_stripped = text.strip()
     if not text_stripped:
@@ -294,67 +294,41 @@ def classify(text: str, semantic: "SemanticFallback | None" = None) -> Classifie
     text_lower = text_stripped.lower()
     word_count = len(text_stripped.split())
 
-    # Short text (<=3 words, no ?) -- check acknowledgment first
+    # Fast path: short inputs (<=3 words, no ?) — check heuristic patterns
     if word_count <= 3 and "?" not in text_stripped:
         for pat in PATTERNS["acknowledgment"]:
             if pat.search(text_lower):
                 sub = "negative" if re.match(r"^(no|nah|nope|not really)", text_lower) else "affirmative"
                 return ClassifiedInput("acknowledgment", 0.9, text_stripped, sub, "heuristic")
+        for pat in PATTERNS["social"]:
+            if pat.search(text_lower):
+                sub = _infer_subcategory("social", text_stripped)
+                return ClassifiedInput("social", 0.9, text_stripped, sub, "heuristic")
+        for pat in PATTERNS["emotional"]:
+            if pat.search(text_lower):
+                sub = _infer_subcategory("emotional", text_stripped)
+                return ClassifiedInput("emotional", 0.9, text_stripped, sub, "heuristic")
 
-    # Score each category by counting regex matches
-    scores: dict[str, int] = {}
-    for category, pats in PATTERNS.items():
-        for pat in pats:
-            if pat.search(text_stripped):
-                scores[category] = scores.get(category, 0) + 1
-
-    if scores:
-        best = max(scores, key=scores.get)  # type: ignore[arg-type]
-        top_score = scores[best]
-
-        # Tiebreak: when question and task tie, "could you" / "can you" /
-        # "would you" framing is a polite request -- prefer task.
-        if (
-            scores.get("question", 0) == top_score
-            and scores.get("task", 0) == top_score
-            and re.match(r"^(can you|could you|would you)\b", text_stripped, re.IGNORECASE)
-        ):
-            best = "task"
-
-        confidence = min(0.5 + top_score * 0.2, 0.95)
-        subcategory = _infer_subcategory(best, text_stripped)
-        heuristic_result = ClassifiedInput(best, confidence, text_stripped, subcategory, "heuristic")
-
-        # If heuristic is confident enough, return immediately
-        if confidence >= 0.5:
-            return heuristic_result
-
-        # Try semantic fallback if available
-        if semantic is not None:
-            sem_category, sem_confidence = semantic.classify(text_stripped)
-            if sem_confidence > confidence:
-                sem_subcategory = _infer_subcategory(sem_category, text_stripped)
-                return ClassifiedInput(
-                    sem_category, sem_confidence, text_stripped,
-                    sem_subcategory, "semantic",
-                )
-
-        return heuristic_result
-
-    # No heuristic match at all -- try semantic fallback
+    # Primary: semantic classification
     if semantic is not None:
         sem_category, sem_confidence = semantic.classify(text_stripped)
+
+        # Boost to question if text ends with ? and semantic didn't pick question
+        if text_stripped.endswith("?") and sem_category != "question":
+            sem_category = "question"
+            sem_confidence = max(sem_confidence, 0.7)
+
         sem_subcategory = _infer_subcategory(sem_category, text_stripped)
         return ClassifiedInput(
             sem_category, sem_confidence, text_stripped,
             sem_subcategory, "semantic",
         )
 
-    # Structural fallback: ends with ? -> question
+    # No semantic model available -- structural fallback
     if text_stripped.endswith("?"):
         return ClassifiedInput("question", 0.6, text_stripped, "", "heuristic")
 
-    # Ultimate default: acknowledgment (safe fallback -- per CONTEXT.md)
+    # Ultimate default: acknowledgment (safe fallback)
     return ClassifiedInput("acknowledgment", 0.3, text_stripped, "", "heuristic")
 
 

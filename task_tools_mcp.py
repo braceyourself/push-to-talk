@@ -18,10 +18,11 @@ TOOLS = [
     {
         "name": "spawn_task",
         "description": (
-            "Start a Claude CLI task in the background. The task has full tool access -- "
-            "Bash, file read/write/edit, grep, glob, web search, everything. Use for ANY "
-            "request that touches files, code, commands, or the real world. Return immediately "
-            "with a brief acknowledgment. Keep acknowledgments short, every word takes time to speak."
+            "Start a background Claude CLI agent for COMPLEX, MULTI-STEP work only: editing files, "
+            "debugging, refactoring, implementing features, or analysis requiring multiple tool calls. "
+            "Do NOT use for simple commands or file reads — use run_command or read_file instead, "
+            "they return results instantly. spawn_task takes 10-60+ seconds to start. "
+            "Return immediately with a brief acknowledgment."
         ),
         "inputSchema": {
             "type": "object",
@@ -105,6 +106,61 @@ TOOLS = [
         }
     },
     {
+        "name": "run_command",
+        "description": (
+            "PREFERRED for any single command. Run a shell command and return stdout/stderr/exit_code "
+            "instantly. Use for: git status/log/diff, ls, grep/find, df, systemctl, docker ps, "
+            "cat, head, tail, wc, curl, pip list, npm ls, make, pytest, any CLI tool. "
+            "Supports pipes and redirects. Result returns in milliseconds — always try this first "
+            "before considering spawn_task."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to execute (pipes and redirects supported)"
+                },
+                "working_dir": {
+                    "type": "string",
+                    "description": "Working directory (absolute path). Defaults to home directory."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default 30, max 120)"
+                }
+            },
+            "required": ["command"]
+        }
+    },
+    {
+        "name": "read_file",
+        "description": (
+            "PREFERRED for reading files. Returns file contents instantly. Use for: checking configs, "
+            "reading source code, viewing logs, READMEs, package.json, any text file. "
+            "Supports offset and limit for large files. Always use this instead of spawn_task "
+            "when the user asks to read, check, or look at a file."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute path to the file to read"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Line number to start from (0-based, default 0)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max number of lines to return (0 = all, default 0)"
+                }
+            },
+            "required": ["path"]
+        }
+    },
+    {
         "name": "send_notification",
         "description": (
             "Send a desktop notification immediately. Use for reminders, alerts, timers, "
@@ -140,6 +196,13 @@ def send_response(response):
     sys.stdout.flush()
 
 
+# Socket timeout per tool: run_command may take up to 120s
+_TOOL_TIMEOUTS = {
+    "run_command": 135,  # 120s max execution + 15s buffer
+    "spawn_task": 30,
+}
+
+
 def call_main_process(tool_name, arguments):
     """Call the main push-to-talk process via Unix socket to execute a tool."""
     if not SOCKET_PATH:
@@ -147,7 +210,8 @@ def call_main_process(tool_name, arguments):
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        sock.settimeout(30)  # 30s timeout for tool execution
+        timeout = _TOOL_TIMEOUTS.get(tool_name, 30)
+        sock.settimeout(timeout)
         sock.connect(SOCKET_PATH)
 
         request = json.dumps({"tool": tool_name, "args": arguments})

@@ -82,6 +82,12 @@ class StreamComposer:
         # Lookahead buffer for peek-ahead without reordering
         self._lookahead: AudioSegment | None | object = _NO_LOOKAHEAD
 
+        # Shutdown flag
+        self._stopped = False
+
+        # Filler-is-response: when a "sufficient" filler plays, suppress LLM TTS
+        self._filler_sufficient = False
+
         # ── Cadence parameters (tunable) ──
         self.inter_sentence_pause: float = 0.15   # 150ms between sentences
         self.post_clip_pause: float = 0.25         # 250ms after filler clip
@@ -142,6 +148,7 @@ class StreamComposer:
         Drains the queue, clears held segments, cancels prefetch, clears lookahead.
         """
         self._paused = False
+        self._filler_sufficient = False
         self._held_segments.clear()
         self._lookahead = _NO_LOOKAHEAD
 
@@ -159,6 +166,10 @@ class StreamComposer:
             except asyncio.QueueEmpty:
                 break
 
+    def stop(self) -> None:
+        """Signal the composer to exit its run loop."""
+        self._stopped = True
+
     # ── Main loop ─────────────────────────────────────────────────
 
     async def _next_segment(self) -> AudioSegment | None:
@@ -167,15 +178,24 @@ class StreamComposer:
             seg = self._lookahead
             self._lookahead = _NO_LOOKAHEAD
             return seg  # type: ignore[return-value]
-        return await self._segment_q.get()
+        # Use timeout so we can check the stopped flag periodically
+        while not self._stopped:
+            try:
+                return await asyncio.wait_for(self._segment_q.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+        return None
 
     async def run(self) -> None:
-        """Main composer loop -- runs forever, processing segments."""
-        while True:
+        """Main composer loop -- runs until stopped."""
+        while not self._stopped:
             segment = await self._next_segment()
+            if segment is None and self._stopped:
+                break
 
             # End-of-turn sentinel
             if segment is _EOT_SENTINEL:
+                self._filler_sufficient = False
                 gen_id = self._get_gen_id()
                 await self._audio_out_q.put(PipelineFrame(
                     type=FrameType.END_OF_TURN,
@@ -237,6 +257,8 @@ class StreamComposer:
 
     async def _process_filler_clip(self, segment: AudioSegment, gen_id: int) -> None:
         """Emit filler clip PCM followed by post-clip pause."""
+        if segment.metadata.get("sufficient"):
+            self._filler_sufficient = True
         if isinstance(segment.data, bytes) and segment.data:
             await self._emit_pcm(segment.data, FrameType.FILLER, gen_id)
         await self._emit_silence(self.post_clip_pause, gen_id)
@@ -245,6 +267,10 @@ class StreamComposer:
         """Generate TTS for a sentence, emit audio + SENTENCE_DONE + pause."""
         text = segment.data
         if not isinstance(text, str) or not text.strip():
+            return
+
+        # Filler already served as the response — drop LLM TTS
+        if self._filler_sufficient:
             return
 
         pcm: bytes | None = None
