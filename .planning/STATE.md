@@ -13,7 +13,7 @@ Milestone: v1.2 Adaptive Quick Responses
 Phase: 9 of 11 (Semantic Matching + Pipeline Polish)
 Plan: 2 of 3 in current phase
 Status: In progress
-Last activity: 2026-02-20 -- Completed quick-001-PLAN.md (personality restructure)
+Last activity: 2026-02-20 -- Completed quick-002-PLAN.md (configurable idle timeout)
 
 Progress: [############                  ] 42% (5/12 plans)
 
@@ -89,6 +89,7 @@ v1.2 execution decisions (09-02):
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 001 | Adapt Clawdbot personality system (Russel identity, soul values, user prefs) | 2026-02-20 | 0f70b4d | [001-adapt-clawdbot-personality-system](./quick/001-adapt-clawdbot-personality-system/) |
+| 002 | Configurable idle timeout with always-on default (0 = never disconnect) | 2026-02-20 | d5450f8 | [002-always-on-listening-smart-responding](./quick/002-always-on-listening-smart-responding/) |
 
 ### Blockers/Concerns
 
@@ -97,5 +98,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-20
-Stopped at: Completed quick-001-PLAN.md
+Stopped at: Completed quick-002-PLAN.md
 Resume file: None
