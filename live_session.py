@@ -187,6 +187,9 @@ class LiveSession:
         # CLI response reader task — tracked so barge-in can cancel it
         self._response_reader_task = None
 
+        # CLI session persistence — resume conversations across restarts
+        self._cli_session_id = None
+
         # Circuit breakers for service fallback
         self._stt_breaker = CircuitBreaker("STT/Deepgram")
         self._tts_breaker = CircuitBreaker("TTS/OpenAI")
@@ -1188,6 +1191,14 @@ class LiveSession:
             "--strict-mcp-config",
         ]
 
+        # Resume previous conversation if available
+        session_file = Path("~/.local/share/push-to-talk/cli_session_id").expanduser()
+        if session_file.exists():
+            prev_session = session_file.read_text().strip()
+            if prev_session:
+                cmd.extend(["--resume", prev_session])
+                print(f"Live session: Resuming CLI session {prev_session}", flush=True)
+
         # Disable all built-in tools — only MCP tools available
         cmd.extend(["--tools", ""])
 
@@ -1360,6 +1371,15 @@ class LiveSession:
                     event_data = json.loads(line_str)
                 except json.JSONDecodeError:
                     continue
+
+                # Capture CLI session ID from any event that carries it
+                cli_sid = event_data.get("session_id")
+                if cli_sid and not self._cli_session_id:
+                    self._cli_session_id = cli_sid
+                    session_file = Path("~/.local/share/push-to-talk/cli_session_id").expanduser()
+                    session_file.parent.mkdir(parents=True, exist_ok=True)
+                    session_file.write_text(cli_sid)
+                    print(f"Live session: CLI session ID: {cli_sid}", flush=True)
 
                 # Check for interrupt
                 if self.generation_id != gen_id:
