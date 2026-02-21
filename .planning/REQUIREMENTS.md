@@ -1,94 +1,127 @@
-# Requirements: Push-to-Talk v1.2
+# Requirements: Push-to-Talk v2.0
 
-**Defined:** 2026-02-18
-**Core Value:** Natural, low-friction voice conversation with Claude that feels like talking to a person
+**Defined:** 2026-02-21
+**Core Value:** An always-present AI that listens, understands context, and contributes when it has something useful to add
 
-## v1 Requirements
+## v2.0 Requirements
 
-Requirements for v1.2 Adaptive Quick Responses milestone.
+Requirements for v2.0 Always-On Observer milestone.
 
-### Classification
+### Continuous Input Stream
 
-- [x] **CLAS-01**: System classifies STT output into coarse categories (question, command, agreement, emotional, greeting, farewell) via heuristic pattern matching in under 1ms
-- [ ] **CLAS-02**: Semantic similarity matching via model2vec serves as fallback when heuristic classifier produces no confident match
-- [ ] **CLAS-03**: Short or trivial inputs receive silence-as-response (natural pause) instead of a filler clip
+- [ ] **CSTR-01**: Audio capture runs continuously without PTT activation, gated by Silero VAD to only process speech segments
+- [ ] **CSTR-02**: Whisper STT transcribes speech segments continuously, producing a stream of timestamped transcripts
+- [ ] **CSTR-03**: Rolling transcript buffer maintains a sliding window of recent transcripts (configurable, ~5-10 minutes) as the monitoring LLM's context
+- [ ] **CSTR-04**: Transcript buffer includes speaker attribution where detectable (user vs AI vs other)
+- [ ] **CSTR-05**: Audio feedback loop prevention via PipeWire echo cancellation prevents the AI from hearing and responding to its own speech
 
-### Response Library
+### Monitoring Decision Engine
 
-- [x] **RLIB-01**: Response library stores situation-to-audio-clip mappings organized by input category
-- [x] **RLIB-02**: Seed library ships with 30-40 pre-generated Piper TTS clips across all categories, available on first use
-- [x] **RLIB-03**: Category-aware filler selection replaces random clip selection in `_filler_manager()`
-- [x] **RLIB-04**: Each clip tracks usage count and contextual accuracy metrics for pruning decisions
+- [ ] **MNTR-01**: Ollama (Llama 3.2 3B) evaluates the transcript buffer after each speech segment and outputs a structured JSON decision (should_respond, confidence, response_type, tone)
+- [ ] **MNTR-02**: Name-based activation ("hey Russel" / "Russell" / "Russ") bypasses confidence threshold — AI always responds when addressed by name
+- [ ] **MNTR-03**: Name detection during AI playback triggers barge-in interruption (replacing PTT-based interruption)
+- [ ] **MNTR-04**: Decision engine considers addressee detection, relevance, urgency, and interruption cost when deciding whether to respond
+- [ ] **MNTR-05**: Configurable confidence threshold controls how aggressively the AI participates (low = proactive, high = conservative)
 
-### Non-Speech Awareness
+### Response Backend
 
-- [ ] **NSPC-01**: System detects non-speech vocalizations (coughs, sighs, laughter) from STT rejection metadata and VAD signals
-- [ ] **NSPC-02**: Non-speech events trigger contextual responses (cough -> "excuse you", sigh -> empathetic acknowledgment)
-- [ ] **NSPC-03**: Non-speech detection uses configurable confidence threshold to manage false positive rate
+- [ ] **RESP-01**: System automatically selects response backend (Claude CLI or Ollama) based on query complexity, network availability, and expected latency
+- [ ] **RESP-02**: Ollama generates quick conversational responses (~200ms) for simple interactions and proactive contributions
+- [ ] **RESP-03**: Claude CLI handles complex queries, tool-using requests, and multi-step reasoning (existing pipeline)
+- [ ] **RESP-04**: Response tone/style adapts to conversation context — technical in work discussions, casual in banter, supportive when user sounds frustrated
 
-### Pipeline Integration
+### Proactive Participation
 
-- [x] **PIPE-01**: Classification and response selection complete within existing 500ms filler gate with no added perceptible latency
-- [ ] **PIPE-02**: Quick response clips integrate with barge-in system via sentence tracking awareness
-- [ ] **PIPE-03**: Playback handles collision-free transition from quick response clip to full LLM TTS response (sink-side frame draining)
+- [ ] **PRCT-01**: AI proactively contributes to conversations when it has relevant information, even without being addressed
+- [ ] **PRCT-02**: Attention signal (brief verbal cue or audio chime) plays before unsolicited proactive responses
+- [ ] **PRCT-03**: Interruptibility detection suppresses proactive responses when user appears busy (long silence = deep work, explicit "quiet mode" command)
+- [ ] **PRCT-04**: Conversation balance tracking prevents the AI from dominating the conversation
 
-### Library Management
+### Resource Management
 
-- [ ] **LMGT-01**: Post-session curator daemon analyzes conversation to identify uncovered situations and generates new clips
-- [ ] **LMGT-02**: Library pruning removes or deprioritizes clips with low effectiveness based on usage tracking
-- [ ] **LMGT-03**: Curator daemon follows learner.py pattern (subprocess, signal file notification)
+- [ ] **RSRC-01**: System runs continuously for 8+ hours without memory leaks, GPU exhaustion, or CPU runaway
+- [ ] **RSRC-02**: Transcript buffer is bounded (ring buffer) with configurable size, older entries dropped or summarized
+- [ ] **RSRC-03**: GPU VRAM manages concurrent Whisper + Ollama inference within RTX 3070 8GB budget
+- [ ] **RSRC-04**: Graceful degradation chain: Ollama down → heuristic classifier + Claude CLI; network down → Ollama only; GPU pressure → downgrade Whisper model
 
-## v2 Requirements
+### Non-Speech & Library (from v1.2)
+
+- [ ] **NSPL-01**: Non-speech vocalizations (coughs, sighs, laughter) detected from STT rejection metadata trigger contextual responses
+- [ ] **NSPL-02**: Post-session curator daemon analyzes conversations, identifies response gaps, and generates new quick response clips
+- [ ] **NSPL-03**: Library pruning removes or deprioritizes clips with low effectiveness based on usage tracking
+
+### Multi-Speaker Awareness
+
+- [ ] **SPKR-01**: System distinguishes primary user voice from other audio sources (TV, guests, other people) using energy profiles and proximity heuristics
+- [ ] **SPKR-02**: Speaker attribution labels in transcript buffer improve decision engine accuracy (respond to user, not TV dialogue)
+
+## v3 Requirements
 
 Deferred to future milestones.
 
-### Advanced Classification
+### Advanced Proactivity
 
-- **CLAS-04**: Multi-turn context tracking (response depends on conversation history, not just current input)
-- **CLAS-05**: Prosodic analysis (tone, pitch, speaking rate inform category selection)
+- **PRCT-05**: Learning user schedule/routines for time-based proactive offers
+- **PRCT-06**: Multi-turn conversation memory across sessions (persistent context)
 
-### Advanced Library
+### Advanced Speaker
 
-- **RLIB-05**: Dynamic TTS generation (generate clips on-the-fly instead of pre-cached, requires faster TTS)
-- **RLIB-06**: Multiple voice/personality profiles with distinct response libraries
-- **LMGT-04**: A/B effectiveness comparison between response variants
+- **SPKR-03**: Speaker diarization via pyannote.audio for accurate multi-speaker tracking
+- **SPKR-04**: Voice enrollment — user registers their voice for personalized recognition
+
+### Advanced Response
+
+- **RESP-05**: Dynamic TTS fillers generated on-the-fly with contextual text
+- **RESP-06**: Multiple voice/personality profiles with distinct response libraries
 
 ## Out of Scope
 
 | Feature | Reason |
 |---------|--------|
-| Cloud API classification | Latency incompatible with <50ms budget, defeats local-first design |
-| Full NLU pipeline | Over-engineering for 5-6 coarse categories on single sentences |
-| 30+ category taxonomy | Research shows accuracy drops to ~60%, worse than random generic fillers |
-| ML classifier for v1 | Pattern matching handles 90%+ of cases in <1ms with zero dependencies |
-| Category-dependent gate timing | Premature optimization, uniform gate sufficient for v1 |
+| Hardware wake word detection (Picovoice/openWakeWord) | Whisper STT already runs continuously — name detection on transcripts is simpler and cheaper |
+| Cloud-based monitoring LLM | Privacy concern (always-on mic), adds latency, costs money, violates local-first philosophy |
+| Full conversation transcription storage | Surveillance feature — rolling buffer is ephemeral by design |
+| Speech-to-speech model (GPT-4o Realtime) | Cloud-only, expensive, designed for 1:1 conversation not ambient monitoring |
+| Multi-room / multi-device mesh | Massive scope expansion — one device, one room, one mic |
+| Routine-based proactivity | Different product — Russel participates in conversations, doesn't initiate from silence |
 
 ## Traceability
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CLAS-01 | Phase 8 | Complete |
-| CLAS-02 | Phase 9 | Pending |
-| CLAS-03 | Phase 9 | Pending |
-| RLIB-01 | Phase 8 | Complete |
-| RLIB-02 | Phase 8 | Complete |
-| RLIB-03 | Phase 8 | Complete |
-| RLIB-04 | Phase 8 | Complete |
-| NSPC-01 | Phase 11 | Pending |
-| NSPC-02 | Phase 11 | Pending |
-| NSPC-03 | Phase 11 | Pending |
-| PIPE-01 | Phase 8 | Complete |
-| PIPE-02 | Phase 9 | Pending |
-| PIPE-03 | Phase 9 | Pending |
-| LMGT-01 | Phase 10 | Pending |
-| LMGT-02 | Phase 10 | Pending |
-| LMGT-03 | Phase 10 | Pending |
+| CSTR-01 | TBD | Pending |
+| CSTR-02 | TBD | Pending |
+| CSTR-03 | TBD | Pending |
+| CSTR-04 | TBD | Pending |
+| CSTR-05 | TBD | Pending |
+| MNTR-01 | TBD | Pending |
+| MNTR-02 | TBD | Pending |
+| MNTR-03 | TBD | Pending |
+| MNTR-04 | TBD | Pending |
+| MNTR-05 | TBD | Pending |
+| RESP-01 | TBD | Pending |
+| RESP-02 | TBD | Pending |
+| RESP-03 | TBD | Pending |
+| RESP-04 | TBD | Pending |
+| PRCT-01 | TBD | Pending |
+| PRCT-02 | TBD | Pending |
+| PRCT-03 | TBD | Pending |
+| PRCT-04 | TBD | Pending |
+| RSRC-01 | TBD | Pending |
+| RSRC-02 | TBD | Pending |
+| RSRC-03 | TBD | Pending |
+| RSRC-04 | TBD | Pending |
+| NSPL-01 | TBD | Pending |
+| NSPL-02 | TBD | Pending |
+| NSPL-03 | TBD | Pending |
+| SPKR-01 | TBD | Pending |
+| SPKR-02 | TBD | Pending |
 
 **Coverage:**
-- v1 requirements: 16 total
-- Mapped to phases: 16
-- Unmapped: 0
+- v2.0 requirements: 27 total
+- Mapped to phases: 0 (awaiting roadmap)
+- Unmapped: 27
 
 ---
-*Requirements defined: 2026-02-18*
-*Last updated: 2026-02-19 after Phase 8 completion*
+*Requirements defined: 2026-02-21*
+*Last updated: 2026-02-21 after initial definition*
