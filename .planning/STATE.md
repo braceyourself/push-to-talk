@@ -11,18 +11,18 @@ See: .planning/PROJECT.md (updated 2026-02-21)
 
 Milestone: v2.0 Always-On Observer
 Phase: 12 of 16 (Infrastructure + Safety Net)
-Plan: 1 of 3 (awaiting checkpoint approval)
+Plan: 2 of 3
 Status: In progress
-Last activity: 2026-02-21 — Completed 12-01-PLAN.md (VRAM validation, VRAMMonitor, PipeWire AEC)
+Last activity: 2026-02-21 — Completed 12-02-PLAN.md (TranscriptBuffer, hallucination filter)
 
-Progress: [█░░░░░░░░░] ~3% (1 of ~30 total plans, pending checkpoint)
+Progress: [██░░░░░░░░] ~7% (2 of ~30 total plans)
 
 ## Performance Metrics
 
 **Velocity (v2.0):**
-- Total plans completed: 1 (pending checkpoint)
-- Average duration: 11min
-- Total execution time: 11min
+- Total plans completed: 2
+- Average duration: 8min
+- Total execution time: 16min
 
 ## Accumulated Context
 
@@ -48,6 +48,11 @@ Phase 12-01 decisions:
 - AEC device name: "Echo Cancellation Source" (with spaces) for pasimple device_name param
 - VRAMMonitor uses factory method create() returning None for graceful GPU-less operation
 
+Phase 12-02 decisions:
+- get_context() always returns at least one segment even if it exceeds token budget
+- 46 hallucination phrases (18 existing + 28 research-backed from arXiv 2501.11378)
+- TranscriptSegment is frozen (immutable) for thread safety
+
 ### Research Flags
 
 - **Phase 12:** ~~PipeWire AEC device selection needs 30-min spike on this machine~~ DONE: "Echo Cancellation Source"
@@ -72,5 +77,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-21
-Stopped at: Completed 12-01-PLAN.md, awaiting checkpoint approval
+Stopped at: Completed 12-02-PLAN.md
 Resume file: None
