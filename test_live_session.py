@@ -2616,6 +2616,156 @@ def test_vram_monitor_init_failure_graceful():
 
 
 # ══════════════════════════════════════════════════════════════════
+# Test Group: Hallucination Filter Tests (transcript_buffer.py)
+# ══════════════════════════════════════════════════════════════════
+
+@test("Hallucination: known phrase 'thank you' is detected")
+def test_hallucination_known_phrase():
+    from transcript_buffer import is_hallucination
+    assert is_hallucination("thank you") == True
+
+@test("Hallucination: case-insensitive with trailing punctuation")
+def test_hallucination_case_insensitive():
+    from transcript_buffer import is_hallucination
+    assert is_hallucination("Thanks for watching.") == True
+
+@test("Hallucination: 'PLEASE SUBSCRIBE' detected (uppercase)")
+def test_hallucination_subscribe():
+    from transcript_buffer import is_hallucination
+    assert is_hallucination("PLEASE SUBSCRIBE") == True
+
+@test("Hallucination: single word 'the' with high no_speech_prob")
+def test_hallucination_single_word_high_nsp():
+    from transcript_buffer import is_hallucination
+    assert is_hallucination("the", no_speech_prob=0.5) == True
+
+@test("Hallucination: single word 'hello' with low no_speech_prob is NOT hallucination")
+def test_hallucination_single_word_low_nsp():
+    from transcript_buffer import is_hallucination
+    assert is_hallucination("hello", no_speech_prob=0.1) == False
+
+@test("Hallucination: short text 'a' (<=2 chars) detected")
+def test_hallucination_short_text():
+    from transcript_buffer import is_hallucination
+    assert is_hallucination("a") == True
+
+@test("Hallucination: empty string detected")
+def test_hallucination_empty():
+    from transcript_buffer import is_hallucination
+    assert is_hallucination("") == True
+
+@test("Hallucination: repetitive 'thank you thank you thank you thank you'")
+def test_hallucination_repetitive():
+    from transcript_buffer import is_hallucination
+    assert is_hallucination("thank you thank you thank you thank you") == True
+
+@test("Hallucination: normal speech 'I need help with my project' is NOT hallucination")
+def test_hallucination_normal_speech():
+    from transcript_buffer import is_hallucination
+    assert is_hallucination("I need help with my project") == False
+
+@test("Hallucination: normal question 'What time is the meeting?' is NOT hallucination")
+def test_hallucination_normal_question():
+    from transcript_buffer import is_hallucination
+    assert is_hallucination("What time is the meeting?") == False
+
+@test("Hallucination: 'subtitles by' detected")
+def test_hallucination_subtitles():
+    from transcript_buffer import is_hallucination
+    assert is_hallucination("subtitles by") == True
+
+
+# ══════════════════════════════════════════════════════════════════
+# Test Group: TranscriptBuffer Tests (transcript_buffer.py)
+# ══════════════════════════════════════════════════════════════════
+
+@test("TranscriptBuffer: append 5 segments, len() returns 5")
+def test_buffer_append_and_len():
+    from transcript_buffer import TranscriptBuffer, TranscriptSegment
+    buf = TranscriptBuffer(max_segments=200, max_age_seconds=300.0)
+    for i in range(5):
+        buf.append(TranscriptSegment(text=f"segment {i}", timestamp=time.time()))
+    assert len(buf) == 5, f"Expected 5, got {len(buf)}"
+
+@test("TranscriptBuffer: max_segments=3, add 5 -> len() returns 3, oldest dropped")
+def test_buffer_max_segments():
+    from transcript_buffer import TranscriptBuffer, TranscriptSegment
+    buf = TranscriptBuffer(max_segments=3, max_age_seconds=300.0)
+    for i in range(5):
+        buf.append(TranscriptSegment(text=f"segment {i}", timestamp=time.time()))
+    assert len(buf) == 3, f"Expected 3, got {len(buf)}"
+    # Verify oldest were dropped: get_context should have segments 2, 3, 4
+    ctx = buf.get_context()
+    assert "segment 0" not in ctx, "segment 0 should have been evicted"
+    assert "segment 1" not in ctx, "segment 1 should have been evicted"
+    assert "segment 4" in ctx, "segment 4 should be present"
+
+@test("TranscriptBuffer: get_context format is '[source] text' per line")
+def test_buffer_get_context_format():
+    from transcript_buffer import TranscriptBuffer, TranscriptSegment
+    buf = TranscriptBuffer(max_segments=200, max_age_seconds=300.0)
+    now = time.time()
+    buf.append(TranscriptSegment(text="text1", timestamp=now, source="user"))
+    buf.append(TranscriptSegment(text="text2", timestamp=now + 1, source="user"))
+    buf.append(TranscriptSegment(text="text3", timestamp=now + 2, source="user"))
+    ctx = buf.get_context()
+    expected = "[user] text1\n[user] text2\n[user] text3"
+    assert ctx == expected, f"Expected:\n{expected}\nGot:\n{ctx}"
+
+@test("TranscriptBuffer: get_context with max_tokens limits output")
+def test_buffer_get_context_max_tokens():
+    from transcript_buffer import TranscriptBuffer, TranscriptSegment
+    buf = TranscriptBuffer(max_segments=200, max_age_seconds=300.0)
+    now = time.time()
+    for i in range(10):
+        buf.append(TranscriptSegment(text=f"This is segment number {i} with some text", timestamp=now + i))
+    # max_tokens=10 -> ~40 chars budget. Only the most recent segment(s) should fit.
+    ctx = buf.get_context(max_tokens=10)
+    # Should have at most ~40 characters worth of content
+    assert len(ctx) <= 60, f"Context too long ({len(ctx)} chars) for max_tokens=10"
+    # Should contain the most recent segment
+    assert "segment number 9" in ctx, "Should contain most recent segment"
+
+@test("TranscriptBuffer: get_since returns segments after timestamp")
+def test_buffer_get_since():
+    from transcript_buffer import TranscriptBuffer, TranscriptSegment
+    buf = TranscriptBuffer(max_segments=200, max_age_seconds=300.0)
+    t1 = 1000.0
+    t2 = 1001.0
+    t3 = 1002.0
+    buf.append(TranscriptSegment(text="old", timestamp=t1))
+    buf.append(TranscriptSegment(text="mid", timestamp=t2))
+    buf.append(TranscriptSegment(text="new", timestamp=t3))
+    result = buf.get_since(1001.0)  # Should return only segments AFTER 1001.0
+    assert len(result) == 1, f"Expected 1 segment after t=1001.0, got {len(result)}"
+    assert result[0].text == "new"
+
+@test("TranscriptBuffer: clear() empties the buffer")
+def test_buffer_clear():
+    from transcript_buffer import TranscriptBuffer, TranscriptSegment
+    buf = TranscriptBuffer(max_segments=200, max_age_seconds=300.0)
+    for i in range(5):
+        buf.append(TranscriptSegment(text=f"seg {i}", timestamp=time.time()))
+    assert len(buf) == 5
+    buf.clear()
+    assert len(buf) == 0, f"Expected 0 after clear(), got {len(buf)}"
+
+@test("TranscriptBuffer: time-based eviction on append")
+def test_buffer_time_eviction():
+    from transcript_buffer import TranscriptBuffer, TranscriptSegment
+    buf = TranscriptBuffer(max_segments=200, max_age_seconds=1.0)
+    old_time = time.time() - 5.0  # 5 seconds ago, well past max_age of 1s
+    buf.append(TranscriptSegment(text="old segment", timestamp=old_time))
+    assert len(buf) == 1, "Should have 1 segment right after append"
+    # Append a new segment -- this should trigger eviction of the old one
+    buf.append(TranscriptSegment(text="new segment", timestamp=time.time()))
+    assert len(buf) == 1, f"Expected 1 after eviction, got {len(buf)}"
+    ctx = buf.get_context()
+    assert "old segment" not in ctx, "Old segment should have been evicted"
+    assert "new segment" in ctx, "New segment should remain"
+
+
+# ══════════════════════════════════════════════════════════════════
 # Run all tests
 # ══════════════════════════════════════════════════════════════════
 
