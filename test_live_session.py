@@ -2390,6 +2390,97 @@ async def test_options_cors():
 
 
 # ══════════════════════════════════════════════════════════════════
+# Test Group: Dashboard Integration (event parsing, commands, session)
+# ══════════════════════════════════════════════════════════════════
+
+@test("dashboard event parsing extracts status, metrics, and turns")
+def test_dashboard_event_parsing():
+    """Given JSONL lines, verify correct state extraction."""
+    from event_bus import BusEvent
+
+    # Status event
+    evt = BusEvent.from_json_line('{"ts":1.0,"src":"live_session","type":"status","gen":1,"sid":"s1","status":"listening"}')
+    assert evt.type == "status"
+    assert evt.payload["status"] == "listening"
+    assert evt.gen == 1
+
+    # STT complete with latency
+    evt = BusEvent.from_json_line('{"ts":2.0,"src":"live_session","type":"stt_complete","gen":1,"sid":"s1","text":"hello","latency_ms":234}')
+    assert evt.type == "stt_complete"
+    assert evt.payload["latency_ms"] == 234
+    assert evt.payload["text"] == "hello"
+
+    # LLM first token with latency
+    evt = BusEvent.from_json_line('{"ts":3.0,"src":"live_session","type":"llm_first_token","gen":1,"sid":"s1","latency_ms":456}')
+    assert evt.type == "llm_first_token"
+    assert evt.payload["latency_ms"] == 456
+
+    # TTS complete with latency
+    evt = BusEvent.from_json_line('{"ts":4.0,"src":"live_session","type":"tts_complete","gen":1,"sid":"s1","latency_ms":123}')
+    assert evt.type == "tts_complete"
+    assert evt.payload["latency_ms"] == 123
+
+    # User turn
+    evt = BusEvent.from_json_line('{"ts":5.0,"src":"live_session","type":"user","gen":1,"sid":"s1","text":"What is the weather?"}')
+    assert evt.type == "user"
+    assert evt.payload["text"] == "What is the weather?"
+
+    # Assistant turn
+    evt = BusEvent.from_json_line('{"ts":6.0,"src":"live_session","type":"assistant","gen":1,"sid":"s1","text":"It is sunny."}')
+    assert evt.type == "assistant"
+    assert evt.payload["text"] == "It is sunny."
+
+
+@test("dashboard command write produces valid bus events")
+def test_dashboard_command_write():
+    """Verify EventBusWriter writes command events that can be parsed back."""
+    from event_bus import EventBusWriter, EventBusTailer
+
+    with tempfile.TemporaryDirectory() as td:
+        bus_path = Path(td) / "events.jsonl"
+        writer = EventBusWriter(bus_path, "dashboard", "test_session")
+        writer.open()
+        writer.emit("command", action="mute")
+        writer.emit("command", action="interrupt")
+        writer.emit("command", action="stop")
+        writer.close()
+
+        # Read back and verify
+        tailer = EventBusTailer(bus_path)
+        events = tailer.read_recent(last_n=10, event_type="command")
+        assert len(events) == 3, f"Expected 3 command events, got {len(events)}"
+        assert events[0].payload["action"] == "mute"
+        assert events[0].src == "dashboard"
+        assert events[0].sid == "test_session"
+        assert events[1].payload["action"] == "interrupt"
+        assert events[2].payload["action"] == "stop"
+
+
+@test("dashboard session discovery reads active_session file")
+def test_dashboard_session_discovery():
+    """Verify active_session file reading returns correct bus path."""
+    with tempfile.TemporaryDirectory() as td:
+        # Create a fake session directory with events.jsonl
+        session_dir = Path(td) / "sessions" / "20260221_140000"
+        session_dir.mkdir(parents=True)
+        bus_path = session_dir / "events.jsonl"
+        bus_path.write_text("")
+
+        # Write active_session pointer
+        active_file = Path(td) / "active_session"
+        active_file.write_text(str(session_dir))
+
+        # Simulate dashboard session discovery logic
+        content = active_file.read_text().strip()
+        discovered_dir = Path(content)
+        discovered_bus = discovered_dir / "events.jsonl"
+
+        assert discovered_dir == session_dir
+        assert discovered_bus.exists()
+        assert discovered_dir.name == "20260221_140000"
+
+
+# ══════════════════════════════════════════════════════════════════
 # Run all tests
 # ══════════════════════════════════════════════════════════════════
 

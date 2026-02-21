@@ -2199,6 +2199,10 @@ class LiveOverlayWidget(Gtk.Window):
         restart_svc_item.connect('activate', self._on_restart_service_clicked)
         menu.append(restart_svc_item)
 
+        dash_item = Gtk.MenuItem(label='Dashboard')
+        dash_item.connect('activate', lambda _: self._open_dashboard())
+        menu.append(dash_item)
+
         menu.append(Gtk.SeparatorMenuItem())
 
         # Model selection
@@ -2285,6 +2289,15 @@ class LiveOverlayWidget(Gtk.Window):
 
     def _on_restart_service_clicked(self, widget):
         subprocess.Popen(['systemctl', '--user', 'restart', 'push-to-talk.service'])
+
+    def _open_dashboard(self):
+        """Open or raise the dashboard window."""
+        from dashboard import DashboardWindow
+        if not hasattr(self, '_dashboard') or not self._dashboard.get_visible():
+            self._dashboard = DashboardWindow()
+            self._dashboard.show_all()
+        else:
+            self._dashboard.present()
 
     def _on_model_selected(self, widget, model_id):
         """Handle model selection from context menu."""
