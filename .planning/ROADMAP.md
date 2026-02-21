@@ -61,7 +61,11 @@ Phases 10-11 (library growth, non-speech) folded into v2.0 as NSPL-01/02/03.
   3. Whisper and Ollama run simultaneously on the RTX 3070 without OOM crashes during a 30-minute stress test
   4. Transcript buffer holds ~5 minutes of context and older entries drop off automatically -- no unbounded memory growth
   5. Hallucination rate on ambient audio (keyboard, HVAC, silence) stays below 5% of transcribed segments
-**Plans**: TBD
+**Plans:** 3 plans
+Plans:
+- [ ] 12-01-PLAN.md -- VRAM validation (go/no-go gate), PipeWire AEC setup, VRAMMonitor module
+- [ ] 12-02-PLAN.md -- TranscriptBuffer ring buffer + expanded hallucination filter (TDD)
+- [ ] 12-03-PLAN.md -- ContinuousSTT module + pipeline integration (TDD)
 
 ### Phase 13: Decision Engine
 **Goal**: A local LLM monitors the transcript stream and reliably decides when to respond -- always responding when addressed by name, never responding to background noise or TV dialogue
@@ -121,7 +125,7 @@ Phases execute in numeric order: 12 -> 13 -> 14 -> 15 -> 16
 | 9. Semantic Matching + Pipeline Polish | v1.2 | 3/3 | Complete | 2026-02-20 |
 | 10. Library Growth + Pruning | v1.2 | — | Deferred to v2.0 (NSPL-02/03) | — |
 | 11. Non-Speech Awareness | v1.2 | — | Deferred to v2.0 (NSPL-01) | — |
-| 12. Infrastructure + Safety Net | v2.0 | 0/TBD | Not started | - |
+| 12. Infrastructure + Safety Net | v2.0 | 0/3 | Not started | - |
 | 13. Decision Engine | v2.0 | 0/TBD | Not started | - |
 | 14. Response Backend + Integration | v2.0 | 0/TBD | Not started | - |
 | 15. Proactive Participation | v2.0 | 0/TBD | Not started | - |
