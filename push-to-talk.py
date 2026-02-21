@@ -810,7 +810,14 @@ class PushToTalk:
                         content = restart_signal.read_text().strip()
                         if content == "restart_live":
                             restart_signal.write_text("idle")  # Clear signal
-                            if not self.live_session:
+                            session_dead = (not self.live_session or
+                                            not getattr(self.live_session, 'running', False))
+                            if session_dead:
+                                # Wait for old session thread to finish
+                                if self.live_thread and self.live_thread.is_alive():
+                                    self.live_thread.join(timeout=3)
+                                self.live_session = None
+                                self.live_thread = None
                                 print("Config watcher: Restart live session requested", flush=True)
                                 self.start_live_session()
                     except Exception:

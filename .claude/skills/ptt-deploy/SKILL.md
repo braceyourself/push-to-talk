@@ -31,6 +31,7 @@ All of these must be synced (repo → deploy dir):
 - `stream_composer.py`
 - `response_library.py`
 - `openai_realtime.py`
+- `ptt-launcher.py`
 
 **Data/config:**
 - `category_exemplars.json`
@@ -47,7 +48,7 @@ All of these must be synced (repo → deploy dir):
    REPO=/home/ethan/code/push-to-talk
    DEPLOY=/home/ethan/.local/share/push-to-talk
    changed=()
-   for f in push-to-talk.py indicator.py live_session.py input_classifier.py learner.py task_manager.py task_tools_mcp.py pipeline_frames.py clip_factory.py stream_composer.py response_library.py openai_realtime.py category_exemplars.json vocabulary.txt requirements.txt; do
+   for f in push-to-talk.py indicator.py live_session.py input_classifier.py learner.py task_manager.py task_tools_mcp.py pipeline_frames.py clip_factory.py stream_composer.py response_library.py openai_realtime.py ptt-launcher.py category_exemplars.json vocabulary.txt requirements.txt; do
      if [ -f "$REPO/$f" ] && ! diff -q "$REPO/$f" "$DEPLOY/$f" > /dev/null 2>&1; then
        changed+=("$f")
      fi
@@ -70,9 +71,9 @@ All of these must be synced (repo → deploy dir):
    done
    ```
 
-3. **Restart service:**
+3. **Restart services:**
    ```bash
-   systemctl --user restart push-to-talk.service
+   systemctl --user restart push-to-talk.service push-to-talk-launcher.service
    ```
 
 4. **Verify startup** — Tail journal briefly to confirm clean start:

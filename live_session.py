@@ -184,7 +184,7 @@ class LiveSession:
     def __init__(self, openai_api_key=None, deepgram_api_key=None,
                  voice="ash", model="claude-sonnet-4-5-20250929", on_status=None,
                  fillers_enabled=True, barge_in_enabled=True, whisper_model=None,
-                 idle_timeout=0, sse_dashboard=False):
+                 idle_timeout=0, sse_dashboard=False, sse_port=9847):
         self.openai_api_key = openai_api_key
         self.deepgram_api_key = deepgram_api_key
         self.whisper_model = whisper_model
@@ -194,6 +194,7 @@ class LiveSession:
 
         # SSE dashboard
         self._sse_dashboard = sse_dashboard
+        self._sse_port = sse_port
         self._sse_clients: list[asyncio.StreamWriter] = []
         self._sse_server = None
 
@@ -862,65 +863,67 @@ class LiveSession:
         if not self._sse_dashboard:
             return
 
-        async def handle_sse_client(reader, writer):
-            # Read and discard the HTTP request
+        async def handle_client(reader, writer):
+            # Parse request line
+            try:
+                request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+                if not request_line:
+                    writer.close()
+                    return
+                parts = request_line.decode().split()
+                method = parts[0] if parts else ''
+                path = parts[1] if len(parts) > 1 else '/'
+            except (asyncio.TimeoutError, ConnectionError, UnicodeDecodeError):
+                writer.close()
+                return
+
+            # Read headers
+            content_length = 0
             try:
                 while True:
                     line = await asyncio.wait_for(reader.readline(), timeout=5.0)
                     if line == b"\r\n" or not line:
                         break
+                    if b':' in line:
+                        k, v = line.decode().split(':', 1)
+                        if k.strip().lower() == 'content-length':
+                            content_length = int(v.strip())
             except (asyncio.TimeoutError, ConnectionError):
                 writer.close()
                 return
 
-            # Send HTTP response headers
-            writer.write(
-                b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: text/event-stream\r\n"
-                b"Cache-Control: no-cache\r\n"
-                b"Connection: keep-alive\r\n"
-                b"Access-Control-Allow-Origin: *\r\n"
-                b"\r\n"
-            )
-            try:
-                await writer.drain()
-            except (ConnectionError, OSError):
+            # Route requests
+            if method == 'GET' and '/events' in path:
+                await self._handle_sse_stream(reader, writer)
+            elif method == 'POST' and '/cmd' in path:
+                body = await reader.read(content_length) if content_length else b'{}'
+                await self._handle_command(writer, body)
+            elif method == 'OPTIONS':
+                writer.write(
+                    b"HTTP/1.1 204 No Content\r\n"
+                    b"Access-Control-Allow-Origin: *\r\n"
+                    b"Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                    b"Access-Control-Allow-Headers: Content-Type\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                try:
+                    await writer.drain()
+                except (ConnectionError, OSError):
+                    pass
                 writer.close()
-                return
-
-            # Send initial snapshot
-            snapshot = self._build_state_snapshot()
-            msg = f"data: {json.dumps(snapshot)}\n\n".encode()
-            try:
-                writer.write(msg)
-                await writer.drain()
-            except (ConnectionError, OSError):
+            else:
+                writer.write(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
+                try:
+                    await writer.drain()
+                except (ConnectionError, OSError):
+                    pass
                 writer.close()
-                return
-
-            self._sse_clients.append(writer)
-            print(f"SSE: Client connected ({len(self._sse_clients)} total)", flush=True)
-
-            # Keep connection alive with periodic pings
-            try:
-                while self.running:
-                    await asyncio.sleep(15)
-                    try:
-                        writer.write(b": keepalive\n\n")
-                        await writer.drain()
-                    except (ConnectionError, OSError):
-                        break
-            finally:
-                if writer in self._sse_clients:
-                    self._sse_clients.remove(writer)
-                writer.close()
-                print(f"SSE: Client disconnected ({len(self._sse_clients)} total)", flush=True)
 
         try:
             self._sse_server = await asyncio.start_server(
-                handle_sse_client, '127.0.0.1', 9847
+                handle_client, '127.0.0.1', self._sse_port
             )
-            print(f"SSE dashboard server at http://127.0.0.1:9847/events", flush=True)
+            print(f"SSE dashboard server at http://127.0.0.1:{self._sse_port}/events", flush=True)
 
             # Periodic queue depth emission (ephemeral — no disk write)
             async def emit_queue_depths():
@@ -943,6 +946,109 @@ class LiveSession:
             for writer in list(self._sse_clients):
                 writer.close()
             self._sse_clients.clear()
+
+    async def _handle_sse_stream(self, reader, writer):
+        """Handle GET /events — SSE stream connection."""
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/event-stream\r\n"
+            b"Cache-Control: no-cache\r\n"
+            b"Connection: keep-alive\r\n"
+            b"Access-Control-Allow-Origin: *\r\n"
+            b"\r\n"
+        )
+        try:
+            await writer.drain()
+        except (ConnectionError, OSError):
+            writer.close()
+            return
+
+        # Send initial snapshot
+        snapshot = self._build_state_snapshot()
+        msg = f"data: {json.dumps(snapshot)}\n\n".encode()
+        try:
+            writer.write(msg)
+            await writer.drain()
+        except (ConnectionError, OSError):
+            writer.close()
+            return
+
+        self._sse_clients.append(writer)
+        print(f"SSE: Client connected ({len(self._sse_clients)} total)", flush=True)
+
+        # Keep connection alive with periodic pings
+        try:
+            while self.running:
+                await asyncio.sleep(15)
+                try:
+                    writer.write(b": keepalive\n\n")
+                    await writer.drain()
+                except (ConnectionError, OSError):
+                    break
+        finally:
+            if writer in self._sse_clients:
+                self._sse_clients.remove(writer)
+            writer.close()
+            print(f"SSE: Client disconnected ({len(self._sse_clients)} total)", flush=True)
+
+    async def _handle_command(self, writer, body: bytes):
+        """Handle POST /cmd requests from the dashboard."""
+        try:
+            cmd = json.loads(body)
+            action = cmd.get('action', '')
+            result = {"ok": True}
+
+            if action in ('mute', 'unmute'):
+                # Emit bus command — mic stage polls bus for mute/unmute
+                if self._bus:
+                    self._bus.emit("command", gen=self.generation_id, action=action)
+                else:
+                    self.set_muted(action == 'mute')
+            elif action == 'interrupt':
+                self.request_interrupt()
+            elif action == 'restart':
+                # Write restart_live signal (same as indicator "Start Session")
+                # then stop the live session — config watcher will restart it
+                if self._bus:
+                    self._bus.emit("command", gen=self.generation_id, action="stop")
+                status_file = Path(__file__).parent / "status"
+                status_file.write_text("restart_live")
+                self._send_json_response(writer, result)
+                await writer.drain()
+                writer.close()
+                return
+            elif action == 'stop':
+                if self._bus:
+                    self._bus.emit("command", gen=self.generation_id, action="stop")
+                self._send_json_response(writer, result)
+                await writer.drain()
+                writer.close()
+                return
+            else:
+                result = {"ok": False, "error": f"Unknown action: {action}"}
+
+            self._send_json_response(writer, result)
+            await writer.drain()
+            writer.close()
+        except Exception as e:
+            try:
+                self._send_json_response(writer, {"ok": False, "error": str(e)})
+                await writer.drain()
+            except (ConnectionError, OSError):
+                pass
+            writer.close()
+
+    def _send_json_response(self, writer, data: dict):
+        """Write an HTTP JSON response to a StreamWriter."""
+        body = json.dumps(data).encode()
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Access-Control-Allow-Origin: *\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
 
     def _reset_idle_timer(self):
         self._cancel_idle_timer()
@@ -1994,7 +2100,7 @@ class LiveSession:
                                 self._reset_idle_timer()
                                 print(f"Live session: {'Muted' if self.muted else 'Unmuted'} by user", flush=True)
                         if cmd_events:
-                            _last_bus_check_ts = cmd_events[-1].ts
+                            _last_bus_check_ts = cmd_events[-1].ts + 0.001
                         if not self.running:
                             break
 

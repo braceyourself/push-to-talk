@@ -128,6 +128,27 @@
   .status-dot.idle { background: #555; }
   @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
   .status-text { font-size: 13px; font-weight: 600; text-transform: capitalize; }
+
+  /* ── Controls ── */
+  .controls-card {
+    background: #16213e; border-radius: 6px; padding: 8px 10px; border: 1px solid #0f3460;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .controls-row { display: flex; gap: 6px; }
+  .ctrl-btn {
+    flex: 1; padding: 5px 8px; border-radius: 5px; border: 1px solid #333;
+    background: #1a1a2e; color: #ccc; font-size: 11px; font-weight: 600; font-family: inherit;
+    cursor: pointer; transition: background 0.15s, border-color 0.15s;
+  }
+  .ctrl-btn:hover { background: #252545; border-color: #555; }
+  .ctrl-btn:active { background: #333355; }
+  .ctrl-btn.muted-active { background: #ef444430; border-color: #ef4444; color: #ef4444; }
+  .ctrl-btn.svc-btn { color: #888; }
+  .ctrl-btn.danger { color: #ef4444; border-color: #ef444440; }
+  .ctrl-btn.danger:hover { background: #ef444420; border-color: #ef4444; }
+  .ctrl-btn.start-btn { color: #4ade80; border-color: #4ade8040; }
+  .ctrl-btn.start-btn:hover { background: #4ade8020; border-color: #4ade80; }
+
   .metrics-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
   .metric-mini {
     background: #16213e; border-radius: 6px; padding: 6px 8px; border: 1px solid #0f3460; text-align: center;
@@ -283,6 +304,19 @@
           <div class="status-dot idle" id="statusDot"></div>
           <div class="status-text" id="statusText">Idle</div>
         </div>
+        <div class="controls-card">
+          <div class="controls-row" id="startRow" style="display:none">
+            <button class="ctrl-btn start-btn" onclick="window._startService()">Start Service</button>
+          </div>
+          <div class="controls-row" id="sessionRow1">
+            <button class="ctrl-btn" id="btnMute" onclick="window._sendCmd(window._isMuted ? 'unmute' : 'mute')">Mute</button>
+            <button class="ctrl-btn" id="btnInterrupt" onclick="window._sendCmd('interrupt')">Interrupt</button>
+          </div>
+          <div class="controls-row" id="sessionRow2">
+            <button class="ctrl-btn svc-btn" onclick="window._sendCmd('restart')">Restart</button>
+            <button class="ctrl-btn svc-btn danger" onclick="window._sendCmd('stop')">Stop</button>
+          </div>
+        </div>
         <div class="metrics-row">
           <div class="metric-mini">
             <div class="metric-mini-label">STT</div>
@@ -329,6 +363,7 @@
 
   // ── State ──
   let es = null;
+  let isMuted = false;
   const MAX_LOG = 300;
   const MAX_CONV = 20;
   const SPARK_LEN = 20;
@@ -378,6 +413,50 @@
     if (activeFilter === 'errors') return FILTER_ERRORS.has(type);
     return true;
   }
+
+  // ── Command sender ──
+  async function sendCmd(action) {
+    try {
+      const res = await fetch('http://127.0.0.1:9847/cmd', {
+        method: 'POST',
+        body: JSON.stringify({action})
+      });
+      const data = await res.json();
+      if (!data.ok) console.warn('Command failed:', data.error);
+    } catch (e) {
+      console.warn('Command error:', e);
+    }
+  }
+  window._sendCmd = sendCmd;
+
+  function updateMuteBtn() {
+    const btn = $('btnMute');
+    if (!btn) return;
+    btn.textContent = isMuted ? 'Unmute' : 'Mute';
+    if (isMuted) btn.classList.add('muted-active');
+    else btn.classList.remove('muted-active');
+  }
+  Object.defineProperty(window, '_isMuted', { get() { return isMuted; } });
+
+  function setControlsConnected(connected) {
+    $('startRow').style.display = connected ? 'none' : 'flex';
+    $('sessionRow1').style.display = connected ? 'flex' : 'none';
+    $('sessionRow2').style.display = connected ? 'flex' : 'none';
+  }
+
+  async function startService() {
+    try {
+      const res = await fetch('http://127.0.0.1:9848', {
+        method: 'POST',
+        body: JSON.stringify({action: 'start'})
+      });
+      const data = await res.json();
+      if (!data.ok) console.warn('Start failed:', data.error);
+    } catch (e) {
+      console.warn('Start error (is push-to-talk-launcher running?):', e);
+    }
+  }
+  window._startService = startService;
 
   // ── Queue pill helpers ──
   function updateQueuePill(id, val) {
@@ -459,13 +538,13 @@
     const displayText = text.length > maxLen ? text.substring(0, maxLen) + '...' : text;
     const label = extraClass === 'filler' ? 'filler' : role;
     turn.innerHTML = `<div class="conv-role ${role}">${label}</div><div class="conv-text">${escapeHtml(displayText)}</div>`;
-    convContent.appendChild(turn);
+    convContent.prepend(turn);
     convCount++;
     if (convCount > MAX_CONV) {
-      convContent.removeChild(convContent.firstChild);
+      convContent.removeChild(convContent.lastChild);
       convCount--;
     }
-    convContent.scrollTop = convContent.scrollHeight;
+    convContent.scrollTop = 0;
   }
 
   function escapeHtml(s) {
@@ -510,6 +589,8 @@
   const handlers = {
     snapshot(e) {
       genId.textContent = e.gen_id;
+      isMuted = !!e.muted;
+      updateMuteBtn();
       setStatus(e.muted ? 'muted' : 'idle');
       if (e.queue_depths) {
         updateQueuePill('qAudioIn', e.queue_depths.audio_in || 0);
@@ -519,6 +600,8 @@
       }
     },
     status(e) {
+      isMuted = e.status === 'muted';
+      updateMuteBtn();
       setStatus(e.status);
       setPipelineStage(e.status);
     },
@@ -645,6 +728,7 @@
     es.onopen = () => {
       connDot.className = 'conn-dot connected';
       connLabel.textContent = 'Connected';
+      setControlsConnected(true);
     };
 
     es.onmessage = (ev) => {
@@ -658,6 +742,7 @@
 
     es.onerror = () => {
       connDot.className = 'conn-dot disconnected';
+      setControlsConnected(false);
       connLabel.textContent = 'Reconnecting...';
       es.close();
       es = null;

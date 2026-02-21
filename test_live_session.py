@@ -1719,10 +1719,19 @@ async def test_audio_capture_queue_overflow():
 # Test Group 22: SSE Dashboard Server
 # ══════════════════════════════════════════════════════════════════
 
+def _free_port():
+    """Get a free TCP port for testing."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
 @test("SSE server starts on configured port")
 async def test_sse_server_starts():
     """Binds, accepts connections, returns 200 + SSE headers."""
-    session = make_session(sse_dashboard=True)
+    port = _free_port()
+    session = make_session(sse_dashboard=True, sse_port=port)
     session.running = True
     session.generation_id = 1
     session._audio_in_q = asyncio.Queue(maxsize=100)
@@ -1736,7 +1745,7 @@ async def test_sse_server_starts():
 
     try:
         # Connect as a client
-        reader, writer = await asyncio.open_connection('127.0.0.1', 9847)
+        reader, writer = await asyncio.open_connection('127.0.0.1', port)
 
         # Send HTTP request
         writer.write(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -1768,7 +1777,8 @@ async def test_sse_server_starts():
 @test("SSE server sends snapshot on connect")
 async def test_sse_server_snapshot():
     """First message is type: snapshot with running/muted/queue_depths."""
-    session = make_session(sse_dashboard=True)
+    port = _free_port()
+    session = make_session(sse_dashboard=True, sse_port=port)
     session.running = True
     session.generation_id = 5
     session.muted = True
@@ -1781,7 +1791,7 @@ async def test_sse_server_snapshot():
     await asyncio.sleep(0.1)
 
     try:
-        reader, writer = await asyncio.open_connection('127.0.0.1', 9847)
+        reader, writer = await asyncio.open_connection('127.0.0.1', port)
         writer.write(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
         await writer.drain()
 
@@ -2207,6 +2217,176 @@ async def test_bus_task_complete_event():
     assert len(events) == 1
     assert events[0].payload["task_name"] == "test task"
     session._bus.close()
+
+
+# ══════════════════════════════════════════════════════════════════
+# Test Group: SSE Command Endpoint (POST /cmd)
+# ══════════════════════════════════════════════════════════════════
+
+async def _sse_server_session():
+    """Helper: create a session with SSE server running, return (session, server_task, port)."""
+    port = _free_port()
+    session = make_session(sse_dashboard=True, sse_port=port)
+    session.running = True
+    session.generation_id = 1
+    session._audio_in_q = asyncio.Queue(maxsize=100)
+    session._stt_out_q = asyncio.Queue(maxsize=50)
+    session._llm_out_q = asyncio.Queue(maxsize=50)
+    session._audio_out_q = asyncio.Queue(maxsize=200)
+    _setup_bus(session)
+    server_task = asyncio.create_task(session._sse_server_stage())
+    await asyncio.sleep(0.1)
+    return session, server_task, port
+
+
+async def _send_cmd(port, action):
+    """Helper: POST a command to the SSE server, return parsed JSON response."""
+    body = json.dumps({"action": action}).encode()
+    reader, writer = await asyncio.open_connection('127.0.0.1', port)
+    writer.write(
+        f"POST /cmd HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+        + body
+    )
+    await writer.drain()
+
+    data = b""
+    deadline = asyncio.get_event_loop().time() + 3.0
+    while asyncio.get_event_loop().time() < deadline:
+        chunk = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+        if not chunk:
+            break
+        data += chunk
+        if b"\r\n\r\n" in data:
+            header_end = data.index(b"\r\n\r\n") + 4
+            headers_text = data[:header_end].decode()
+            # Extract content-length
+            cl = 0
+            for line in headers_text.split("\r\n"):
+                if line.lower().startswith("content-length:"):
+                    cl = int(line.split(":", 1)[1].strip())
+            body_bytes = data[header_end:]
+            while len(body_bytes) < cl:
+                more = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+                if not more:
+                    break
+                body_bytes += more
+            writer.close()
+            return json.loads(body_bytes.decode())
+
+    writer.close()
+    raise RuntimeError(f"No valid response received: {data[:200]}")
+
+
+async def _cleanup_server(session, server_task):
+    """Helper: stop SSE server cleanly."""
+    session.running = False
+    server_task.cancel()
+    try:
+        await server_task
+    except asyncio.CancelledError:
+        pass
+
+
+@test("POST /cmd mute emits bus command")
+async def test_cmd_mute():
+    session, server_task, port = await _sse_server_session()
+    try:
+        result = await _send_cmd(port, "mute")
+        assert result["ok"] == True, f"Expected ok=True, got {result}"
+        cmds = session._bus.read_recent(event_type="command")
+        assert len(cmds) >= 1, "Expected command event on bus"
+        assert cmds[-1].payload["action"] == "mute"
+    finally:
+        session._bus.close()
+        await _cleanup_server(session, server_task)
+
+
+@test("POST /cmd unmute emits bus command")
+async def test_cmd_unmute():
+    session, server_task, port = await _sse_server_session()
+    try:
+        result = await _send_cmd(port, "unmute")
+        assert result["ok"] == True, f"Expected ok=True, got {result}"
+        cmds = session._bus.read_recent(event_type="command")
+        assert len(cmds) >= 1, "Expected command event on bus"
+        assert cmds[-1].payload["action"] == "unmute"
+    finally:
+        session._bus.close()
+        await _cleanup_server(session, server_task)
+
+
+@test("POST /cmd interrupt calls request_interrupt")
+async def test_cmd_interrupt():
+    session, server_task, port = await _sse_server_session()
+    try:
+        session.request_interrupt = MagicMock()
+        result = await _send_cmd(port, "interrupt")
+        assert result["ok"] == True, f"Expected ok=True, got {result}"
+        session.request_interrupt.assert_called_once()
+    finally:
+        session._bus.close()
+        await _cleanup_server(session, server_task)
+
+
+@test("POST /cmd unknown action returns error")
+async def test_cmd_unknown():
+    session, server_task, port = await _sse_server_session()
+    try:
+        result = await _send_cmd(port, "bogus_action")
+        assert result["ok"] == False, f"Expected ok=False for unknown action, got {result}"
+        assert "Unknown action" in result.get("error", ""), f"Expected error message, got {result}"
+    finally:
+        session._bus.close()
+        await _cleanup_server(session, server_task)
+
+
+@test("GET to unknown path returns 404")
+async def test_unknown_path_404():
+    session, server_task, port = await _sse_server_session()
+    try:
+        reader, writer = await asyncio.open_connection('127.0.0.1', port)
+        writer.write(b"GET /nonexistent HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await writer.drain()
+
+        data = b""
+        while b"\r\n" not in data:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            if not chunk:
+                break
+            data += chunk
+
+        assert b"404" in data, f"Expected 404 response, got: {data[:100]}"
+        writer.close()
+    finally:
+        session._bus.close()
+        await _cleanup_server(session, server_task)
+
+
+@test("OPTIONS /cmd returns CORS preflight headers")
+async def test_options_cors():
+    session, server_task, port = await _sse_server_session()
+    try:
+        reader, writer = await asyncio.open_connection('127.0.0.1', port)
+        writer.write(b"OPTIONS /cmd HTTP/1.1\r\nHost: localhost\r\nOrigin: null\r\n\r\n")
+        await writer.drain()
+
+        data = b""
+        deadline = asyncio.get_event_loop().time() + 3.0
+        while asyncio.get_event_loop().time() < deadline:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            if not chunk:
+                break
+            data += chunk
+            if b"\r\n\r\n" in data:
+                break
+
+        text = data.decode()
+        assert "204" in text, f"Expected 204 for OPTIONS, got: {text[:100]}"
+        assert "Access-Control-Allow-Methods" in text, f"Expected CORS methods header"
+        writer.close()
+    finally:
+        session._bus.close()
+        await _cleanup_server(session, server_task)
 
 
 # ══════════════════════════════════════════════════════════════════
