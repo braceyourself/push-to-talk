@@ -2481,6 +2481,141 @@ def test_dashboard_session_discovery():
 
 
 # ══════════════════════════════════════════════════════════════════
+# Test Group: VRAMMonitor
+# ══════════════════════════════════════════════════════════════════
+
+@test("VRAMMonitor: check returns 'ok' at 4000MB of 8192MB")
+def test_vram_monitor_check_ok():
+    """Mock NVML returning 4000MB used of 8192MB total -> check() returns 'ok'."""
+    with patch.dict('sys.modules', {'pynvml': MagicMock()}):
+        import importlib
+        # Force reimport to pick up mocked pynvml
+        if 'vram_monitor' in sys.modules:
+            del sys.modules['vram_monitor']
+        from vram_monitor import VRAMMonitor
+
+        mock_pynvml = sys.modules['pynvml']
+        mock_info_init = MagicMock()
+        mock_info_init.total = 8192 * 1024 * 1024
+        mock_info_init.used = 4000 * 1024 * 1024
+        mock_info_init.free = (8192 - 4000) * 1024 * 1024
+        mock_pynvml.nvmlDeviceGetMemoryInfo.return_value = mock_info_init
+
+        monitor = VRAMMonitor()
+        assert monitor.check() == "ok", f"Expected 'ok' at 4000MB, got '{monitor.check()}'"
+
+
+@test("VRAMMonitor: check returns 'warning' at 6500MB")
+def test_vram_monitor_check_warning():
+    """Mock 6500MB used -> returns 'warning'."""
+    with patch.dict('sys.modules', {'pynvml': MagicMock()}):
+        if 'vram_monitor' in sys.modules:
+            del sys.modules['vram_monitor']
+        from vram_monitor import VRAMMonitor
+
+        mock_pynvml = sys.modules['pynvml']
+        mock_info_init = MagicMock()
+        mock_info_init.total = 8192 * 1024 * 1024
+        mock_info_init.used = 6500 * 1024 * 1024
+        mock_info_init.free = (8192 - 6500) * 1024 * 1024
+        mock_pynvml.nvmlDeviceGetMemoryInfo.return_value = mock_info_init
+
+        monitor = VRAMMonitor()
+        assert monitor.check() == "warning", f"Expected 'warning' at 6500MB, got '{monitor.check()}'"
+
+
+@test("VRAMMonitor: check returns 'critical' at 7200MB")
+def test_vram_monitor_check_critical():
+    """Mock 7200MB used -> returns 'critical'."""
+    with patch.dict('sys.modules', {'pynvml': MagicMock()}):
+        if 'vram_monitor' in sys.modules:
+            del sys.modules['vram_monitor']
+        from vram_monitor import VRAMMonitor
+
+        mock_pynvml = sys.modules['pynvml']
+        mock_info_init = MagicMock()
+        mock_info_init.total = 8192 * 1024 * 1024
+        mock_info_init.used = 7200 * 1024 * 1024
+        mock_info_init.free = (8192 - 7200) * 1024 * 1024
+        mock_pynvml.nvmlDeviceGetMemoryInfo.return_value = mock_info_init
+
+        monitor = VRAMMonitor()
+        assert monitor.check() == "critical", f"Expected 'critical' at 7200MB, got '{monitor.check()}'"
+
+
+@test("VRAMMonitor: check returns 'emergency' at 7900MB")
+def test_vram_monitor_check_emergency():
+    """Mock 7900MB used -> returns 'emergency'."""
+    with patch.dict('sys.modules', {'pynvml': MagicMock()}):
+        if 'vram_monitor' in sys.modules:
+            del sys.modules['vram_monitor']
+        from vram_monitor import VRAMMonitor
+
+        mock_pynvml = sys.modules['pynvml']
+        mock_info_init = MagicMock()
+        mock_info_init.total = 8192 * 1024 * 1024
+        mock_info_init.used = 7900 * 1024 * 1024
+        mock_info_init.free = (8192 - 7900) * 1024 * 1024
+        mock_pynvml.nvmlDeviceGetMemoryInfo.return_value = mock_info_init
+
+        monitor = VRAMMonitor()
+        assert monitor.check() == "emergency", f"Expected 'emergency' at 7900MB, got '{monitor.check()}'"
+
+
+@test("VRAMMonitor: get_usage_mb returns correct value")
+def test_vram_monitor_get_usage_mb():
+    """Mock 3000MB used -> get_usage_mb() returns 3000."""
+    with patch.dict('sys.modules', {'pynvml': MagicMock()}):
+        if 'vram_monitor' in sys.modules:
+            del sys.modules['vram_monitor']
+        from vram_monitor import VRAMMonitor
+
+        mock_pynvml = sys.modules['pynvml']
+        mock_info = MagicMock()
+        mock_info.total = 8192 * 1024 * 1024
+        mock_info.used = 3000 * 1024 * 1024
+        mock_info.free = (8192 - 3000) * 1024 * 1024
+        mock_pynvml.nvmlDeviceGetMemoryInfo.return_value = mock_info
+
+        monitor = VRAMMonitor()
+        assert monitor.get_usage_mb() == 3000, f"Expected 3000, got {monitor.get_usage_mb()}"
+
+
+@test("VRAMMonitor: get_free_mb returns correct value")
+def test_vram_monitor_get_free_mb():
+    """Mock 3000MB used of 8192MB -> get_free_mb() returns 5192."""
+    with patch.dict('sys.modules', {'pynvml': MagicMock()}):
+        if 'vram_monitor' in sys.modules:
+            del sys.modules['vram_monitor']
+        from vram_monitor import VRAMMonitor
+
+        mock_pynvml = sys.modules['pynvml']
+        mock_info = MagicMock()
+        mock_info.total = 8192 * 1024 * 1024
+        mock_info.used = 3000 * 1024 * 1024
+        mock_info.free = (8192 - 3000) * 1024 * 1024
+        mock_pynvml.nvmlDeviceGetMemoryInfo.return_value = mock_info
+
+        monitor = VRAMMonitor()
+        assert monitor.get_free_mb() == 5192, f"Expected 5192, got {monitor.get_free_mb()}"
+
+
+@test("VRAMMonitor: create() returns None on init failure")
+def test_vram_monitor_init_failure_graceful():
+    """pynvml.nvmlInit raises exception -> VRAMMonitor.create() returns None."""
+    with patch.dict('sys.modules', {'pynvml': MagicMock()}):
+        if 'vram_monitor' in sys.modules:
+            del sys.modules['vram_monitor']
+        from vram_monitor import VRAMMonitor
+
+        mock_pynvml = sys.modules['pynvml']
+        mock_pynvml.nvmlInit.side_effect = Exception("NVML not available")
+
+        result = VRAMMonitor.create()
+        assert result is None, f"Expected None on init failure, got {result}"
+
+
+# ══════════════════════════════════════════════════════════════════
 # Run all tests
 # ══════════════════════════════════════════════════════════════════
 
