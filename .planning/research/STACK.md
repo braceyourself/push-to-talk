@@ -1,278 +1,438 @@
-# Stack Research: Adaptive Quick Response Library
+# Stack Research: v2.0 Always-On Observer
 
-**Domain:** Context-aware audio response selection for voice conversation app
-**Researched:** 2026-02-18
-**Confidence:** HIGH
+**Domain:** Always-on voice assistant with local LLM monitoring layer
+**Researched:** 2026-02-21
+**Confidence:** HIGH (core stack), MEDIUM (VRAM budgeting)
 
 ## Executive Summary
 
-The adaptive quick response system replaces random acknowledgment clip selection with context-aware, AI-driven phrase matching. The existing stack (Piper TTS, Whisper STT, Silero VAD, asyncio pipeline) provides nearly everything needed. Only two small additions are recommended: **model2vec** for ultra-fast semantic matching of user input to response phrases, and **SQLite** (stdlib) for the response library metadata store. Non-speech event detection should piggyback on Whisper's existing output rather than introducing a separate audio classifier -- Whisper already produces bracketed annotations like `[Laughter]` and the existing `no_speech_prob` / `avg_logprob` filters already detect non-speech. The key architectural insight: the response library is small (dozens to low hundreds of phrases), so the matching problem is trivial and should not be over-engineered.
+The v2.0 always-on observer requires three stack additions: the **Ollama Python client** (`ollama` 0.6.1) for local LLM integration, **Ollama server** with Llama 3.2 3B for the monitoring layer, and architectural changes to the existing audio/STT pipeline for continuous operation. No other new dependencies are needed. The `ollama` library's only dependencies are `httpx` (0.28.1, already installed) and `pydantic` (2.12.5, already installed), so it adds zero transitive dependencies. Name-based interruption ("hey Russel") should use the existing Whisper STT transcript stream -- not a separate wake word library -- because the always-on STT already produces continuous transcripts that can be string-matched. The critical constraint is GPU VRAM: the RTX 3070 has 8GB, Whisper large-v3 with int8 uses ~3-4GB, and Llama 3.2 3B Q4 uses ~2-3GB, leaving them both fitting but tight. A fallback strategy (Whisper on CPU or downgrade to distil-large-v3) must be planned.
 
 ## Recommended Stack Additions
 
-### Input Classification & Phrase Matching
+### 1. Ollama Server (System-Level)
 
 | Technology | Version | Purpose | Why |
 |------------|---------|---------|-----|
-| `model2vec` | 0.4.x (latest) | Semantic embedding of user input and response phrases for similarity matching | Only dependency is numpy (already installed). Encodes 20,000+ sentences/sec on CPU. ~8MB model file. Sub-millisecond per query against a library of hundreds of phrases. Far faster than sentence-transformers (50 sent/sec) and far lighter (8MB vs 100MB+). No GPU needed. |
-| `numpy` | 1.26.4 (installed) | Cosine similarity computation on embedding vectors | Already installed. `np.dot()` on normalized vectors gives cosine similarity in microseconds for a few hundred phrases. No additional library needed for the similarity math. |
+| Ollama | latest (install via curl script) | Local LLM inference server | Manages model loading, GPU allocation, and HTTP API. Runs as a systemd service. Handles model lifecycle (keep_alive, loading, unloading) without application code. Already decided in PROJECT.md -- Ollama + Llama 3.2 3B is the monitoring layer. |
+| Llama 3.2 3B | `llama3.2:3b` (2.0GB download) | Transcript monitoring and response decisions | 128K context window. Fits in ~2-3GB VRAM with Q4_K_M quantization. Outperforms Gemma 2 2.6B on instruction following and summarization. Fast enough for monitoring (~200ms for short classification responses with `num_predict` limit). |
 
-**Confidence: HIGH** -- model2vec is actively maintained (last release May 2025), only needs numpy, verified API via GitHub docs. The `potion-base-8M` model is 8MB on disk and retains ~90% of MiniLM accuracy while being 500x faster on CPU.
+**Confidence: HIGH** -- Ollama's install is a single curl command. Llama 3.2 3B is a first-party Meta model with 57.5M+ downloads on Ollama's registry. Verified model page at [ollama.com/library/llama3.2](https://ollama.com/library/llama3.2).
 
-### Response Library Storage
+**Installation:**
+```bash
+# Install Ollama server
+curl -fsSL https://ollama.com/install.sh | sh
 
-| Technology | Version | Purpose | Why |
-|------------|---------|---------|-----|
-| Python `sqlite3` (stdlib) | 3.45.1 (verified on system) | Response library metadata: phrases, categories, audio file paths, usage stats, embeddings | Zero-dependency. FTS5 verified available. Atomic reads/writes for concurrent access from pipeline stages. Single file on disk, trivially backed up. Already the standard for local-first desktop apps. |
-| JSON metadata files | N/A | Clip pool metadata (extends existing `ack_pool.json` pattern) | Existing pattern from clip_factory.py. Use for backward compatibility with the existing acknowledgment system during migration. |
+# Pull the model (2.0GB download, one-time)
+ollama pull llama3.2:3b
 
-**Confidence: HIGH** -- sqlite3 is stdlib, FTS5 confirmed available via `PRAGMA compile_options`.
+# Configure for always-on (model stays loaded in GPU)
+# Add to /etc/systemd/system/ollama.service [Service] section:
+# Environment="OLLAMA_KEEP_ALIVE=-1"
+# Environment="OLLAMA_GPU_OVERHEAD=500000000"  # Reserve 500MB for other CUDA apps
+```
 
-### Audio Clip Pre-generation
-
-| Technology | Version | Purpose | Why |
-|------------|---------|---------|-----|
-| Piper TTS | installed (en_US-lessac-medium.onnx) | Generate response audio clips from text phrases | Already integrated. The existing `clip_factory.py` demonstrates the exact pattern needed: subprocess Piper call, quality gating with RMS/duration/clipping checks, WAV storage. Extend this pattern rather than replacing it. |
-| `asyncio` subprocess | stdlib (3.12) | Async batch generation of clips during idle periods | Already used throughout the pipeline. Use `asyncio.create_subprocess_exec()` for non-blocking Piper invocations. Can generate clips in background without blocking the voice pipeline. |
-
-**Confidence: HIGH** -- Existing, working code in clip_factory.py.
-
-### Non-Speech Event Detection
+### 2. Ollama Python Client
 
 | Technology | Version | Purpose | Why |
 |------------|---------|---------|-----|
-| Whisper (existing) | 20250625 (installed) | Detect non-speech events via transcript text and segment metadata | Whisper already outputs bracketed non-speech annotations like `[Laughter]`, `[Coughing]`, `[Music]` from its training data. The existing `_whisper_transcribe()` method returns these as text. Combined with existing `no_speech_prob` (>0.6 = non-speech) and `avg_logprob` (<-1.0 = low confidence transcription), we can classify audio into: speech, non-speech-with-annotation, and rejected-non-speech. No new model needed. |
-| Silero VAD (existing) | silero_vad.onnx (installed) | Voice activity detection for distinguishing silence from non-speech sounds | Already loaded and running during playback for barge-in. Can be reused during input classification: VAD says "voice activity" but Whisper says "not speech" = non-speech vocalization (cough, laugh, sigh). |
+| `ollama` | 0.6.1 | Python client for Ollama API | Official library. AsyncClient integrates directly with existing asyncio event loop. Streaming support via `async for`. Structured JSON output via `format` parameter with Pydantic schemas. Dependencies: httpx >=0.27 (have 0.28.1) + pydantic >=2.9 (have 2.12.5) = zero new transitive deps. |
 
-**Confidence: MEDIUM** -- Whisper's bracketed annotations are inconsistent (trained on YouTube subtitles, not explicitly designed for this). The existing multi-layer filtering already catches most non-speech via `no_speech_prob` and `avg_logprob`. For initial implementation, combining these signals is sufficient. Dedicated audio classifiers (Whisper-AT, SenseVoice) can be added later if detection quality is insufficient.
+**Confidence: HIGH** -- Verified on [PyPI](https://pypi.org/project/ollama/) (0.6.1, released 2025-11-13). Dependencies confirmed present in venv. AsyncClient API verified via [GitHub README](https://github.com/ollama/ollama-python).
+
+**Integration pattern:**
+```python
+from ollama import AsyncClient
+
+# Non-streaming for fast classification decisions
+async def should_respond(transcript_window: str) -> dict:
+    response = await AsyncClient().chat(
+        model='llama3.2:3b',
+        messages=[
+            {'role': 'system', 'content': MONITOR_SYSTEM_PROMPT},
+            {'role': 'user', 'content': transcript_window}
+        ],
+        format={  # Structured output via JSON schema
+            'type': 'object',
+            'properties': {
+                'should_respond': {'type': 'boolean'},
+                'reason': {'type': 'string'},
+                'complexity': {'type': 'string', 'enum': ['quick', 'deep']},
+                'response_text': {'type': 'string'}
+            },
+            'required': ['should_respond', 'reason', 'complexity']
+        },
+        options={
+            'temperature': 0,       # Deterministic for classification
+            'num_predict': 100,     # Cap output tokens for speed
+        },
+        keep_alive=-1,  # Keep model loaded
+    )
+    return json.loads(response.message.content)
+
+# Streaming for Ollama-generated responses (quick mode)
+async def generate_quick_response(prompt: str):
+    async for part in await AsyncClient().chat(
+        model='llama3.2:3b',
+        messages=[{'role': 'user', 'content': prompt}],
+        stream=True,
+        options={'num_predict': 200},
+    ):
+        yield part['message']['content']
+```
+
+**Key API details verified:**
+- `AsyncClient()` defaults to `http://localhost:11434`
+- `format` parameter accepts JSON schema dict or `"json"` string for unstructured JSON
+- `options` dict supports: `temperature`, `num_predict`, `top_p`, `top_k`, `seed`, `num_ctx`, `stop`
+- `keep_alive` accepts: seconds (int), duration string ("5m", "24h"), or -1 (forever)
+- Error handling: catch `ollama.ResponseError`, check `.status_code` (404 = model not found)
+- Streaming returns `AsyncIterator[ChatResponse]` objects with `.message.content`
+
+### 3. Existing Stack Modifications (No New Dependencies)
+
+These changes use existing dependencies but are architecturally significant:
+
+| Component | Current | v2.0 Change | Why |
+|-----------|---------|-------------|-----|
+| Audio capture (`pasimple`) | PTT-gated: only captures when key held | Always-on: captures continuously, independent of LLM state | Decoupled input stream. Same `pasimple.PaSimple` API, remove PTT gate condition. |
+| Whisper STT (`faster-whisper`) | Triggered by silence detection after PTT | Continuous: rolling buffer, transcribe on silence boundaries | Same model, same API. Change is in the buffering/trigger logic, not the library. |
+| Silero VAD (`onnxruntime`) | Only runs during AI playback for barge-in | Runs continuously alongside STT for voice activity | Already loaded. Extend usage from barge-in-only to continuous VAD signal. |
+| Generation ID system | Increment on interrupt/new turn | Extend to track monitoring vs response generation | Existing mechanism, new semantics. |
+| StreamComposer | Manages TTS audio queue with barge-in | Add Ollama-generated TTS segments alongside Claude-generated | Same API, new content source. |
+
+**Confidence: HIGH** -- All modifications use existing, tested code and libraries.
+
+## VRAM Budget Analysis
+
+**Hardware:** NVIDIA RTX 3070, 8192 MiB total, ~4259 MiB free (current baseline with desktop overhead)
+
+| Model | Precision | Estimated VRAM | Notes |
+|-------|-----------|----------------|-------|
+| Whisper large-v3 | int8_float16 | ~3.0-3.5 GB | Current production model. CTranslate2 int8 quantization. Based on benchmarks showing large-v2 int8 at 3.1GB. |
+| Llama 3.2 3B | Q4_K_M (Ollama default) | ~2.0-2.5 GB | 2.0GB model file + KV cache + CUDA overhead (~0.5GB). |
+| Silero VAD | ONNX | ~50 MB | Negligible. |
+| **Total** | | **~5.0-6.0 GB** | Fits in 8GB with 2-3GB headroom for CUDA runtime + desktop. |
+
+**Risk: MEDIUM** -- The 8GB budget is workable but not generous. If both models are loaded simultaneously with large KV caches, VRAM pressure could cause Ollama to partially offload to CPU (slower inference) or CTranslate2 to OOM. Mitigation strategies:
+
+1. **Primary plan:** Both models on GPU. Ollama's `OLLAMA_GPU_OVERHEAD` env var reserves VRAM for other CUDA applications (set to ~4GB to account for Whisper).
+2. **Fallback A:** Switch Whisper to `distil-large-v3` -- 51% smaller (756M vs 1550M params), 6.3x faster, within 1% WER accuracy. Reduces Whisper VRAM to ~1.5-2GB.
+3. **Fallback B:** Switch Whisper to CPU with `int8` compute type. Slower (~2-3x real-time instead of ~10x) but frees all GPU for Ollama.
+4. **Fallback C:** Use Whisper "small" model (244M params, ~1GB VRAM with int8). PROJECT.md mentions "small" but codebase uses "large-v3". The small model is sufficient for always-on monitoring where accuracy is less critical than PTT mode.
+
+**Confidence: MEDIUM** -- VRAM numbers are estimated from multiple sources. Exact concurrent usage needs empirical testing on the actual hardware.
 
 ## Alternatives Considered
 
-### For Semantic Matching
+### For Local LLM
 
 | Recommended | Alternative | Why Not |
 |-------------|-------------|---------|
-| `model2vec` (potion-base-8M) | `sentence-transformers` (all-MiniLM-L6-v2) | 100MB model, ~50 sent/sec on CPU, pulls in PyTorch (~2GB). Massive overkill for matching against a few hundred phrases. Adds 10-20ms per encode vs sub-millisecond with model2vec. |
-| `model2vec` (potion-base-8M) | TF-IDF + cosine similarity (scikit-learn) | Would need scikit-learn (~30MB dependency). TF-IDF is lexical, not semantic -- "I appreciate that" would not match "thanks" or "that's great." For a response library where semantic similarity matters, embeddings win. |
-| `model2vec` (potion-base-8M) | `rapidfuzz` (fuzzy string matching) | Edit-distance based, not semantic. "Can you help me with this?" would not match "I need assistance." Good for typo correction, wrong tool for intent matching. |
-| `model2vec` (potion-base-8M) | Claude API call for classification | Adds 500-2000ms latency per classification. The entire point of quick responses is sub-100ms selection. Cloud dependency defeats local-first design. |
-| `model2vec` (potion-base-8M) | Rule-based keyword matching | Brittle, requires manual maintenance, misses paraphrases. Would need growing list of regex patterns per response category. |
-| `model2vec` (potion-base-8M) | No matching at all (random selection like current system) | The current system is the baseline we're replacing. Context-aware selection is the entire feature. |
+| Ollama + Llama 3.2 3B | llama.cpp directly | Ollama wraps llama.cpp with model management, HTTP API, GPU scheduling, and keep_alive. Raw llama.cpp requires manual model loading, no HTTP server, and custom Python bindings. Ollama is the right abstraction for an application that needs an always-available LLM endpoint. |
+| Ollama + Llama 3.2 3B | Haiku (Anthropic API) | PROJECT.md explicitly chose Ollama: "Free, local, ~200ms, fits local-first philosophy. Haiku comparable but costs money and needs network." |
+| Ollama + Llama 3.2 3B | Ollama + Phi-4 Mini | Phi-4 Mini (3.8B) is slightly larger and would use more VRAM. Llama 3.2 3B is proven for instruction following and fits the VRAM budget better. Could be a future upgrade if VRAM allows. |
+| Ollama + Llama 3.2 3B | Ollama + Qwen 3 0.6B | Too small for reliable monitoring decisions. The 3B parameter size is the sweet spot for understanding conversation context and making respond/don't-respond judgments. |
+| Ollama + Llama 3.2 3B | vLLM | Production inference server, overkill for single-user desktop app. Heavier resource usage, more complex setup. Ollama is designed for exactly this use case. |
 
-### For Non-Speech Detection
-
-| Recommended | Alternative | Why Not |
-|-------------|-------------|---------|
-| Whisper existing output + heuristics | `whisper-at` (Whisper Audio Tagger) | Only 152 weekly PyPI downloads. Replaces the whisper import entirely (uses `whisper_at` instead of `whisper`). Adds 527-class AudioSet tagging but we only need ~5 categories (laugh, cough, sigh, clear, silence). The existing Whisper already gives us what we need via bracket annotations + confidence scores. |
-| Whisper existing output + heuristics | SenseVoice (FunAudioLLM) | Requires `funasr` framework (~large dependency tree). Would replace Whisper entirely. 70ms for 10s of audio is fast, but we already have Whisper loaded and running. Adding a second speech model doubles memory usage for marginal non-speech detection improvement. |
-| Whisper existing output + heuristics | librosa + manual feature classification | Adds ~20MB dependency (librosa). Would need to build custom classifiers from MFCC/spectral features. Training data needed. Significant engineering effort for something Whisper already handles adequately. |
-| Whisper existing output + heuristics | MediaPipe Audio Classifier | Google's solution. Adds TensorFlow Lite dependency. Broad categories, not tuned for conversational non-speech sounds. |
-
-### For Storage
+### For Ollama Python Integration
 
 | Recommended | Alternative | Why Not |
 |-------------|-------------|---------|
-| SQLite (stdlib) | JSON files (current pattern) | JSON works for the current 10-15 clip pool. Will not scale to hundreds of phrases with usage statistics, embeddings, category metadata, and lookup queries. JSON requires loading entire file for any query. SQLite handles concurrent reads from multiple pipeline stages. |
-| SQLite (stdlib) | Redis / any external DB | External service dependency for a desktop app. Must be running before the app starts. Overkill for a single-user local database of a few hundred records. |
-| SQLite (stdlib) | TinyDB | Unnecessary dependency when sqlite3 is stdlib and more capable. |
-| SQLite (stdlib) | pickle files | Security risk, not human-readable, no query capability. |
+| `ollama` official library (0.6.1) | Raw `httpx` calls to Ollama REST API | The official library adds Pydantic response types, error handling, and AsyncClient with streaming iterators. Since both its dependencies (httpx, pydantic) are already installed, there is no cost to using it. Raw httpx would mean reimplementing response parsing, streaming iteration, and error handling. |
+| `ollama` official library (0.6.1) | LangChain `ChatOllama` | Massive dependency tree (langchain-core, langchain-community). Wrong abstraction -- this is a direct LLM call, not a chain/agent. |
+| `ollama` official library (0.6.1) | OpenAI-compatible API (`openai` library) | Ollama exposes OpenAI-compatible endpoints, but the native Ollama library has better feature coverage (structured output via `format`, `keep_alive`, model management). The openai library is already installed but is used for TTS, not LLM. |
+
+### For Name-Based Interruption
+
+| Recommended | Alternative | Why Not |
+|-------------|-------------|---------|
+| Whisper transcript string matching | openWakeWord (dedicated wake word library) | PROJECT.md explicitly states "Wake word detection hardware -- using software-based name recognition instead." The always-on Whisper STT already produces continuous transcripts. Checking `if "hey russel" in transcript.lower()` is trivial, requires zero new dependencies, and leverages the existing STT pipeline. openWakeWord would require a separate 16kHz audio stream, a separate ONNX model (~200KB but still another model to load), and training a custom "hey Russel" model. The STT approach is simpler, more maintainable, and "free" since we're already transcribing everything. |
+| Whisper transcript string matching | Picovoice Porcupine | Commercial license required for custom wake words. Cloud dependency for training. Contradicts local-first philosophy. |
+| Whisper transcript string matching | Simple energy-based keyword spotting | Not robust enough. "Hey Russel" needs speech recognition, not just audio energy. |
+
+**Note on openWakeWord for future consideration:** If Whisper-based name detection proves too slow (Whisper transcription takes 200-500ms vs openWakeWord's real-time ~80ms latency), openWakeWord could be added later as a fast pre-filter. It runs on CPU with negligible resources. But start with the simpler approach first.
+
+### For Continuous Audio Capture
+
+| Recommended | Alternative | Why Not |
+|-------------|-------------|---------|
+| `pasimple` (existing, PulseAudio Simple API) | `sounddevice` (PortAudio wrapper) | pasimple is already integrated and working. It provides simple blocking reads in a daemon thread, which is the correct pattern for continuous capture. sounddevice adds PortAudio dependency and callback-based API that doesn't match the existing queue-based architecture. |
+| `pasimple` (existing) | `pipewire_python` | Direct PipeWire bindings. The system runs PipeWire with PulseAudio compatibility layer, so pasimple works through PipeWire already. No benefit to switching to native PipeWire API for simple mic capture. |
+| `pasimple` (existing) | PyAudio (already installed) | PyAudio is used for playback, not capture. pasimple is used for capture. This separation works well -- no reason to change it. |
 
 ## What NOT to Add
 
 | Avoid | Why | Impact if Added |
 |-------|-----|-----------------|
-| PyTorch | model2vec uses numpy only. Sentence-transformers would pull in PyTorch (~2GB). The existing Whisper already has torch, but model2vec avoids needing it for the matching layer. | +2GB disk, +500MB RAM, slower startup |
-| scikit-learn | TF-IDF is lexical, not semantic. Would add ~30MB for worse matching quality than model2vec. | +30MB, still needs embeddings for good semantic matching |
-| FAISS / Annoy / HNSWlib | Vector search indices for millions of vectors. The response library has at most a few hundred entries. Brute-force `np.dot()` on 100 vectors of 256 dimensions takes microseconds. | Unnecessary complexity, additional C++ dependency |
-| A separate audio classifier model | SenseVoice, Whisper-AT, or custom CNN would add a second loaded model. Whisper already detects non-speech adequately for this use case. | +100MB-1GB model, doubled audio processing time |
-| LangChain / LlamaIndex | RAG frameworks for retrieval-augmented generation. The response library is not a document corpus -- it's a small lookup table of pre-generated audio clips. | Massive dependency tree, wrong abstraction |
-| Cloud embedding APIs (OpenAI, Cohere) | Adds latency (100-500ms per call), requires API key, breaks offline operation. Model2vec runs locally in sub-millisecond. | Network dependency, latency, cost |
+| openWakeWord | Whisper transcript already provides name detection. Adding a separate audio processing pipeline for wake word detection adds complexity without clear benefit when STT is always running. | +onnxruntime model, separate audio stream, training pipeline |
+| LangChain / LlamaIndex | Direct Ollama API calls are sufficient. The monitoring layer is a simple prompt-in/decision-out loop, not a multi-step chain or RAG pipeline. | Massive dependency tree, wrong abstraction, slower |
+| A second Whisper model | One Whisper instance handles all STT. Don't load a separate small model for "fast pre-screening" alongside the large model -- that doubles VRAM. | +1-3GB VRAM, doubled audio processing |
+| Redis / message queue | asyncio.Queue is sufficient for inter-stage communication within a single process. The monitoring layer and response backends are coroutines in the same event loop. | External service dependency, operational complexity |
+| WebSocket server | Ollama uses HTTP (REST), not WebSockets. The existing EventBus JSONL handles inter-process communication. No need for a WebSocket layer. | Unnecessary complexity |
+| pydantic (for structured output schemas) | Already installed (2.12.5). Mentioned here because it might seem like a new dependency -- it is not. | N/A (already present) |
 
 ## Installation
 
 ```bash
-# New dependency (only numpy as transitive dep, already installed)
-pip install model2vec
+# 1. Install Ollama server (system-level, one-time)
+curl -fsSL https://ollama.com/install.sh | sh
 
-# Download the model (8MB, one-time)
-python3 -c "from model2vec import StaticModel; StaticModel.from_pretrained('minishlab/potion-base-8M')"
+# 2. Pull the monitoring model (2.0GB download, one-time)
+ollama pull llama3.2:3b
+
+# 3. Configure Ollama for always-on with GPU overhead reservation
+sudo systemctl edit ollama.service
+# Add:
+# [Service]
+# Environment="OLLAMA_KEEP_ALIVE=-1"
+# Environment="OLLAMA_GPU_OVERHEAD=4000000000"
+
+sudo systemctl daemon-reload && sudo systemctl restart ollama
+
+# 4. Install Python client in PTT venv
+source ~/.local/share/push-to-talk/venv/bin/activate
+pip install ollama==0.6.1
+
+# 5. Verify
+python3 -c "
+import asyncio
+from ollama import AsyncClient
+async def test():
+    r = await AsyncClient().chat(model='llama3.2:3b', messages=[{'role':'user','content':'Say hi'}])
+    print(r.message.content)
+asyncio.run(test())
+"
 ```
 
 Add to `requirements.txt`:
 ```
-# Semantic matching for quick response library
-model2vec
+# Local LLM monitoring (Ollama client)
+ollama>=0.6
 ```
-
-No other new packages needed. SQLite is stdlib. Piper, Whisper, numpy, onnxruntime are already installed.
 
 ## Integration Points with Existing Stack
 
-### 1. Clip Factory Extension (clip_factory.py)
+### 1. Audio Capture Stage (live_session.py `_audio_capture_stage`)
 
-The existing `clip_factory.py` generates acknowledgment clips with quality gating. Extend it to:
-- Accept a phrase list (not just hardcoded `ACKNOWLEDGMENT_PROMPTS`)
-- Store metadata in SQLite instead of JSON
-- Compute and store model2vec embeddings alongside each phrase
-- Support multiple categories (acknowledgment, empathy, agreement, humor, deflection)
+**Current:** Audio frames flow to `_audio_in_q` only when PTT key is held (or in live mode with idle timeout).
+
+**v2.0:** Audio frames flow continuously. The capture loop removes all PTT/mute gating. Frames are always pushed to the queue. A separate "monitoring STT" consumer processes them independently from the "response LLM" stage.
 
 ```python
-# Existing pattern (preserve):
-pcm = generate_clip(prompt, length_scale, noise_w, noise_scale)
-scores = evaluate_clip(pcm)
-if scores["pass"]:
-    save_clip_to(pcm, filename, clip_dir)
+# Current pattern (preserve the pasimple threading):
+def record_thread():
+    with pasimple.PaSimple(pasimple.PA_STREAM_RECORD, ...) as pa:
+        while not stop_event.is_set():
+            data = pa.read(CHUNK_SIZE)
+            loop.call_soon_threadsafe(_enqueue_audio, PipelineFrame(...))
 
-# New: also store embedding
-from model2vec import StaticModel
-model = StaticModel.from_pretrained("minishlab/potion-base-8M")
-embedding = model.encode([prompt])[0]  # 256-dim vector
-# Store embedding in SQLite alongside clip metadata
+# v2.0 change: remove mute/gate checks from the consumer side
+# Audio capture itself is already always-on in the daemon thread
 ```
 
-### 2. Filler Selection (live_session.py)
+### 2. STT Stage (live_session.py `_stt_stage`)
 
-Replace `_pick_filler()` (random selection with no-repeat guard) with context-aware selection:
+**Current:** Accumulates audio, detects silence, transcribes, emits TRANSCRIPT frames to `_stt_out_q`. STT is gated during AI playback.
+
+**v2.0:** STT runs continuously. Transcripts feed TWO consumers:
+1. **Monitoring queue** (`_monitor_q`): Every transcript goes here for the Ollama observer.
+2. **Response queue** (`_stt_out_q`): Only when the observer decides to respond, the relevant transcript is forwarded.
 
 ```python
-# Current (random):
-def _pick_filler(self, category: str) -> bytes | None:
-    clips = self._filler_clips.get(category)
-    idx = random.choice([i for i in range(len(clips)) if i != last])
-    return clips[idx]
+# New: dual-output from STT stage
+if transcript and not _is_hallucination(transcript):
+    # Always feed the monitor
+    await self._monitor_q.put(transcript)
 
-# New (semantic match):
-def _pick_response(self, user_text: str) -> bytes | None:
-    user_embedding = self._model.encode([user_text])[0]
-    scores = np.dot(self._phrase_embeddings, user_embedding)
-    best_idx = np.argmax(scores)
-    return self._response_clips[best_idx]
+    # Check for name-based interrupt
+    if self._check_name_interrupt(transcript):
+        await self._trigger_barge_in()
 ```
 
-### 3. Non-Speech Detection (live_session.py)
+### 3. New: Monitor Stage (new coroutine)
 
-Extend `_whisper_transcribe()` to classify input type before returning:
+A new pipeline stage that consumes transcripts from `_monitor_q` and calls Ollama:
 
 ```python
-# Existing multi-layer filtering already rejects non-speech.
-# Add: when ALL segments rejected, check WHY they were rejected
-# to distinguish cough/laugh from silence.
+async def _monitor_stage(self):
+    """Consume continuous transcripts, decide when AI should respond."""
+    transcript_window = []  # Rolling window of recent transcripts
 
-# Heuristic: VAD detected activity + Whisper rejected = non-speech vocalization
-# Heuristic: Whisper text contains brackets = annotated non-speech event
-# Heuristic: no_speech_prob > 0.8 + low RMS = silence
-# Heuristic: no_speech_prob 0.3-0.6 + specific text patterns = uncertain
+    while self.running:
+        transcript = await self._monitor_q.get()
+        transcript_window.append(transcript)
+
+        # Trim window to last N seconds / entries
+        transcript_window = transcript_window[-10:]
+
+        # Ask Ollama: should we respond?
+        decision = await self._ollama_should_respond(
+            '\n'.join(transcript_window)
+        )
+
+        if decision['should_respond']:
+            if decision['complexity'] == 'quick':
+                # Ollama generates the response directly
+                await self._quick_respond_ollama(decision)
+            else:
+                # Forward to Claude CLI for deep response
+                await self._stt_out_q.put(PipelineFrame(
+                    type=FrameType.TRANSCRIPT,
+                    generation_id=self.generation_id,
+                    data='\n'.join(transcript_window)
+                ))
 ```
 
-### 4. Pipeline Frames (pipeline_frames.py)
+### 4. Response Backend Selection (new logic)
 
-Add a new frame type for classified input:
+**Current:** All responses go through Claude CLI.
+
+**v2.0:** Configurable backend based on conditions:
+
+```python
+async def _select_backend(self, complexity: str) -> str:
+    """Choose response backend based on conditions."""
+    if complexity == 'quick':
+        return 'ollama'  # Fast local response
+
+    # Check network availability for Claude
+    if not await self._check_network():
+        return 'ollama'  # Fallback when offline
+
+    return 'claude'  # Deep response via CLI
+```
+
+### 5. Name-Based Interruption (extend existing barge-in)
+
+**Current:** VAD detects sustained speech during playback, triggers barge-in.
+
+**v2.0:** Additionally check transcript content for "hey russel":
+
+```python
+def _check_name_interrupt(self, transcript: str) -> bool:
+    """Check if user said the AI's name to interrupt."""
+    lower = transcript.lower().strip()
+    triggers = ['hey russel', 'hey russell', 'russel', 'russell']
+    return any(trigger in lower for trigger in triggers)
+```
+
+### 6. Pipeline Frames (pipeline_frames.py)
+
+New frame types for the monitoring layer:
 
 ```python
 class FrameType(Enum):
     # ... existing types ...
-    QUICK_RESPONSE = auto()  # Pre-generated clip selected by context
-    INPUT_CLASSIFIED = auto()  # Classification result (speech/non-speech/event type)
+    MONITOR_DECISION = auto()  # Ollama decided to respond
+    OLLAMA_RESPONSE = auto()   # Response text from Ollama backend
 ```
 
-### 5. SQLite Library Schema
+### 7. EventBus (event_bus.py)
 
-```sql
-CREATE TABLE phrases (
-    id INTEGER PRIMARY KEY,
-    text TEXT NOT NULL,
-    category TEXT NOT NULL,  -- 'acknowledgment', 'empathy', 'agreement', etc.
-    embedding BLOB,          -- model2vec 256-dim float32 vector (1KB)
-    created_at REAL,
-    last_used_at REAL,
-    use_count INTEGER DEFAULT 0
-);
+New event types:
 
-CREATE TABLE clips (
-    id INTEGER PRIMARY KEY,
-    phrase_id INTEGER REFERENCES phrases(id),
-    filename TEXT NOT NULL,
-    filepath TEXT NOT NULL,
-    duration REAL,
-    rms REAL,
-    quality_pass BOOLEAN,
-    piper_params TEXT,  -- JSON: length_scale, noise_w, noise_scale
-    created_at REAL
-);
-
-CREATE TABLE usage_log (
-    id INTEGER PRIMARY KEY,
-    clip_id INTEGER REFERENCES clips(id),
-    user_input TEXT,
-    input_type TEXT,  -- 'speech', 'laughter', 'cough', etc.
-    similarity_score REAL,
-    timestamp REAL
-);
-
--- FTS5 for text search across phrases
-CREATE VIRTUAL TABLE phrases_fts USING fts5(text, category, content=phrases, content_rowid=id);
+```python
+class EventType(str, Enum):
+    # ... existing types ...
+    MONITOR_TRANSCRIPT = "monitor_transcript"   # Transcript sent to monitor
+    MONITOR_DECISION = "monitor_decision"       # Ollama's respond/ignore decision
+    BACKEND_SELECTED = "backend_selected"       # claude vs ollama for response
+    OLLAMA_RESPONSE = "ollama_response"         # Response from Ollama backend
 ```
 
 ## Performance Budget
 
-| Operation | Target | Actual (estimated) | Notes |
-|-----------|--------|-------------------|-------|
-| Embed user text | <5ms | <1ms | model2vec: ~0.05ms per sentence on CPU |
-| Match against library | <5ms | <0.1ms | np.dot() on 100x256 matrix: microseconds |
-| Total classification + selection | <20ms | <5ms | Well within the 500ms filler gate |
-| Model load (startup) | <500ms | ~200ms | model2vec loads 8MB file, one-time at session start |
-| Clip factory batch (10 clips) | <30s | ~10s | Piper generates ~1 clip/sec, quality gating adds negligible overhead |
-| SQLite query | <5ms | <1ms | Single-file local DB, simple indexed queries |
-
-Context: The existing filler system has a 500ms gate before playing any acknowledgment clip. The entire classification + selection pipeline must complete well within this gate to avoid adding perceptible latency. At <5ms total, this leaves 495ms of headroom.
+| Operation | Target | Estimated | Notes |
+|-----------|--------|-----------|-------|
+| Ollama monitoring call (non-streaming) | <500ms | ~200ms | Llama 3.2 3B with `num_predict: 100`, `temperature: 0`, structured JSON output. Model kept loaded via `keep_alive: -1`. |
+| Ollama quick response (streaming) | <1s TTFT | ~200ms | First token in ~200ms, full response streams over 1-2s. |
+| Whisper continuous transcription | <500ms per segment | ~200-400ms | Same as current. Runs in executor thread. 10x real-time factor on GPU. |
+| Name detection in transcript | <1ms | <0.1ms | Simple string `in` check. |
+| Backend selection logic | <5ms | <1ms | Simple condition checks. |
+| End-to-end: user speaks to AI starts responding | <2s | ~1-1.5s | silence detection (0.8s) + STT (0.3s) + monitoring (0.2s) + backend selection (<0.01s) + TTS start (0.2s) |
 
 ## Version Compatibility
 
-| Package | Compatible With | Notes |
-|---------|-----------------|-------|
-| Python 3.12 | All recommended additions | model2vec requires Python 3.8+. sqlite3 is stdlib. |
-| model2vec 0.4.x | numpy 1.26.4 (installed) | Only dependency is numpy. No torch/tensorflow needed. |
-| numpy 1.26.4 | model2vec, existing whisper, existing onnxruntime | Already installed, no version conflicts. |
-| SQLite 3.45.1 | FTS5 enabled | Verified via PRAGMA compile_options. |
-| Piper TTS | en_US-lessac-medium.onnx | Same model and invocation pattern as existing clip_factory.py. |
+| Package | Version | Compatible With | Notes |
+|---------|---------|-----------------|-------|
+| `ollama` | 0.6.1 | Python 3.8+, httpx >=0.27, pydantic >=2.9 | All requirements met in current venv. |
+| `httpx` | 0.28.1 (installed) | ollama 0.6.1 | Already present, no upgrade needed. |
+| `pydantic` | 2.12.5 (installed) | ollama 0.6.1 | Already present, no upgrade needed. |
+| Ollama server | latest | RTX 3070 (CUDA), Llama 3.2 3B | NVIDIA GPU support is Ollama's primary platform. |
+| `faster-whisper` | 1.2.1 (installed) | CTranslate2 4.7.1, CUDA 12 | No change needed. |
+| `pasimple` | installed | PipeWire compat layer | No change needed. |
+
+## Ollama API Quick Reference
+
+For roadmap authors -- key Ollama API details for phase planning:
+
+**Structured output (critical for monitoring):**
+```python
+# Pass JSON schema to format parameter
+response = await AsyncClient().chat(
+    model='llama3.2:3b',
+    messages=[...],
+    format={'type': 'object', 'properties': {...}, 'required': [...]},
+    options={'temperature': 0}  # Deterministic for classification
+)
+result = json.loads(response.message.content)  # Guaranteed valid JSON
+```
+
+**Streaming (for quick responses):**
+```python
+async for part in await AsyncClient().chat(
+    model='llama3.2:3b', messages=[...], stream=True
+):
+    text_chunk = part['message']['content']
+```
+
+**Error handling:**
+```python
+import ollama
+try:
+    response = await AsyncClient().chat(...)
+except ollama.ResponseError as e:
+    if e.status_code == 404:
+        # Model not loaded -- pull it
+        await AsyncClient().pull('llama3.2:3b')
+```
+
+**Model management:**
+```python
+# List loaded models
+models = await AsyncClient().list()
+
+# Check if model is loaded
+ps = await AsyncClient().ps()  # Running models with VRAM usage
+```
 
 ## Data Footprint
 
 | Component | Size | Notes |
 |-----------|------|-------|
-| model2vec model (potion-base-8M) | ~8MB | Downloaded to HuggingFace cache on first use |
-| SQLite database (100 phrases) | <1MB | Embeddings are 1KB each (256 x float32), metadata is small |
-| Audio clips (100 phrases, ~2 clips each) | ~10MB | WAV files at 22050Hz, 1-3 seconds each |
-| Total new disk usage | ~20MB | Negligible for a desktop app |
-
-## Migration Path from Current System
-
-The current system uses:
-- `audio/fillers/acknowledgment/` directory with WAV files
-- `audio/fillers/ack_pool.json` for metadata
-- `_pick_filler()` for random selection
-
-Migration approach:
-1. **Phase 1:** Keep existing clips and metadata. Add SQLite alongside JSON. Import existing clips into SQLite.
-2. **Phase 2:** Add model2vec embeddings to SQLite entries. Implement context-aware `_pick_response()` alongside `_pick_filler()`.
-3. **Phase 3:** Expand phrase library beyond acknowledgments. Add new categories. Retire JSON metadata in favor of SQLite.
-
-This allows the existing random filler system to keep working as a fallback while the new system is built incrementally.
+| Ollama server | ~500MB installed | System-level install |
+| Llama 3.2 3B model | 2.0GB on disk | Stored in `~/.ollama/models/` |
+| `ollama` Python package | ~100KB | Thin wrapper around httpx |
+| **Total new disk usage** | ~2.5GB | Dominated by the LLM model file |
 
 ## Sources
 
-- [model2vec GitHub](https://github.com/MinishLab/model2vec) -- Verified API, model sizes, dependencies, inference speed (HIGH confidence)
-- [model2vec PyPI](https://pypi.org/project/model2vec/) -- Latest version, release history (HIGH confidence)
-- [minishlab/potion-base-8M on HuggingFace](https://huggingface.co/minishlab/potion-base-8M) -- Model specs, 8M params, 256 dimensions (HIGH confidence)
-- [sentence-transformers/all-MiniLM-L6-v2 on HuggingFace](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) -- Comparison baseline: 80MB, 50 sent/sec CPU (HIGH confidence)
-- [Whisper-AT paper and PyPI](https://pypi.org/project/whisper-at/) -- 152 weekly downloads, replaces whisper import (MEDIUM confidence)
-- [SenseVoice GitHub](https://github.com/FunAudioLLM/SenseVoice) -- Non-speech event labels, requires funasr framework (MEDIUM confidence)
-- [RapidFuzz PyPI](https://pypi.org/project/RapidFuzz/) -- v3.14.3, edit-distance based, not semantic (HIGH confidence)
-- [SQLite FTS5 docs](https://sqlite.org/fts5.html) -- Full-text search extension, BM25 ranking (HIGH confidence)
-- [Python sqlite3 stdlib](https://docs.python.org/3.12/library/sqlite3.html) -- Verified FTS5 available on system (HIGH confidence)
-- [OpenAI Whisper GitHub](https://github.com/openai/whisper) -- no_speech_prob, avg_logprob, compression_ratio segment fields (HIGH confidence)
-- Existing codebase: `clip_factory.py`, `live_session.py`, `pipeline_frames.py` -- Direct code inspection (HIGH confidence)
+- [Ollama Python library GitHub](https://github.com/ollama/ollama-python) -- AsyncClient API, streaming, structured output (HIGH confidence)
+- [Ollama PyPI](https://pypi.org/project/ollama/) -- v0.6.1, dependencies: httpx + pydantic (HIGH confidence)
+- [Ollama /api/chat docs](https://docs.ollama.com/api/chat) -- format, options, keep_alive, streaming parameters (HIGH confidence)
+- [Ollama structured outputs docs](https://docs.ollama.com/capabilities/structured-outputs) -- JSON schema via format parameter (HIGH confidence)
+- [Ollama FAQ](https://docs.ollama.com/faq) -- keep_alive, OLLAMA_MAX_LOADED_MODELS, GPU memory management (HIGH confidence)
+- [Llama 3.2 model page](https://ollama.com/library/llama3.2) -- 3B/1B sizes, 2.0GB/1.3GB, 128K context (HIGH confidence)
+- [Ollama VRAM guide](https://localllm.in/blog/ollama-vram-requirements-for-local-llms) -- 3B model ~2-3GB VRAM with Q4 (MEDIUM confidence, community source)
+- [Whisper memory requirements](https://github.com/openai/whisper/discussions/5) -- Model size vs VRAM table (HIGH confidence, official repo)
+- [faster-whisper GitHub](https://github.com/SYSTRAN/faster-whisper) -- int8 quantization, distil-large-v3 support (HIGH confidence)
+- [openWakeWord GitHub](https://github.com/dscripka/openWakeWord) -- Evaluated and rejected for initial implementation (HIGH confidence)
+- [distil-whisper HuggingFace](https://huggingface.co/distil-whisper/distil-large-v3) -- 6.3x faster, 51% smaller, within 1% WER (HIGH confidence)
+- Existing codebase: `live_session.py`, `pipeline_frames.py`, `event_bus.py`, `stream_composer.py`, `requirements.txt` -- Direct code inspection (HIGH confidence)
+- System inspection: `nvidia-smi`, `pip show`, venv package versions -- Direct verification (HIGH confidence)
 
 ---
-*Stack research for: Adaptive Quick Response Library*
-*Researched: 2026-02-18*
+*Stack research for: v2.0 Always-On Observer*
+*Researched: 2026-02-21*

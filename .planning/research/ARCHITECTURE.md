@@ -1,618 +1,772 @@
-# Architecture: Adaptive Quick Responses Integration
+# Architecture: v2.0 Decoupled Input Stream + LLM Observer
 
-**Domain:** Adaptive quick response system for existing voice pipeline
-**Researched:** 2026-02-18
-**Overall Confidence:** HIGH (codebase fully read, integration points verified in source)
+**Domain:** Always-on voice assistant with independent input capture, monitoring layer, and configurable response backend
+**Researched:** 2026-02-21
+**Overall Confidence:** HIGH (codebase fully read, existing pipeline thoroughly understood, patterns verified)
 
 ## Executive Summary
 
-The adaptive quick response system replaces the current random filler selection in `live_session.py` with a context-aware response library. The architecture adds three new components (input classifier, response library, library curator) while modifying two existing ones (filler manager in `live_session.py`, clip factory). The key insight from reading the codebase: the integration point is narrow and well-defined. The `_filler_manager()` method and `_llm_stage()` are the only places that need modification in the hot path. Library growth/pruning runs entirely outside the pipeline as a post-session process.
+The v2.0 architecture transforms the current 5-stage sequential pipeline into a decoupled system with three independent loops: (1) an always-on input stream that continuously captures audio and produces transcripts, (2) a monitoring loop that watches the transcript stream via a local LLM and decides when and how to respond, and (3) a response generation layer that produces the actual reply through either Claude CLI or Ollama.
 
-## Current Pipeline Architecture
+The critical insight from reading the existing codebase: the current pipeline is already partially decoupled. Audio capture runs in a daemon thread, STT runs in a thread executor, and the LLM stage consumes from a queue independently. The main coupling point is the `_stt_gated` flag -- STT is suppressed during AI playback because the system assumes a strict turn-taking model (user speaks, AI responds, user waits). Removing this assumption is the single biggest architectural change. Everything else -- composer, playback, barge-in, filler system, event bus -- can remain largely unchanged.
 
-```
-                  +--------------+
-                  | Audio Capture |  Stage 1: pw-record -> AUDIO_RAW frames
-                  +------+-------+
-                         | _audio_in_q (Queue, maxsize=100)
-                         v
-                  +--------------+
-                  |   STT Stage  |  Stage 2: Whisper in executor -> TRANSCRIPT frames
-                  | (+ VAD for   |  Also: silence detection, hallucination filtering,
-                  |  barge-in)   |        STT gating during playback
-                  +------+-------+
-                         | _stt_out_q (Queue, maxsize=50)
-                         v
-                  +--------------+
-                  |  LLM Stage   |  Stage 3: Claude CLI subprocess -> TEXT_DELTA frames
-                  | (+ filler    |  Also: filler_manager starts here, barge-in annotation,
-                  |  manager)    |        tool intent display, post-tool buffering
-                  +------+-------+
-                         | _llm_out_q (Queue, maxsize=50)
-                         v
-                  +--------------+
-                  |  TTS Stage   |  Stage 4: Piper TTS -> TTS_AUDIO frames
-                  |              |  22050Hz -> 24000Hz resampling
-                  +------+-------+
-                         | _audio_out_q (Queue, maxsize=200)
-                         v
-                  +--------------+
-                  | Playback     |  Stage 5: PyAudio output
-                  | Stage        |  Also: STT gating, sentence counting, delayed unmute
-                  +--------------+
-```
+The second insight: GPU memory is the binding constraint. The RTX 3070 has 8GB VRAM. Whisper large-v3 uses ~3-4GB. Ollama with Llama 3.2 3B at int4 uses ~2GB. Together they fit, but switching Whisper to the `small` or `medium` model (0.5-1.5GB) gives comfortable headroom and makes continuous operation sustainable. Continuous Whisper transcription fundamentally changes the GPU utilization profile from burst (transcribe on silence) to sustained (transcribe every few seconds).
 
-### Current Filler Flow (What Gets Replaced)
-
-Reading `_llm_stage()` lines 1528-1559, the flow is:
-
-1. TRANSCRIPT frame arrives from STT
-2. `_filler_cancel = asyncio.Event()` created
-3. `_filler_manager(transcript, cancel_event)` started as asyncio task
-4. User message sent to CLI with `_send_to_cli()`
-5. `_read_cli_response()` streams back text deltas, setting `_filler_cancel` on first text
-6. After CLI response complete, `_filler_cancel.set()` forces cancellation
-
-Inside `_filler_manager()` (lines 559-574):
-1. Wait 500ms gate -- if LLM responds within 500ms, skip filler entirely
-2. If gate expires, pick random acknowledgment clip via `_pick_filler("acknowledgment")`
-3. Play clip via `_play_filler_audio()` which sends FILLER frames to `_audio_out_q`
-
-The `_pick_filler()` method (lines 545-557) is purely random with a no-repeat guard. It has zero awareness of what the user said.
-
-### Key Timing Constraint
-
-The filler system has a 500ms gate. This means the input classifier must produce a result in well under 500ms. Whisper transcription already takes 200-600ms (it runs in a thread executor -- see line 1471). So by the time the TRANSCRIPT arrives at `_llm_stage`, the user has already been waiting 200-600ms. The filler gate adds another 500ms. Total silence before filler: 700-1100ms.
-
-The classifier must run within that 500ms gate window, ideally in under 100ms to leave room for clip lookup and any pre-play processing. This rules out any LLM-based classification in the hot path.
-
-## Recommended Architecture
-
-### Component Diagram
+## Current Architecture (v1.x)
 
 ```
-  EXISTING                          NEW
-  --------                          ---
+┌─────────────────────────────────────────────────────────────────┐
+│                     SEQUENTIAL PIPELINE                         │
+│                                                                 │
+│  ┌──────────┐  audio_in_q  ┌──────────┐  stt_out_q  ┌───────┐ │
+│  │  Audio   ├─────────────>│   STT    ├────────────>│  LLM  │ │
+│  │ Capture  │              │ (Whisper) │             │(Claude│ │
+│  │(PulseAudio)             │ +VAD     │             │  CLI) │ │
+│  └──────────┘              └──────────┘             └───┬───┘ │
+│       ^                        ^                        │     │
+│       │                        │ _stt_gated             │     │
+│       │                        │ (suppressed             │     │
+│       │                        │  during playback)       v     │
+│  ┌──────────┐              ┌──────────┐           ┌─────────┐ │
+│  │ Playback │<─────────────│ Composer │<──────────│ Filler  │ │
+│  │(PyAudio) │  audio_out_q │(TTS+queue)│          │ Manager │ │
+│  └──────────┘              └──────────┘           └─────────┘ │
+│                                                                 │
+│  PTT key held = mic unmuted, STT active                        │
+│  PTT key released = STT flush, generation cycle                │
+│  AI speaking = _stt_gated=True, VAD active for barge-in       │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-  +---------------+
-  | STT Stage     |
-  | (Whisper)     |------TRANSCRIPT frame----+
-  +---------------+                          |
-                                             v
-                              +-----------------------------+
-                              | InputClassifier             |  NEW
-                              | - keyword/pattern matching  |
-                              | - non-speech event flags    |
-                              | - situation categorization  |
-                              +-------------+---------------+
-                                            |
-                                   ClassifiedInput
-                                   {category, confidence,
-                                    original_text, tags}
-                                            |
-  +---------------+                         v
-  | LLM Stage     |          +-----------------------------+
-  | (Claude CLI)  |          | ResponseLibrary             |  NEW
-  | _filler_mgr   |<------  | - lookup(classification)    |
-  | (MODIFIED)    |          | - returns best clip or None |
-  +---------------+          | - in-memory index + disk    |
-                              +-----------------------------+
-                                            ^
-                                            | loads/saves
-                                            v
-                              +-----------------------------+
-                              | LibraryCurator              |  NEW
-                              | - post-session analysis     |  (daemon, like learner.py)
-                              | - gap identification        |
-                              | - clip generation           |
-                              | - quality pruning           |
-                              +-----------------------------+
+### Key Coupling Points in Current Architecture
+
+1. **`_stt_gated` flag** (live_session.py line 211): When AI is speaking, STT discards all audio. The mic stays live (for VAD barge-in), but no transcription happens. This prevents the system from hearing anything while responding.
+
+2. **`set_muted()` / `_stt_flush_event`** (lines 2656-2673): The PTT key directly controls whether STT accumulates audio. Key release triggers a flush-and-transcribe cycle. This is the fundamental PTT coupling.
+
+3. **`_llm_stage()` blocking on `_stt_out_q`** (line 2395): The LLM stage sits idle waiting for a transcript. It processes exactly one transcript per cycle, then blocks again. There is no concept of "monitoring" an ongoing stream.
+
+4. **`generation_id` for coherence** (line 219): All frames carry a generation ID. When the user interrupts (barge-in), the ID increments and stale frames are discarded. This system works well and should be preserved.
+
+5. **Filler manager races with LLM** (line 2421): The filler system and LLM response run concurrently, with the filler canceled when LLM text arrives. This pattern translates directly to the new architecture.
+
+## Target Architecture (v2.0)
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                                                                      │
+│  ╔══════════════════════════════════╗                                 │
+│  ║  INPUT STREAM (always running)  ║                                 │
+│  ║                                  ║                                 │
+│  ║  ┌──────────┐    ┌───────────┐  ║                                 │
+│  ║  │  Audio   ├───>│Continuous │  ║                                 │
+│  ║  │ Capture  │    │ Whisper   │  ║                                 │
+│  ║  │          │    │ STT       │  ║                                 │
+│  ║  └──────────┘    └─────┬─────┘  ║                                 │
+│  ║                        │        ║                                 │
+│  ║               TranscriptSegment ║                                 │
+│  ║                        │        ║                                 │
+│  ║                        v        ║                                 │
+│  ║              ┌──────────────┐   ║                                 │
+│  ║              │ Transcript   │   ║                                 │
+│  ║              │ Buffer       │   ║  ──> EventBus (all events)      │
+│  ║              │ (ring buffer │   ║                                 │
+│  ║              │  + context)  │   ║                                 │
+│  ║              └──────┬───────┘   ║                                 │
+│  ╚═════════════════════╪═══════════╝                                 │
+│                        │ (read-only access)                          │
+│                        v                                             │
+│  ╔═════════════════════════════════════╗                              │
+│  ║  MONITOR (Ollama, polling loop)    ║                              │
+│  ║                                     ║                              │
+│  ║  ┌────────────────────────────┐    ║                              │
+│  ║  │ Monitor Loop               │    ║                              │
+│  ║  │ - Reads transcript buffer  │    ║                              │
+│  ║  │ - Builds context window    │    ║                              │
+│  ║  │ - Calls Ollama (3B)       │    ║                              │
+│  ║  │ - Decides: RESPOND / WAIT │    ║                              │
+│  ║  │ - Routes to backend       │    ║                              │
+│  ║  └─────────────┬──────────────┘    ║                              │
+│  ╚════════════════╪═══════════════════╝                              │
+│                   │                                                   │
+│         ResponseDecision                                             │
+│         {action, backend,                                            │
+│          prompt, context}                                            │
+│                   │                                                   │
+│                   v                                                   │
+│  ╔═════════════════════════════════════╗                              │
+│  ║  RESPONSE (Claude CLI or Ollama)   ║                              │
+│  ║                                     ║                              │
+│  ║  ┌────────────┐  ┌─────────────┐  ║                              │
+│  ║  │ Claude CLI │  │ Ollama      │  ║                              │
+│  ║  │ (deep/     │  │ (quick/     │  ║                              │
+│  ║  │  tools)    │  │  local)     │  ║                              │
+│  ║  └─────┬──────┘  └──────┬──────┘  ║                              │
+│  ║        └────────┬───────┘         ║                              │
+│  ╚═════════════════╪═════════════════╝                              │
+│                    │                                                  │
+│           text deltas / sentences                                    │
+│                    │                                                  │
+│                    v                                                  │
+│  ╔═════════════════════════════════════╗                              │
+│  ║  OUTPUT (unchanged from v1.x)      ║                              │
+│  ║                                     ║                              │
+│  ║  ┌──────────┐    ┌──────────┐     ║                              │
+│  ║  │ Stream   ├───>│ Playback │     ║                              │
+│  ║  │ Composer │    │ (PyAudio)│     ║                              │
+│  ║  │ (+TTS)   │    │          │     ║                              │
+│  ║  └──────────┘    └──────────┘     ║                              │
+│  ╚═════════════════════════════════════╝                              │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────┐              │
+│  │ SUPPORT (unchanged from v1.x)                      │              │
+│  │ - Filler/Response library (quick clips)            │              │
+│  │ - Input classifier (heuristic + semantic)          │              │
+│  │ - Learner daemon                                   │              │
+│  │ - Event bus (JSONL)                                │              │
+│  │ - SSE dashboard                                    │              │
+│  │ - Task manager                                     │              │
+│  └────────────────────────────────────────────────────┘              │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### New Components
 
-#### 1. InputClassifier (in-process, synchronous)
+#### 1. Continuous STT (`ContinuousSTT`)
 
-**Location:** New file `input_classifier.py`, instantiated in `LiveSession.__init__()`
+**What it replaces:** The `_stt_stage()` method in `live_session.py` (lines 2179-2383).
 
-**Why synchronous:** Must complete in <100ms. This is a pure-Python pattern matcher, not an LLM call. The current STT already provides the text; classification is string analysis.
+**Key change:** Instead of accumulating audio until silence-after-speech and producing one transcript per turn, the continuous STT produces a stream of `TranscriptSegment` objects. Each segment represents a chunk of recognized speech, tagged with timestamps, speaker confidence, and whether it is final or interim.
+
+**Implementation approach:** Use the existing faster-whisper library in a rolling-buffer pattern. Process audio in overlapping windows (e.g., every 2-3 seconds, with 1 second overlap). Compare consecutive transcriptions to extract stable (confirmed) text versus speculative (in-progress) text.
 
 ```python
 @dataclass
-class ClassifiedInput:
-    """Result of classifying user input for quick response selection."""
-    category: str          # "question", "command", "emotional", "social",
-                           # "acknowledgment", "non_speech", "unknown"
-    subcategory: str       # "greeting", "farewell", "thanks", "cough",
-                           # "sigh", "laugh", "task_request", "info_query", etc.
-    confidence: float      # 0.0 - 1.0
-    original_text: str     # The raw transcript
-    tags: list[str]        # Additional context tags: ["short", "urgent", etc.]
-
-class InputClassifier:
-    """Fast, rule-based input classification for quick response selection.
-
-    NOT an LLM call. Uses keyword patterns, regex, and heuristics.
-    Designed to complete in <10ms for typical inputs.
-    """
-
-    def classify(self, transcript: str, stt_metadata: dict | None = None) -> ClassifiedInput:
-        """Classify user input into a situation category.
-
-        Args:
-            transcript: The STT-produced text
-            stt_metadata: Optional metadata from STT (no_speech_prob, etc.)
-
-        Returns:
-            ClassifiedInput with category and confidence
-        """
-        ...
+class TranscriptSegment:
+    text: str                    # Transcribed text
+    timestamp: float             # Wall clock time
+    is_final: bool               # True = confirmed, False = interim
+    audio_start: float           # Start time in audio stream
+    audio_end: float             # End time in audio stream
+    confidence: float            # Whisper confidence
+    has_speech: bool             # VAD confirmed speech
+    metadata: dict               # no_speech_prob, avg_logprob, etc.
 ```
 
-**Classification categories (initial set):**
+**Why rolling windows, not streaming Whisper:** Whisper is not a streaming model. Libraries like WhisperLive and whisper_streaming simulate streaming by re-transcribing overlapping audio windows and diffing the results. This is the proven approach. The key optimization: use a smaller Whisper model (`small` or `medium` instead of `large-v3`) to make repeated transcription fast enough for continuous operation.
 
-| Category | Subcategory | Pattern | Example Input |
-|----------|-------------|---------|---------------|
-| social | greeting | starts with "hey", "hi", "hello", "what's up" | "Hey, how's it going?" |
-| social | farewell | "bye", "see you", "later", "goodnight" | "Alright, talk to you later" |
-| social | thanks | "thanks", "thank you", "appreciate it" | "Thanks for that" |
-| question | info_query | ends with "?", starts with wh-word | "What time is it?" |
-| question | opinion | "what do you think", "should I" | "Should I use SQLite or JSON?" |
-| command | task_request | "can you", "please", "do X", imperative | "Run the tests" |
-| command | tool_use | references files, code, projects | "Check the logs in /var/log" |
-| emotional | frustration | "ugh", "damn", "this sucks" | "Ugh, it broke again" |
-| emotional | excitement | "awesome", "yes!", "nice" | "That's awesome!" |
-| acknowledgment | affirmative | "yeah", "okay", "sure", "got it" | "Yeah, makes sense" |
-| acknowledgment | negative | "no", "nah", "not really" | "Nah, that's not right" |
-| non_speech | cough | STT rejected + audio characteristics | (cough detected by STT filter) |
-| non_speech | sigh | STT low confidence + duration | (sigh) |
-| non_speech | laugh | STT low confidence + pattern | (laugh) |
-| unknown | unknown | low confidence on all patterns | (ambiguous input) |
+**Whisper model size trade-off:**
 
-**Non-speech detection integration:** The existing STT stage already filters non-speech via `_whisper_transcribe()` (lines 784-817). When all segments are rejected, it calls `self._set_status("stt_rejected")`. Currently this data is discarded. The new architecture captures these rejections:
+| Model | VRAM | Transcription Speed (3s audio) | WER | Continuous Feasible? |
+|-------|------|-------------------------------|-----|---------------------|
+| large-v3 | ~3.9GB | 400-800ms | Best | Marginal (GPU contention with Ollama) |
+| medium | ~1.5GB | 150-300ms | Good | Yes |
+| small | ~0.5GB | 50-150ms | Acceptable | Yes, comfortable |
+| distil-large-v3 | ~1.5GB | 100-200ms | Near large-v3 | Yes (best trade-off) |
 
-- When Whisper rejects all segments with high `no_speech_prob`, the STT stage can emit a new frame type (see pipeline frame changes below) carrying the rejection metadata
-- The classifier uses `no_speech_prob`, `avg_logprob`, and the raw text (even rejected text like "hmm" or "uh") to categorize the non-speech event
-- This allows "excuse you" for a cough, empathetic acknowledgment for a sigh, etc.
+**Recommendation:** Use `distil-large-v3` for the continuous STT. It has near-large-v3 accuracy at medium-model speed and VRAM. This leaves ~4-5GB free for Ollama. Falls back to `small` if GPU memory is tight.
 
-#### 2. ResponseLibrary (in-process, lookup)
+**Confidence: MEDIUM** -- distil-large-v3 performance claims are from the faster-whisper docs and community benchmarks, not independently verified. The rolling-window approach is proven by WhisperLive and whisper_streaming projects.
 
-**Location:** New file `response_library.py`, instantiated in `LiveSession.__init__()`
+**STT gating removal:** The `_stt_gated` flag is removed entirely. The input stream runs continuously regardless of whether the AI is speaking. The monitor decides whether incoming speech is relevant (user talking to the AI vs. background conversation). This is a fundamental shift.
 
-**Storage format: JSON** (not SQLite). Rationale:
-- The library will have 50-200 entries at most (each is a situation + clip reference)
-- Entire library loads into memory at startup (same pattern as `_load_filler_clips()`)
-- No concurrent write access needed during a session (writes happen post-session)
-- JSON is human-readable and consistent with `ack_pool.json` pattern
-- SQLite adds a dependency for no benefit at this scale
+**VAD integration:** Silero VAD (already loaded, line 1306) continues to run on the audio stream. Its role changes from "detect barge-in during playback" to "detect any speech activity at any time." VAD-positive chunks get transcribed; VAD-negative chunks are silently discarded. This prevents wasting GPU on silence/noise.
 
-**Storage location:** `audio/responses/` (parallel to `audio/fillers/`)
+#### 2. Transcript Buffer (`TranscriptBuffer`)
 
-```
-audio/
-  fillers/
-    acknowledgment/          # existing ack clips (to be migrated)
-    ack_pool.json            # existing metadata
-  responses/
-    library.json             # response library index
-    clips/                   # pre-generated response audio clips
-      greeting_hey_001.wav
-      greeting_hey_002.wav
-      thanks_welcome_001.wav
-      cough_excuse_001.wav
-      ...
-```
+**What it is:** A shared, thread-safe data structure that accumulates transcript segments and provides a sliding-window view for the monitor.
 
-**library.json schema:**
-
-```json
-{
-  "version": 1,
-  "entries": [
-    {
-      "id": "greeting_hey_001",
-      "situation": {
-        "category": "social",
-        "subcategory": "greeting"
-      },
-      "response_text": "Hey! What's up?",
-      "clip_filename": "greeting_hey_001.wav",
-      "created_at": 1771418989.27,
-      "use_count": 14,
-      "last_used": 1771500000.0,
-      "effectiveness": 0.85,
-      "tags": ["casual", "short"]
-    }
-  ]
-}
-```
-
-**Lookup algorithm:**
+**Why a separate component:** The monitor needs to read the full recent context (last N seconds or N tokens of conversation). The STT produces segments one at a time. The buffer bridges these two rates, handling deduplication of interim-then-final segments and managing the context window.
 
 ```python
-class ResponseLibrary:
-    def __init__(self):
-        self._entries: list[ResponseEntry] = []
-        self._index: dict[str, list[ResponseEntry]] = {}  # category -> entries
-        self._clips: dict[str, bytes] = {}  # id -> pcm_data
-        self._usage_log: list[dict] = []    # tracks what was played
+class TranscriptBuffer:
+    """Thread-safe, append-only transcript accumulator with sliding window access."""
 
-    def lookup(self, classification: ClassifiedInput) -> ResponseEntry | None:
-        """Find the best matching response for a classified input.
+    def __init__(self, max_age_seconds: float = 300, max_tokens: int = 2048):
+        self._segments: deque[TranscriptSegment] = deque()
+        self._lock = asyncio.Lock()
+        self._max_age = max_age_seconds
+        self._max_tokens = max_tokens
+        self._new_segment_event = asyncio.Event()
+        self._token_count = 0
 
-        Returns None if no good match exists (falls back to generic ack).
-        """
-        key = f"{classification.category}:{classification.subcategory}"
-        candidates = self._index.get(key, [])
+    async def append(self, segment: TranscriptSegment):
+        """Add a new segment. Replaces interim segment with same audio range if final."""
+        async with self._lock:
+            # Replace interim with final if covering same time range
+            if segment.is_final:
+                self._segments = deque(
+                    s for s in self._segments
+                    if not (not s.is_final
+                            and s.audio_start >= segment.audio_start - 0.5
+                            and s.audio_end <= segment.audio_end + 0.5)
+                )
+            self._segments.append(segment)
+            self._evict_old()
+            self._new_segment_event.set()
 
-        if not candidates:
-            # Fall back to category-level match
-            candidates = self._index.get(classification.category, [])
+    async def get_context(self, max_tokens: int = 0) -> list[TranscriptSegment]:
+        """Get recent segments within token budget."""
+        budget = max_tokens or self._max_tokens
+        async with self._lock:
+            result = []
+            tokens_used = 0
+            for seg in reversed(self._segments):
+                seg_tokens = len(seg.text.split()) * 1.3  # rough token estimate
+                if tokens_used + seg_tokens > budget:
+                    break
+                result.append(seg)
+                tokens_used += seg_tokens
+            return list(reversed(result))
 
-        if not candidates:
-            return None  # No match -- _filler_manager falls back to random ack
+    async def get_since(self, timestamp: float) -> list[TranscriptSegment]:
+        """Get all segments since a timestamp. Used by monitor to get new input."""
+        async with self._lock:
+            return [s for s in self._segments if s.timestamp > timestamp]
 
-        # Score candidates: prefer variety (avoid recently used), high effectiveness
-        return self._score_and_pick(candidates)
+    async def wait_for_new(self, timeout: float = 1.0) -> bool:
+        """Block until a new segment arrives or timeout. Returns True if new data."""
+        self._new_segment_event.clear()
+        try:
+            await asyncio.wait_for(self._new_segment_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
-    def get_clip(self, entry_id: str) -> bytes | None:
-        """Get pre-loaded PCM audio for a response entry."""
-        return self._clips.get(entry_id)
+    def _evict_old(self):
+        """Remove segments older than max_age or exceeding token budget."""
+        cutoff = time.time() - self._max_age
+        while self._segments and self._segments[0].timestamp < cutoff:
+            self._segments.popleft()
 ```
 
-**Lookup must be fast:** The `_index` is a dict keyed by `"category:subcategory"`. Lookup is O(1) to find candidates, then O(n) to score a small list (typically 2-5 candidates per subcategory). Total: <1ms.
+**Context window management strategy:**
 
-#### 3. LibraryCurator (post-session daemon)
+The buffer maintains a 5-minute rolling window of transcript segments. The monitor reads from this buffer with a configurable token budget (default 2048 tokens, which is generous for Llama 3.2 3B's context window of 131K tokens but keeps inference fast).
 
-**Location:** New file `library_curator.py`, spawned like `learner.py`
+Why NOT summarization: For a voice assistant monitoring ambient audio, the recent raw text is more valuable than a summary. The monitor needs to see exact phrasing, pauses, and turn boundaries to decide whether to respond. Summarization loses these signals. The 5-minute / 2048-token window is sufficient because conversational context rarely extends beyond a few minutes.
 
-**Pattern:** Follows the exact same pattern as `learner.py`:
-- Spawned as subprocess at session start via `_spawn_curator()`
-- Reads conversation JSONL log
-- Runs post-session analysis via `claude -p`
-- Writes new entries to `library.json` and generates clips via Piper
-- Communicates back via signal file (like `learner_notify`)
+Why NOT vector retrieval: The monitor needs temporal context (what was said recently, in order), not semantic retrieval. Vector stores are for "find relevant past information," not "what just happened in the last 30 seconds."
 
-**Why a separate daemon (not inline):**
-- Library growth involves LLM calls (deciding what phrases to generate) -- too slow for real-time
-- Clip generation via Piper takes 1-3s per clip -- would block the pipeline
-- Same architectural pattern as learner: watch log, extract insights, write to disk
-- Next session picks up new clips automatically via `_load_library()` at startup
+#### 3. Monitor Loop (`MonitorLoop`)
 
-**Curator responsibilities:**
+**What it is:** An asyncio coroutine that polls the transcript buffer, builds a prompt with recent context, calls Ollama (Llama 3.2 3B) to decide whether to respond, and if yes, routes the response to the appropriate backend.
 
-1. **Gap identification:** After session ends, analyze conversation log for situations where:
-   - No response was found (logged as `response_miss` events)
-   - A generic acknowledgment was used where a specific response would be better
-   - New interaction patterns appeared (user greeting style, frequent question types)
+**This is the brain of v2.0.** It replaces the simple "transcript arrives -> send to LLM" flow with a deliberate decision cycle.
 
-2. **Clip generation:** For each identified gap:
-   - Use Claude to generate 2-3 natural response phrases for the situation
-   - Generate audio clips via Piper with varied TTS parameters (same as clip_factory.py)
-   - Evaluate clip quality (same scoring as existing `evaluate_clip()`)
-   - Add passing clips to `library.json`
+```python
+@dataclass
+class ResponseDecision:
+    action: str                  # "respond", "wait", "acknowledge", "ignore"
+    backend: str                 # "claude", "ollama", "filler"
+    confidence: float            # 0.0 - 1.0
+    prompt: str                  # What to send to the response backend
+    reasoning: str               # Why (for logging/debugging)
+    trigger_segment_id: int      # Which segment triggered the response
 
-3. **Quality pruning:** Remove entries that:
-   - Were used but followed by the user interrupting (barge-in after quick response = bad match)
-   - Have very low `effectiveness` scores
-   - Are duplicative (multiple entries for same situation with similar text)
-   - Exceed per-category caps (keep top N per subcategory)
+class MonitorLoop:
+    """Watches transcript buffer, decides when and how to respond."""
+
+    POLL_INTERVAL = 0.5          # Check for new transcripts every 500ms
+    SILENCE_THRESHOLD = 2.0      # Seconds of silence before evaluating
+    MIN_NEW_TOKENS = 5           # Minimum new words before evaluating
+    COOLDOWN_AFTER_RESPONSE = 3.0  # Don't respond again for N seconds
+
+    def __init__(self, transcript_buffer, ollama_client, response_router):
+        self._buffer = transcript_buffer
+        self._ollama = ollama_client
+        self._router = response_router
+        self._last_eval_time = 0
+        self._last_response_time = 0
+        self._last_seen_timestamp = 0
+        self._responding = False  # True while AI is generating/speaking
+
+    async def run(self):
+        """Main monitor loop. Runs forever."""
+        while True:
+            # Wait for new transcript data
+            has_new = await self._buffer.wait_for_new(timeout=self.POLL_INTERVAL)
+
+            if self._responding:
+                continue  # Don't evaluate while AI is speaking
+
+            # Cooldown: don't re-evaluate immediately after responding
+            if time.time() - self._last_response_time < self.COOLDOWN_AFTER_RESPONSE:
+                continue
+
+            # Get segments since last evaluation
+            new_segments = await self._buffer.get_since(self._last_seen_timestamp)
+            if not new_segments:
+                continue
+
+            # Update timestamp
+            self._last_seen_timestamp = new_segments[-1].timestamp
+
+            # Check if there is enough new content to evaluate
+            new_text = " ".join(s.text for s in new_segments if s.is_final)
+            if len(new_text.split()) < self.MIN_NEW_TOKENS:
+                continue
+
+            # Check for silence (user stopped speaking)
+            last_segment_age = time.time() - new_segments[-1].timestamp
+            if last_segment_age < self.SILENCE_THRESHOLD:
+                continue  # User might still be talking
+
+            # Build full context and evaluate
+            context = await self._buffer.get_context(max_tokens=1500)
+            decision = await self._evaluate(context, new_segments)
+
+            if decision.action == "respond":
+                self._responding = True
+                self._last_response_time = time.time()
+                await self._router.route(decision)
+                self._responding = False
+            elif decision.action == "acknowledge":
+                # Play a quick filler clip without full LLM response
+                await self._router.acknowledge(decision)
+```
+
+**Monitor decision prompt (sent to Ollama):**
+
+```
+You are monitoring a live conversation. Decide whether the AI assistant
+should respond to what was just said.
+
+Recent conversation context:
+{context_text}
+
+New input (since last check):
+{new_text}
+
+The AI assistant's name is "Russel". Respond in JSON:
+{
+  "action": "respond" | "wait" | "acknowledge" | "ignore",
+  "backend": "claude" | "ollama",
+  "confidence": 0.0-1.0,
+  "reasoning": "brief explanation"
+}
+
+Guidelines:
+- "respond" when the user is talking to the AI or asking a question
+- "wait" when the user is mid-thought and hasn't finished
+- "acknowledge" when the user said something that deserves a brief reaction
+  but not a full response (e.g., "interesting", sigh, laugh)
+- "ignore" when the user is talking to someone else or it is background noise
+- Use "claude" backend for complex questions, tasks, code, or anything
+  requiring tools
+- Use "ollama" backend for simple factual answers, casual chat, or when
+  speed matters more than depth
+- If the user says the AI's name ("Russel", "hey Russel"), always "respond"
+```
+
+**Ollama inference characteristics (Llama 3.2 3B):**
+
+- Model size: ~2GB VRAM at int4 quantization
+- Inference latency: 100-300ms for short structured outputs
+- Context: 131K tokens (more than enough for our 1500-token window)
+- Structured output: Supports JSON mode via `format: "json"` parameter
+
+**Confidence: MEDIUM** -- Llama 3.2 3B's ability to reliably make respond/wait/ignore decisions has not been tested. The 3B model may struggle with nuanced turn-taking detection. If it proves unreliable, a hybrid approach (heuristic pre-filter + Ollama for ambiguous cases) would be the fallback. The existing input classifier's heuristic patterns could serve as the fast path.
+
+**Monitor evaluation frequency:**
+
+The monitor does NOT call Ollama on every transcript segment. It batches: accumulate segments, wait for a silence gap (2 seconds), check minimum word count (5 words), then evaluate. This means:
+- ~1-2 Ollama calls per user utterance (not per chunk)
+- Each call takes 100-300ms
+- Total latency from user-stops-speaking to decision: 2.0-2.3 seconds
+
+This is slower than the current PTT system (which has ~0s decision latency because the key release IS the decision). The 2-second silence threshold is the primary UX parameter to tune. LiveKit's turn detection research suggests semantic endpointing can reduce this, but for v2.0, silence-based endpointing with a 2-second threshold is a reasonable starting point.
+
+#### 4. Response Router (`ResponseRouter`)
+
+**What it is:** Takes a `ResponseDecision` from the monitor and dispatches it to the appropriate backend (Claude CLI or Ollama), manages the response lifecycle, and feeds results to the existing StreamComposer.
+
+```python
+class ResponseRouter:
+    """Routes response decisions to the appropriate backend."""
+
+    def __init__(self, claude_cli, ollama_client, composer, filler_manager):
+        self._claude = claude_cli       # Existing Claude CLI management
+        self._ollama = ollama_client    # Ollama chat endpoint
+        self._composer = composer        # Existing StreamComposer
+        self._filler = filler_manager   # Existing filler/response system
+
+    async def route(self, decision: ResponseDecision):
+        """Generate and play a response."""
+        if decision.backend == "claude":
+            await self._respond_claude(decision)
+        elif decision.backend == "ollama":
+            await self._respond_ollama(decision)
+
+    async def _respond_claude(self, decision: ResponseDecision):
+        """Send to Claude CLI, stream response through composer."""
+        # Start filler while waiting for Claude
+        filler_cancel = asyncio.Event()
+        filler_task = asyncio.create_task(
+            self._filler.play_contextual(decision.prompt, filler_cancel)
+        )
+
+        # Send to Claude CLI (reuse existing _send_to_cli / _read_cli_response)
+        await self._claude.send(decision.prompt)
+        # Stream text deltas to composer (same as existing _read_cli_response)
+        await self._claude.read_response(self._composer, filler_cancel)
+
+        filler_cancel.set()
+        if not filler_task.done():
+            filler_task.cancel()
+
+    async def _respond_ollama(self, decision: ResponseDecision):
+        """Generate response via Ollama, send to composer."""
+        # Ollama responses are fast enough that fillers are usually not needed
+        response_text = ""
+        sentence_buffer = ""
+
+        async for chunk in self._ollama.chat_stream(decision.prompt):
+            response_text += chunk
+            sentence_buffer += chunk
+
+            # Same sentence-boundary detection as existing _read_cli_response
+            while SENTENCE_END_RE.search(sentence_buffer):
+                match = SENTENCE_END_RE.search(sentence_buffer)
+                end_pos = match.end()
+                sentence = sentence_buffer[:end_pos].strip()
+                sentence_buffer = sentence_buffer[end_pos:]
+                if sentence:
+                    await self._composer.enqueue(
+                        AudioSegment(SegmentType.TTS_SENTENCE, data=sentence)
+                    )
+
+        # Flush remaining
+        if sentence_buffer.strip():
+            await self._composer.enqueue(
+                AudioSegment(SegmentType.TTS_SENTENCE, data=sentence_buffer.strip())
+            )
+
+        await self._composer.enqueue_end_of_turn()
+
+    async def acknowledge(self, decision: ResponseDecision):
+        """Play a quick acknowledgment clip without full response."""
+        await self._filler.play_contextual(decision.prompt, asyncio.Event())
+```
+
+**Backend selection criteria:**
+
+| Criterion | Claude CLI | Ollama |
+|-----------|-----------|--------|
+| Network available | Required | Not required |
+| Complex reasoning | Yes | Limited |
+| Tool use (run commands, read files) | Yes (MCP tools) | No |
+| Code analysis | Yes | Limited |
+| Casual chat | Overkill | Ideal |
+| Simple factual Q&A | Works but slow (2-5s) | Fast (0.5-1s) |
+| Response latency | 2-5 seconds | 0.5-2 seconds |
+
+**Auto-selection logic in the monitor prompt:** The monitor decides the backend as part of its structured output. If the monitor says "claude" but network is unavailable, the router falls back to Ollama with a degraded prompt. This uses the existing `CircuitBreaker` pattern (line 148) already in the codebase.
+
+#### 5. Barge-In / Name Detection (Modified)
+
+**Current barge-in:** VAD detects sustained speech (6 chunks, ~0.5s) during AI playback, triggers `_trigger_barge_in()` which increments `generation_id`, drains queues, builds annotation.
+
+**New barge-in:** Two modes:
+1. **VAD barge-in** (unchanged): Sustained speech during AI output triggers interruption. Same generation_id mechanism, same composer pause/drain.
+2. **Name-based interruption** (new): The continuous STT can detect "hey Russel" even during AI playback (since STT is no longer gated). When the transcript buffer receives a segment containing the wake phrase, it triggers an interrupt.
+
+**Name detection approach:** Do NOT use a dedicated wake word engine (openWakeWord, Porcupine). The continuous Whisper STT already transcribes everything. Name detection is a simple string match on the transcript text:
+
+```python
+WAKE_PHRASES = {"hey russel", "hey russell", "russel", "russell"}
+
+def _check_wake_phrase(self, segment: TranscriptSegment) -> bool:
+    """Check if a transcript segment contains the wake phrase."""
+    text_lower = segment.text.lower().strip()
+    for phrase in WAKE_PHRASES:
+        if phrase in text_lower:
+            return True
+    return False
+```
+
+**Why not openWakeWord:** Adding a wake word engine means another audio processing pipeline running in parallel with Whisper, consuming CPU/GPU. Since Whisper is already transcribing continuously, the transcript IS the wake word detection. This is simpler and more reliable for multi-syllable names (wake word engines excel at short phrases like "hey" but Whisper is better at recognizing actual names).
+
+**Confidence: HIGH** -- This approach is architecturally sound. The only risk is Whisper's latency (the name might be detected 2-3 seconds after being spoken due to the rolling-window transcription). For v2.0, this is acceptable. If sub-second name detection is needed later, openWakeWord can be added as a parallel fast path.
+
+### Unchanged Components
+
+These components require NO architectural changes for v2.0:
+
+| Component | File | Why Unchanged |
+|-----------|------|---------------|
+| StreamComposer | `stream_composer.py` | Receives `AudioSegment` objects from whoever is generating. Does not care if the source is Claude CLI or Ollama. |
+| Playback Stage | `live_session.py` `_playback_stage()` | Consumes `PipelineFrame` from `audio_out_q`. Source-agnostic. |
+| Filler/Response Library | `response_library.py`, `input_classifier.py` | Called by the response router before LLM response, same role as today. |
+| Event Bus | `event_bus.py` | JSONL event log. New event types can be added (e.g., `monitor_decision`, `transcript_segment`) but the bus infrastructure is unchanged. |
+| Learner Daemon | `learner.py` | Tails event bus JSONL, extracts memories. Works regardless of input mode. |
+| Task Manager | `task_manager.py` | Spawns/tracks Claude CLI background tasks. Orthogonal to input mode. |
+| SSE Dashboard | `live_session.py` `_sse_server_stage()` | Broadcasts bus events. New events are automatically included. |
+| Audio Capture | `live_session.py` `_audio_capture_stage()` | PulseAudio recording thread. Unchanged -- it already runs continuously. The only change is that it no longer checks the `muted` flag from PTT. |
 
 ### Modified Components
 
-#### 4. Modified: `_filler_manager()` in live_session.py
+| Component | What Changes | Scope of Change |
+|-----------|-------------|-----------------|
+| `_stt_stage()` | Replaced by `ContinuousSTT`. No longer gates on `_stt_gated`. Produces `TranscriptSegment` instead of `TRANSCRIPT` frames. | Major rewrite of one method. |
+| `_llm_stage()` | Replaced by `MonitorLoop` + `ResponseRouter`. No longer blocks on `_stt_out_q`. | Major rewrite of one method. |
+| `_trigger_barge_in()` | Add name-detection path alongside VAD path. | Small addition. |
+| `__init__()` | Initialize new components (ContinuousSTT, TranscriptBuffer, MonitorLoop, ResponseRouter, OllamaClient). | Medium -- adding initializers. |
+| `run()` | Change stage list: replace `_stt_stage` and `_llm_stage` with new loops. | Medium. |
+| Config | Add new settings: `monitor_model`, `response_backend`, `wake_phrase`, `silence_threshold`. | Small. |
 
-The current `_filler_manager()` is the surgical modification point. It currently:
-1. Waits 500ms gate
-2. Picks random clip
-3. Plays it
+## Data Flow: Complete Lifecycle
 
-The new version:
-1. Classifies input via `InputClassifier.classify(transcript)`
-2. Looks up response via `ResponseLibrary.lookup(classification)`
-3. Waits gate (keep the gate but may reduce to 300ms for known-good matches)
-4. If response found: play it
-5. If no response: fall back to random acknowledgment clip (existing behavior)
-
-```python
-async def _filler_manager(self, user_text: str, cancel_event: asyncio.Event):
-    """Play a context-appropriate quick response while waiting for LLM."""
-    # Step 1: Classify input (sync, <10ms)
-    classification = self._classifier.classify(user_text)
-
-    # Step 2: Lookup response (sync, <1ms)
-    response = self._response_library.lookup(classification)
-
-    # Step 3: Gate -- skip if LLM responds fast
-    gate_ms = 0.3 if response and response.confidence > 0.8 else 0.5
-    try:
-        await asyncio.wait_for(cancel_event.wait(), timeout=gate_ms)
-        return  # LLM responded fast, skip
-    except asyncio.TimeoutError:
-        pass
-
-    if cancel_event.is_set():
-        return
-
-    # Step 4: Play response or fall back
-    if response:
-        clip = self._response_library.get_clip(response.id)
-        if clip:
-            self._response_library.log_usage(response.id, classification)
-            await self._play_filler_audio(clip, cancel_event)
-            return
-
-    # Fallback: existing random acknowledgment
-    clip = self._pick_filler("acknowledgment")
-    if clip:
-        await self._play_filler_audio(clip, cancel_event)
-```
-
-**What does NOT change:**
-- `_play_filler_audio()` -- unchanged, sends FILLER frames to `_audio_out_q`
-- `_play_gated_ack()` -- unchanged, used for tool-use acknowledgments
-- `_pick_filler()` -- kept as fallback
-- All playback stage logic -- unchanged
-- Barge-in logic -- unchanged
-- STT gating -- unchanged
-
-#### 5. Modified: STT stage (non-speech event forwarding)
-
-Currently when Whisper rejects all segments (lines 813-817), it calls `self._set_status("stt_rejected")` and discards the data. The modification:
-
-```python
-# In _stt_stage, after all segments rejected:
-if not kept and segments:
-    self._set_status("stt_rejected")
-    rejected_text = "".join(s.get("text", "") for s in segments).strip()
-
-    # NEW: Forward non-speech event for quick response handling
-    await self._stt_out_q.put(PipelineFrame(
-        type=FrameType.NON_SPEECH,
-        generation_id=self.generation_id,
-        data=rejected_text,
-        metadata={
-            "no_speech_prob": max(s.get("no_speech_prob", 0) for s in segments),
-            "avg_logprob": min(s.get("avg_logprob", 0) for s in segments),
-        }
-    ))
-```
-
-Then in `_llm_stage`, handle NON_SPEECH frames by running classification and playing a quick response WITHOUT sending to the LLM:
-
-```python
-if frame.type == FrameType.NON_SPEECH:
-    # Classify non-speech event
-    classification = self._classifier.classify(
-        frame.data,
-        stt_metadata=frame.metadata
-    )
-    response = self._response_library.lookup(classification)
-    if response:
-        clip = self._response_library.get_clip(response.id)
-        if clip:
-            await self._play_filler_audio(clip, asyncio.Event())  # no cancel
-    continue  # Do NOT send to LLM
-```
-
-### Pipeline Frame Changes
-
-Add one new frame type to `pipeline_frames.py`:
-
-```python
-class FrameType(Enum):
-    AUDIO_RAW = auto()
-    TRANSCRIPT = auto()
-    TEXT_DELTA = auto()
-    TOOL_CALL = auto()
-    TOOL_RESULT = auto()
-    TTS_AUDIO = auto()
-    END_OF_TURN = auto()
-    END_OF_UTTERANCE = auto()
-    FILLER = auto()
-    BARGE_IN = auto()
-    CONTROL = auto()
-    NON_SPEECH = auto()       # NEW: STT-rejected audio event (cough, sigh, etc.)
-```
-
-The `metadata` field on `PipelineFrame` already exists and supports arbitrary dicts, so no structural change to the dataclass is needed. The NON_SPEECH frame carries:
-- `data`: the rejected transcript text (may be useful for classification: "hmm", "uh")
-- `metadata`: `{"no_speech_prob": float, "avg_logprob": float}` from Whisper segments
-
-### Data Flow: Complete Turn Lifecycle
-
-**Normal speech turn (with quick response):**
+### Normal Conversation Turn
 
 ```
-1. User speaks into mic
-2. Audio Capture -> AUDIO_RAW frames -> audio_in_q
-3. STT Stage: Whisper transcribes -> "What's the weather?"
-4. STT Stage -> END_OF_UTTERANCE + TRANSCRIPT frames -> stt_out_q
-5. LLM Stage receives TRANSCRIPT:
-   a. InputClassifier.classify("What's the weather?")
-      -> ClassifiedInput(category="question", subcategory="info_query")
-   b. ResponseLibrary.lookup(classification)
-      -> ResponseEntry(text="Let me check on that.", clip="info_query_check_001.wav")
-   c. Start _filler_manager with classification + response pre-loaded
-   d. Send to Claude CLI
-   e. _filler_manager waits 300ms gate
-   f. Gate expires -> play "Let me check on that." clip as FILLER frames
-   g. Claude CLI responds -> cancel_event.set() -> filler stops
-   h. TEXT_DELTA frames flow to TTS
-6. TTS Stage: Piper synthesizes -> TTS_AUDIO frames -> audio_out_q
-7. Playback Stage: plays audio
+1. User speaks: "What time is it in Tokyo?"
+2. Audio Capture -> audio chunks -> ContinuousSTT
+3. ContinuousSTT: VAD detects speech, starts accumulating
+4. ContinuousSTT: After 2-3s window, Whisper transcribes
+   -> TranscriptSegment(text="What time is it in Tokyo?", is_final=True)
+5. TranscriptBuffer: Appends segment, signals new data
+6. MonitorLoop: Wakes up, sees new segment
+7. MonitorLoop: Waits for 2s silence (user stopped talking)
+8. MonitorLoop: Builds context, calls Ollama:
+   "User said: 'What time is it in Tokyo?' -> respond or wait?"
+9. Ollama responds (200ms):
+   {"action": "respond", "backend": "ollama", "confidence": 0.9}
+10. ResponseRouter: Calls Ollama chat for the actual response
+11. Ollama streams: "It's currently 3:42 AM in Tokyo."
+12. ResponseRouter: Sends sentence to StreamComposer
+13. StreamComposer: Piper TTS -> audio_out_q -> Playback
+14. User hears response (~3.5s after finishing speaking)
 ```
 
-**Non-speech event turn:**
+### Barge-In During Response
 
 ```
-1. User coughs into mic
-2. Audio Capture -> AUDIO_RAW frames -> audio_in_q
-3. STT Stage: Whisper transcribes -> rejects all segments (no_speech_prob=0.85)
-4. STT Stage -> NON_SPEECH frame -> stt_out_q
-   (data="", metadata={"no_speech_prob": 0.85, "avg_logprob": -1.5})
-5. LLM Stage receives NON_SPEECH:
-   a. InputClassifier.classify("", stt_metadata={...})
-      -> ClassifiedInput(category="non_speech", subcategory="cough")
-   b. ResponseLibrary.lookup(classification)
-      -> ResponseEntry(text="Excuse you!", clip="cough_excuse_001.wav")
-   c. Play clip directly (no LLM call, no gate delay)
-6. Playback Stage: plays "Excuse you!" clip
-7. Return to listening (no LLM processing needed)
+1. AI is speaking (playing audio from composer)
+2. ContinuousSTT is running (NOT gated -- this is the key change)
+3. User says: "Actually, what about London?"
+4. VAD detects speech -> barge-in triggers (same as v1.x)
+5. generation_id increments, composer pauses, audio drains
+6. Meanwhile, ContinuousSTT transcribes the interruption
+7. TranscriptSegment("Actually, what about London?") -> buffer
+8. MonitorLoop sees new input, evaluates, decides to respond
+9. Response generated for the new question
 ```
 
-**Session end (library growth):**
+### Name-Based Interruption
 
 ```
-1. Session ends -> session_end event logged to JSONL
-2. LibraryCurator (daemon) detects session_end
-3. Curator reads conversation log + response_miss events
-4. Curator calls claude -p to analyze gaps:
-   "User said 'morning!' 3 times but got generic 'let me check' -- need morning greeting"
-5. Curator generates clips via Piper: "Good morning!", "Morning!", "Hey, good morning!"
-6. Curator writes new entries to library.json
-7. Next session: LiveSession.__init__() loads updated library
+1. AI is speaking a long response
+2. User says: "Hey Russel, stop"
+3. ContinuousSTT transcribes: "Hey Russel, stop"
+4. TranscriptBuffer receives segment, checks for wake phrase
+5. Wake phrase detected -> trigger_barge_in()
+6. Same barge-in flow as VAD (generation_id increment, drain, etc.)
+7. MonitorLoop sees "stop" in context, decides action "acknowledge"
+8. Plays brief acknowledgment clip
 ```
 
-### Integration with Existing Systems
+### Background Conversation (Ignored)
 
-#### Integration with Learner Daemon
+```
+1. User is on a phone call, talking to someone else
+2. ContinuousSTT transcribes fragments of the conversation
+3. TranscriptBuffer accumulates segments
+4. MonitorLoop evaluates:
+   "User is clearly talking to someone else (no AI name,
+    topic is unrelated to previous AI interaction)"
+5. Ollama: {"action": "ignore", "reasoning": "not addressed to AI"}
+6. No response generated
+7. Context window naturally ages out the phone call transcript
+```
 
-The learner and curator are complementary but independent:
-- **Learner:** Watches conversation, writes to `personality/memories/` (who the user is)
-- **Curator:** Watches conversation, writes to `audio/responses/library.json` (how to respond quickly)
-- Both follow the same pattern: subprocess, JSONL tailing, claude -p evaluation
-- They run concurrently, no conflicts (different output files)
+## GPU Memory Budget
 
-The learner does NOT help grow the library directly. They have different concerns:
-- Learner extracts durable facts ("user likes Python, has a cat named Luna")
-- Curator identifies response patterns ("user says 'morning' at session start -> need greeting clip")
+```
+RTX 3070: 8192 MB VRAM total
 
-#### Integration with Clip Factory
+Component                    VRAM (estimated)
+─────────────────────────────────────────────
+Whisper distil-large-v3      ~1,500 MB
+Ollama Llama 3.2 3B (int4)  ~2,000 MB
+Silero VAD (ONNX)            ~50 MB
+PyTorch/CUDA overhead        ~500 MB
+─────────────────────────────────────────────
+Total                        ~4,050 MB
+Free                         ~4,140 MB (comfortable)
 
-The existing `clip_factory.py` manages the acknowledgment clip pool. With adaptive responses:
-- The clip factory continues to maintain the acknowledgment fallback pool
-- The curator generates situation-specific clips using the same Piper TTS and `evaluate_clip()` function
-- The curator can import `generate_clip` and `evaluate_clip` from `clip_factory.py` directly
-- Over time, as the response library grows, the acknowledgment pool becomes less used (but never removed -- it is the safety net)
+Alternative: Whisper small
+─────────────────────────────────────────────
+Whisper small                ~500 MB
+Ollama Llama 3.2 3B (int4)  ~2,000 MB
+Silero VAD (ONNX)            ~50 MB
+PyTorch/CUDA overhead        ~500 MB
+─────────────────────────────────────────────
+Total                        ~3,050 MB
+Free                         ~5,140 MB (very comfortable)
+```
 
-#### Integration with Barge-in
+**Confidence: MEDIUM** -- VRAM estimates are approximate. Actual usage depends on batch sizes, CUDA allocator fragmentation, and whether Ollama keeps the model loaded between inferences. Ollama's GPU memory management (keep-alive, offloading) needs testing.
 
-No changes to barge-in logic. The playback stage already handles FILLER frames identically to TTS_AUDIO for barge-in purposes. When the user interrupts a quick response:
-1. Barge-in triggers as normal (VAD detection, generation_id increment)
-2. Quick response audio stops (filler frame generation checks `cancel_event` and `generation_id`)
-3. Annotation is built with whatever was spoken
-4. The curator logs this as a negative signal for that response entry (barge-in after quick response = bad match)
+**Key concern:** Ollama runs as a Docker container (per the shell function in the user's environment). Docker GPU passthrough with `--gpus all` shares the same physical VRAM, but there may be additional overhead from the container runtime. This needs empirical testing.
 
-#### Integration with Tool-Use Flow
+## Suggested Build Order
 
-The existing tool-use flow in `_read_cli_response()` has its own acknowledgment path (`_play_gated_ack`). This remains unchanged. The adaptive response system only affects the initial filler played before the LLM starts responding. Tool-use acknowledgments ("checking now", "one moment") are already contextually appropriate since they play after a tool_use content_block_start event.
+### Phase A: Continuous STT (independently testable)
 
-### Storage and Persistence
+Build `ContinuousSTT` class that reads from `audio_in_q` and produces `TranscriptSegment` objects into a `TranscriptBuffer`. This can be tested standalone -- feed it audio, verify transcript output.
 
-| Data | Location | Format | Lifecycle |
-|------|----------|--------|-----------|
-| Response library index | `audio/responses/library.json` | JSON | Grows across sessions, loaded at startup |
-| Response audio clips | `audio/responses/clips/*.wav` | WAV (22050Hz) | Generated by curator, loaded at startup |
-| Usage log (per session) | Session dir `response_usage.jsonl` | JSONL | Written during session, read by curator |
-| Response miss log | Session dir `response_misses.jsonl` | JSONL | Written during session, read by curator |
-| Acknowledgment fallback | `audio/fillers/acknowledgment/*.wav` | WAV (22050Hz) | Existing, maintained by clip_factory |
+**Deliverables:**
+- `continuous_stt.py` (new file)
+- `transcript_buffer.py` (new file)
+- Unit tests for both
 
-### Concurrency and Thread Safety
+**Dependencies:** Existing audio capture, existing faster-whisper setup
+**Can test independently:** Yes -- pipe recorded audio through it
+**Risk:** Medium -- Whisper rolling-window approach needs tuning for segment boundaries
 
-- `InputClassifier.classify()`: Pure function, no state mutation, safe to call from asyncio
-- `ResponseLibrary.lookup()`: Read-only during session, safe from asyncio event loop
-- `ResponseLibrary.log_usage()`: Appends to in-memory list, flushed to JSONL at session end
-- `LibraryCurator`: Separate subprocess, writes to `library.json` only after session ends, no concurrent access
-- Clip loading at startup: synchronous in `__init__`, same pattern as existing `_load_filler_clips()`
+### Phase B: Monitor Loop (independently testable)
 
-## Build Order
+Build `MonitorLoop` with Ollama integration and `ResponseDecision` structured output. Can be tested with a mock transcript buffer pre-populated with test data.
 
-Components can be built in phases with clear independence:
+**Deliverables:**
+- `monitor_loop.py` (new file)
+- `ollama_client.py` (new file -- thin wrapper around Ollama HTTP API)
+- Unit tests with mock buffer
 
-### Phase 1: Input Classification (can be built and tested independently)
+**Dependencies:** TranscriptBuffer (from Phase A), Ollama running locally
+**Can test independently:** Yes -- mock the buffer, verify decisions
+**Risk:** Medium -- Ollama decision quality needs prompt tuning. Llama 3.2 3B may need structured output guidance.
 
-Build `input_classifier.py` with `ClassifiedInput` dataclass and `InputClassifier` class. This has zero dependencies on the rest of the system. Can be tested with unit tests against sample transcripts.
+### Phase C: Response Router + Ollama Backend (partially independent)
 
-**Deliverable:** `input_classifier.py` with tests
-**Dependencies:** None
-**Risk:** Low -- pattern matching is well-understood
+Build `ResponseRouter` that dispatches to Claude CLI (reuse existing code) or Ollama (new). The Ollama response path is new; the Claude CLI path wraps existing `_send_to_cli` / `_read_cli_response`.
 
-### Phase 2: Response Library (can be built and tested independently)
+**Deliverables:**
+- `response_router.py` (new file)
+- Ollama chat response streaming in `ollama_client.py`
+- Integration with existing StreamComposer
 
-Build `response_library.py` with `ResponseEntry` dataclass, `ResponseLibrary` class, JSON storage, and lookup algorithm. Seed with initial entries (migrate existing acknowledgment phrases + add social/emotional responses).
+**Dependencies:** Phase B (ResponseDecision), existing StreamComposer, existing Claude CLI
+**Can test independently:** Partially -- Ollama path yes, Claude path needs live CLI
+**Risk:** Low-Medium -- Ollama streaming is straightforward. Claude CLI integration is wrapping existing code.
 
-**Deliverable:** `response_library.py` with initial `library.json`, tests
-**Dependencies:** None (uses existing Piper for initial clip generation)
-**Risk:** Low -- data structure and lookup
+### Phase D: Pipeline Integration
 
-### Phase 3: Pipeline Integration (depends on Phase 1 + 2)
+Wire Phase A/B/C into `live_session.py`. Replace `_stt_stage()` and `_llm_stage()` with the new components. Remove `_stt_gated` flag. Add name detection. Update `run()` method to launch new coroutines.
 
-Modify `_filler_manager()` in `live_session.py` to use classifier + library. Add `NON_SPEECH` frame type. Modify STT stage to emit non-speech events. Wire up logging of usage and misses.
+**Deliverables:**
+- Modified `live_session.py`
+- Modified `pipeline_frames.py` (new frame types if needed)
+- End-to-end integration tests
 
-**Deliverable:** Modified `live_session.py`, `pipeline_frames.py`
-**Dependencies:** Phase 1, Phase 2
-**Risk:** Medium -- touching the hot path, needs careful testing to avoid regression
+**Dependencies:** Phases A, B, C all complete
+**Risk:** High -- this is the big integration. Timing, concurrency, and edge cases (what happens when Ollama is slow, when Whisper produces garbage, when the user and AI talk simultaneously).
 
-### Phase 4: Library Curator (can be built after Phase 2)
+### Phase E: Barge-In + Name Detection
 
-Build `library_curator.py` daemon. Follows learner.py pattern exactly. Post-session gap analysis, clip generation, quality pruning.
+Add name-based interruption. Modify `_trigger_barge_in` to accept both VAD and name-based triggers. Test interruption scenarios.
 
-**Deliverable:** `library_curator.py`
-**Dependencies:** Phase 2 (needs library.json schema), `clip_factory.py` (reuses generate/evaluate)
-**Risk:** Medium -- LLM-based analysis quality depends on prompt engineering
+**Deliverables:**
+- Name detection in ContinuousSTT or TranscriptBuffer
+- Modified barge-in logic
+- Integration tests for interruption scenarios
+
+**Dependencies:** Phase D (pipeline must be working)
+**Risk:** Low -- name detection is string matching. Barge-in mechanism exists and works.
+
+### Phase F: Tuning + Polish
+
+Tune silence thresholds, Ollama prompt, backend selection heuristics. Add fallback behaviors (Ollama unavailable, GPU OOM, bad decisions). Harden edge cases.
+
+**Dependencies:** Phase D and E
+**Risk:** Medium -- tuning is iterative and requires real-world testing
 
 ## Anti-Patterns to Avoid
 
-### Anti-Pattern 1: LLM Classification in the Hot Path
+### Anti-Pattern 1: Running STT and Monitor on Every Audio Chunk
 
-**What:** Using Claude to classify input before selecting a quick response.
-**Why bad:** Claude CLI takes 1-3 seconds for even simple prompts. This would eliminate the entire benefit of quick responses (which exist to fill that wait time).
-**Instead:** Use pure-Python pattern matching. The classification does not need to be perfect -- it needs to be fast. A wrong quick response is better than silence, and the LLM response arrives within seconds anyway.
+**What:** Transcribing every 85ms audio chunk and evaluating every transcript.
+**Why bad:** Whisper inference on short audio is inaccurate and wasteful. Ollama at 200ms per call would be called 12x/second.
+**Instead:** Use VAD to gate STT (only transcribe when speech detected). Use silence detection to gate monitor (only evaluate when user stops talking).
 
-### Anti-Pattern 2: Shared Mutable State Between Session and Curator
+### Anti-Pattern 2: Sharing Whisper Model Between Continuous STT and Batch Operations
 
-**What:** Having the curator modify the library while a session is running.
-**Why bad:** Race conditions on `library.json` reads/writes. The in-memory index would go stale.
-**Instead:** Curator only writes when no session is active (post-session). Next session loads fresh state at startup. Same pattern as learner.py.
+**What:** Using the same `WhisperModel` instance for both continuous transcription and on-demand batch transcription (e.g., for dictation mode).
+**Why bad:** faster-whisper is not thread-safe for concurrent inference. Concurrent calls cause crashes or garbage output.
+**Instead:** The continuous STT owns its own model instance. If batch transcription is needed (dictation mode), either stop continuous STT or use a separate model instance.
 
-### Anti-Pattern 3: Over-Engineering the Classifier
+### Anti-Pattern 3: Making the Monitor Synchronous with the Input Stream
 
-**What:** Building an ML-based classifier for input categorization.
-**Why bad:** Adds model loading latency, dependency complexity, and the categories are simple enough for rules. The 15 categories above cover 90%+ of conversational inputs with regex + keyword matching.
-**Instead:** Start with rules. If classification quality is insufficient, add ML later (can swap the classifier implementation without changing the interface).
+**What:** Requiring the monitor to evaluate every transcript before the next one is produced.
+**Why bad:** If Ollama is slow (300ms+), transcript segments pile up. The monitor falls behind, decisions are stale.
+**Instead:** The monitor runs its own async loop at its own pace. It reads from the buffer, which is always up-to-date. If the monitor is slow, it simply evaluates a larger batch of segments on the next cycle.
 
-### Anti-Pattern 4: Replacing the Filler System Entirely
+### Anti-Pattern 4: Trying to Make Ollama Do Tool Calls
 
-**What:** Removing the existing `_pick_filler("acknowledgment")` fallback.
-**Why bad:** The response library starts empty/small. Without fallback, there would be silence for uncovered situations.
-**Instead:** Keep the existing acknowledgment pool as fallback. Quick responses are an upgrade layer, not a replacement.
+**What:** Adding MCP tool support to Ollama responses.
+**Why bad:** Ollama with Llama 3.2 3B has limited tool-calling reliability. The existing Claude CLI tool pipeline is battle-tested. Duplicating it for Ollama doubles complexity for minimal benefit.
+**Instead:** If the monitor decides tools are needed, it routes to Claude CLI. Ollama is for quick, tool-free responses only.
 
-### Anti-Pattern 5: Pre-Generating All Possible Responses
+### Anti-Pattern 5: Removing PTT Mode Entirely
 
-**What:** Trying to generate clips for every possible situation up front.
-**Why bad:** Combinatorial explosion. The strength of this system is that it learns which situations actually occur and generates clips for those.
-**Instead:** Start with a minimal seed library (greetings, thanks, common question acknowledgments). Let the curator grow it based on actual usage.
+**What:** Deleting all PTT code and making always-on the only mode.
+**Why bad:** Users may want PTT in noisy environments, shared spaces, or when privacy matters. Always-on is a new mode, not a replacement.
+**Instead:** Add always-on as a new `ai_mode` option (alongside existing "claude", "interview", "conversation"). PTT mode remains available as-is. Config drives which mode is active.
 
-## Summary of Changes by File
+### Anti-Pattern 6: Blocking on Ollama Before Playing Filler
 
-| File | Change Type | What Changes |
-|------|-------------|--------------|
-| `pipeline_frames.py` | MODIFY | Add `NON_SPEECH` to FrameType enum |
-| `live_session.py` | MODIFY | `_filler_manager()` uses classifier + library; `_llm_stage()` handles NON_SPEECH frames; `__init__()` instantiates classifier + library; STT stage emits NON_SPEECH frames; `_spawn_curator()` added; logging additions |
-| `input_classifier.py` | NEW | InputClassifier class, ClassifiedInput dataclass |
-| `response_library.py` | NEW | ResponseLibrary class, ResponseEntry dataclass, JSON persistence |
-| `library_curator.py` | NEW | Post-session daemon for library growth/pruning |
-| `audio/responses/library.json` | NEW | Response library index (seed + grows over time) |
-| `audio/responses/clips/` | NEW | Directory for response audio clips |
-| `clip_factory.py` | UNCHANGED | Continues managing acknowledgment fallback pool |
-| `learner.py` | UNCHANGED | Continues managing personality memories |
+**What:** Waiting for the monitor's Ollama decision before playing any audio feedback.
+**Why bad:** Adds 200-300ms of silence on top of the 2-second silence threshold. Total time from user-stops-speaking to any audio: ~2.5 seconds.
+**Instead:** The existing filler/response library should still fire on heuristic classification (fast path, <10ms). The monitor's decision gates the FULL response, not the filler. If the monitor decides "ignore," the filler may have already played -- that is acceptable (a brief "hmm" acknowledging the user is better than 2.5 seconds of silence followed by nothing).
+
+## Configuration Additions
+
+```json
+{
+  "ai_mode": "always_on",           // New mode alongside "claude", "interview", etc.
+  "monitor_model": "llama3.2:3b",   // Ollama model for monitoring
+  "response_model": "llama3.2:3b",  // Ollama model for quick responses
+  "wake_phrase": "russel",           // Name for interruption detection
+  "silence_threshold": 2.0,          // Seconds of silence before evaluating
+  "monitor_cooldown": 3.0,           // Seconds between monitor evaluations
+  "whisper_model": "distil-large-v3", // STT model (continuous mode)
+  "response_backend": "auto",        // "auto", "claude", "ollama"
+  "always_on_stt": true              // Enable continuous STT
+}
+```
+
+## Event Bus Additions
+
+New event types for v2.0 observability:
+
+| Event Type | Payload | Purpose |
+|------------|---------|---------|
+| `transcript_segment` | `{text, is_final, confidence, timestamp}` | Track continuous STT output |
+| `monitor_decision` | `{action, backend, confidence, reasoning}` | Track monitor decisions |
+| `response_routed` | `{backend, prompt_preview}` | Track which backend was selected |
+| `wake_phrase_detected` | `{phrase, timestamp}` | Track name-based interruptions |
+| `ollama_inference` | `{model, latency_ms, tokens}` | Track Ollama performance |
+
+## Open Questions
+
+1. **Whisper model choice needs empirical testing.** distil-large-v3 is recommended but VRAM usage with Ollama simultaneously loaded needs measurement. Might need to fall back to `small`.
+
+2. **Ollama decision quality at 3B.** Llama 3.2 3B may struggle with nuanced "respond vs ignore" decisions, especially distinguishing "user talking to AI" from "user talking to someone else." If this proves unreliable, a hybrid approach (heuristic fast path + Ollama only for ambiguous cases) should be tried.
+
+3. **Latency budget.** The 2-second silence threshold + 200ms Ollama decision = 2.2 seconds minimum from user-stops-speaking to response start. This is slower than PTT (~0.5s). LiveKit's research suggests transformer-based turn detection can reduce silence thresholds to 0.5-1.0 seconds, but that requires a specialized model. For v2.0, the 2-second threshold is the starting point.
+
+4. **GPU memory under sustained load.** Continuous Whisper + Ollama keep-alive both want GPU memory allocated permanently. Need to test whether CUDA allocator handles this gracefully or whether fragmentation causes OOM over long sessions.
+
+5. **Ollama Docker vs native.** Ollama is currently a Docker alias. Docker GPU passthrough may add latency. Worth testing native Ollama installation for comparison.
 
 ## Sources
 
-- **live_session.py** (read in full): Pipeline architecture, filler system, STT gating, barge-in logic, tool-use flow. Lines 559-574 (filler_manager), 1496-1564 (llm_stage), 1325-1492 (stt_stage).
-- **pipeline_frames.py** (read in full): Frame types and PipelineFrame dataclass.
-- **learner.py** (read in full): Daemon pattern for post-session processing.
-- **clip_factory.py** (read in full): Clip generation, quality evaluation, pool management.
-- **task_manager.py** (read in full): Subprocess management patterns.
-- **ack_pool.json** (read in full): Current clip metadata schema.
+- **Codebase analysis** (HIGH confidence): `live_session.py` (2900+ lines, read in full), `stream_composer.py`, `pipeline_frames.py`, `event_bus.py`, `input_classifier.py`, `learner.py`, `push-to-talk.py` (config), all read in full.
+- **WhisperLive / whisper_streaming** (MEDIUM confidence): [GitHub: collabora/WhisperLive](https://github.com/collabora/WhisperLive), [GitHub: ufal/whisper_streaming](https://github.com/ufal/whisper_streaming) -- rolling-window approach for continuous Whisper transcription.
+- **LiveKit turn detection** (MEDIUM confidence): [LiveKit blog: using a transformer for end-of-turn detection](https://blog.livekit.io/using-a-transformer-to-improve-end-of-turn-detection/) -- semantic endpointing with transformer model, <500MB RAM, runs on CPU. Potential future improvement for v2.1.
+- **Ollama structured outputs** (MEDIUM confidence): [Ollama docs: structured outputs](https://docs.ollama.com/capabilities/structured-outputs) -- JSON mode with Pydantic schema, confirmed for Llama 3.2.
+- **AssemblyAI voice agent stack** (LOW confidence): [AssemblyAI blog: voice AI stack](https://www.assemblyai.com/blog/the-voice-ai-stack-for-building-agents) -- streaming architecture patterns, immutable transcription concept.
+- **openWakeWord** (MEDIUM confidence): [GitHub: dscripka/openWakeWord](https://github.com/dscripka/openWakeWord) -- evaluated and rejected for v2.0 in favor of transcript-based name detection.
+- **GPU specs** (HIGH confidence): `nvidia-smi` on the development machine -- RTX 3070, 8192 MB VRAM.
+- **Ollama environment** (HIGH confidence): Ollama runs as Docker container via shell alias in user's `.zshrc`.
