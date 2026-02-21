@@ -5,15 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-02-21)
 
 **Core value:** An always-present AI that listens, understands context, and contributes when it has something useful to add
-**Current focus:** v2.0 Always-On Observer — Defining requirements
+**Current focus:** v2.0 Always-On Observer — Phase 12: Infrastructure + Safety Net
 
 ## Current Position
 
 Milestone: v2.0 Always-On Observer
-Phase: Not started (defining requirements)
+Phase: 12 of 16 (Infrastructure + Safety Net)
 Plan: —
-Status: Defining requirements
-Last activity: 2026-02-21 — Milestone v2.0 started
+Status: Ready to plan
+Last activity: 2026-02-21 — Roadmap created for v2.0 (phases 12-16)
+
+Progress: [░░░░░░░░░░] 0%
 
 ## Performance Metrics
 
@@ -30,26 +32,24 @@ Last activity: 2026-02-21 — Milestone v2.0 started
 
 Decisions are logged in PROJECT.md Key Decisions table.
 
-Carried forward from v1.1:
-- Pipeline architecture: 5-stage asyncio (audio_capture -> STT -> LLM -> TTS -> playback)
-- Local Whisper STT + Piper TTS
-- Acknowledgment phrase fillers (nonverbal clips don't work with Piper)
-- Barge-in via STT gating + VAD
-
 Carried forward from v1.2:
-- Heuristic pattern matching first (<1ms), model2vec semantic fallback second (5-10ms)
-- JSON-based response library (50-200 entries)
 - StreamComposer for unified audio queue with pre-buffering, cadence control, barge-in
+- Heuristic pattern matching first (<1ms), model2vec semantic fallback second (5-10ms)
 - Configurable idle timeout (0 = always-on)
 
 v2.0 milestone decisions:
 - Decouple inputs from LLM processing (independent input stream)
 - Ollama + Llama 3.2 3B for monitoring layer (free, local, ~200ms)
 - Configurable response backend (Claude CLI / Ollama), auto-selected
-- PTT replaced entirely by always-on listening
-- Name-based interruption ("hey Russel") replaces PTT-based barge-in trigger
-- Proactive AI participation (more aggressive — joins even casual conversations)
-- Library growth + non-speech awareness folded from v1.2 phases 10-11
+- Whisper distil-large-v3 for continuous STT (~1.5GB VRAM vs 3.5GB for large-v3)
+- PipeWire echo cancellation as primary feedback loop prevention
+- Start conservative (name-activation only), expand to proactive after validation
+
+### Research Flags
+
+- **Phase 12:** PipeWire AEC device selection needs 30-min spike on this machine
+- **Phase 12:** VRAM validation is go/no-go gate — measure before building anything else
+- **Phase 13:** Llama 3.2 3B decision quality unknown — benchmark 20-30 scenarios before committing
 
 ### Pending Todos
 
@@ -69,5 +69,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-21
-Stopped at: Milestone v2.0 initialized, defining requirements
+Stopped at: v2.0 roadmap created, ready to plan Phase 12
 Resume file: None

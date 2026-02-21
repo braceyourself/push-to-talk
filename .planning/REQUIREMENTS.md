@@ -89,39 +89,39 @@ Deferred to future milestones.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CSTR-01 | TBD | Pending |
-| CSTR-02 | TBD | Pending |
-| CSTR-03 | TBD | Pending |
-| CSTR-04 | TBD | Pending |
-| CSTR-05 | TBD | Pending |
-| MNTR-01 | TBD | Pending |
-| MNTR-02 | TBD | Pending |
-| MNTR-03 | TBD | Pending |
-| MNTR-04 | TBD | Pending |
-| MNTR-05 | TBD | Pending |
-| RESP-01 | TBD | Pending |
-| RESP-02 | TBD | Pending |
-| RESP-03 | TBD | Pending |
-| RESP-04 | TBD | Pending |
-| PRCT-01 | TBD | Pending |
-| PRCT-02 | TBD | Pending |
-| PRCT-03 | TBD | Pending |
-| PRCT-04 | TBD | Pending |
-| RSRC-01 | TBD | Pending |
-| RSRC-02 | TBD | Pending |
-| RSRC-03 | TBD | Pending |
-| RSRC-04 | TBD | Pending |
-| NSPL-01 | TBD | Pending |
-| NSPL-02 | TBD | Pending |
-| NSPL-03 | TBD | Pending |
-| SPKR-01 | TBD | Pending |
-| SPKR-02 | TBD | Pending |
+| CSTR-01 | Phase 12 | Pending |
+| CSTR-02 | Phase 12 | Pending |
+| CSTR-03 | Phase 12 | Pending |
+| CSTR-04 | Phase 13 | Pending |
+| CSTR-05 | Phase 12 | Pending |
+| MNTR-01 | Phase 13 | Pending |
+| MNTR-02 | Phase 13 | Pending |
+| MNTR-03 | Phase 14 | Pending |
+| MNTR-04 | Phase 13 | Pending |
+| MNTR-05 | Phase 13 | Pending |
+| RESP-01 | Phase 14 | Pending |
+| RESP-02 | Phase 14 | Pending |
+| RESP-03 | Phase 14 | Pending |
+| RESP-04 | Phase 14 | Pending |
+| PRCT-01 | Phase 15 | Pending |
+| PRCT-02 | Phase 15 | Pending |
+| PRCT-03 | Phase 15 | Pending |
+| PRCT-04 | Phase 15 | Pending |
+| RSRC-01 | Phase 14 | Pending |
+| RSRC-02 | Phase 12 | Pending |
+| RSRC-03 | Phase 12 | Pending |
+| RSRC-04 | Phase 14 | Pending |
+| NSPL-01 | Phase 16 | Pending |
+| NSPL-02 | Phase 16 | Pending |
+| NSPL-03 | Phase 16 | Pending |
+| SPKR-01 | Phase 16 | Pending |
+| SPKR-02 | Phase 16 | Pending |
 
 **Coverage:**
 - v2.0 requirements: 27 total
-- Mapped to phases: 0 (awaiting roadmap)
-- Unmapped: 27
+- Mapped to phases: 27
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-02-21*
-*Last updated: 2026-02-21 after initial definition*
+*Last updated: 2026-02-21 after roadmap creation*
