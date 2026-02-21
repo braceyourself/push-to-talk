@@ -2,11 +2,11 @@
 
 ## What This Is
 
-A Linux desktop tool providing global hotkey-driven voice input with multiple AI modes. The flagship "live" mode runs a real-time voice conversation with Claude via a 5-stage asyncio pipeline (audio capture → Whisper STT → Claude CLI → Piper TTS → playback). It can spawn and manage background Claude CLI tasks, learn from conversations, and display status through a floating overlay. Other modes include dictation, interview, and conversation with full tool access.
+A Linux desktop AI voice assistant with always-on listening. The AI continuously monitors ambient audio via local Whisper STT, uses a local LLM (Ollama) to decide when to engage, and responds through configurable backends (Claude CLI for deep work, Ollama for quick responses). It proactively participates in conversations, answers questions, and assists with tasks — like having a knowledgeable colleague in the room. Also supports dictation, interview, and conversation modes.
 
 ## Core Value
 
-Natural, low-friction voice conversation with Claude that feels like talking to a person — fast recognition, intelligent responses, no jarring artifacts.
+An always-present AI that listens, understands context, and contributes when it has something useful to add — without requiring explicit activation.
 
 ## Completed Milestone: v1.1 Voice UX Polish ✓
 
@@ -14,20 +14,26 @@ Natural, low-friction voice conversation with Claude that feels like talking to 
 
 **Status:** All 15 requirements satisfied, 4/4 phases passed. Audit passed 2026-02-18.
 
-## Current Milestone: v1.2 Adaptive Quick Responses
+## Completed Milestone: v1.2 Adaptive Quick Responses (Partial) ✓
 
-**Goal:** Replace the dumb filler system with an AI-driven quick response library that learns what to say based on context — making the assistant feel socially aware, not just technically capable.
+**Goal:** Replace the dumb filler system with an AI-driven quick response library that learns what to say based on context.
 
-**Core idea:** The AI builds and maintains a library of situational quick responses (situation → pre-generated audio clip). When input arrives, the system instantly matches it to the right response and plays it while the full LLM response processes in the background.
+**Status:** Phases 8-9 completed (classifier + response library + semantic matching + StreamComposer). Phases 10-11 (library growth, non-speech) folded into v2.0.
+
+## Current Milestone: v2.0 Always-On Observer
+
+**Goal:** Transform from push-to-talk to always-on listening with the LLM as an autonomous observer that decides when and how to respond.
+
+**Core idea:** Decouple input capture from LLM processing. Audio capture and STT run continuously as an independent stream. A local LLM (Ollama + Llama 3.2 3B) monitors this stream, builds context, and decides when the AI should respond. Response generation uses a configurable backend — Claude CLI for complex work, Ollama for quick responses — chosen automatically based on conditions (network, latency, complexity).
 
 **Target features:**
-- Quick response library: growing cache of (situation → audio clip) pairs
-- AI-chosen responses: the AI decides what phrases to use, not random selection
-- Context-aware matching: classify input instantly and match to appropriate response
-- Non-speech awareness: cough → "excuse you", sigh → empathetic response, etc.
-- Library growth: after sessions, identify uncovered situations and generate new phrases
-- Library pruning: phase out phrases that feel unnatural over time
-- Always processing: no perceptible gate/delay, background pipeline feels seamless
+- Always-on mic with continuous Whisper STT (no PTT activation)
+- Local LLM monitoring layer (Ollama) that decides when to respond
+- Configurable response backend (Claude CLI / Ollama) — system picks based on conditions
+- Name-based interruption ("hey Russel") to cut the AI off mid-response
+- Proactive participation — AI joins conversations when it has something to add
+- Library growth (from v1.2): post-session curator expands quick response library
+- Non-speech awareness (from v1.2): coughs, sighs, laughter get contextual responses
 
 ## Requirements
 
@@ -46,32 +52,42 @@ Natural, low-friction voice conversation with Claude that feels like talking to 
 - ✓ Multi-layer STT filtering (no_speech_prob, logprob, compression ratio) — v1.1
 - ✓ Tool-use speech suppression (only final response spoken) — v1.1
 - ✓ Dynamic overlay (tool intent labels, history coalescing, STT rejection flash) — v1.1
+- ✓ Heuristic + semantic input classification (<10ms) — v1.2
+- ✓ Categorized quick response library with situation → audio clip mapping — v1.2
+- ✓ StreamComposer for unified audio queue with pre-buffering and cadence control — v1.2
+- ✓ Configurable idle timeout (0 = always-on) — v1.2
 
 ### Active
 
-- [ ] Quick response library with situation → audio clip mapping
-- [ ] AI-driven phrase selection based on input context
+- [ ] Always-on continuous listening (no PTT activation required)
+- [ ] Independent input stream (audio capture + STT decoupled from LLM)
+- [ ] Local LLM monitoring layer (Ollama + Llama 3.2 3B) decides when to respond
+- [ ] Configurable response backend (Claude CLI / Ollama), auto-selected by conditions
+- [ ] Name-based interruption ("hey Russel") to cut AI off mid-response
+- [ ] Proactive AI participation in conversations
+- [ ] Post-session library growth via curator daemon
 - [ ] Non-speech event awareness (coughs, sighs, laughter → appropriate responses)
-- [ ] Background library growth and pruning across sessions
-- [ ] Seamless background processing — no perceptible filler gate
 
 ### Out of Scope
 
 - OpenAI TTS (sticking with local Piper for now) — latency vs quality tradeoff, revisit later
-- Always-on listening without PTT — privacy, CPU, false positives
 - Visual task dashboard — voice-first tool
 - Persistent tasks across sessions — each session starts fresh
+- Cloud STT — local Whisper is sufficient and free
+- Wake word detection hardware — using software-based name recognition instead
 
 ## Context
 
-The live mode evolved from the original OpenAI Realtime API plan into a Claude CLI-based pipeline using local Whisper for STT and Piper for TTS. v1.1 added barge-in (VAD-based, STT gating instead of mic mute), multi-layer STT filtering, tool-use speech suppression, and acknowledgment phrase fillers. The current filler system picks random clips from a pool — it doesn't understand context, so task-oriented phrases ("let me take a look") play even for simple conversational questions ("what's your name?"). v1.2 replaces this with an AI-driven quick response system that understands what's happening and responds appropriately, including to non-speech events like coughs.
+v1.0-v1.2 built a solid PTT-gated voice pipeline. The architecture proved that local-first (Whisper STT, Piper TTS, Claude CLI) works well. v1.2 added intelligent input classification and a StreamComposer for unified audio handling. But the fundamental model — user pushes a button, speaks, releases, AI responds — is reactive. v2.0 inverts this: the AI is always listening, building context from everything it hears, and contributing proactively. This requires decoupling the input stream from LLM processing, adding a local monitoring layer (Ollama), and making the response backend configurable so the system can respond quickly (Ollama) or deeply (Claude) depending on what's needed.
 
 ## Constraints
 
 - **Platform**: Linux X11 with PipeWire — no cross-platform concerns
-- **Architecture**: 5-stage asyncio pipeline in `live_session.py`, GTK overlay in `indicator.py`
-- **TTS**: Piper local (22050Hz → 24000Hz resampling), fillers also via Piper
-- **STT**: Local Whisper "small" model, blocking transcription in executor
+- **Architecture**: Evolving from 5-stage sequential pipeline to decoupled input stream + LLM observer
+- **TTS**: Piper local (22050Hz → 24000Hz resampling)
+- **STT**: Local Whisper "small" model, continuous operation
+- **Monitoring LLM**: Ollama + Llama 3.2 3B (local, free, ~200ms inference)
+- **Response LLM**: Configurable — Claude CLI or Ollama, auto-selected
 
 ## Key Decisions
 
@@ -82,7 +98,11 @@ The live mode evolved from the original OpenAI Realtime API plan into a Claude C
 | Acknowledgment phrase fillers | Non-verbal (hums) failed with Piper TTS; verbal acknowledgments work well | ✓ Good |
 | Filler clip factory subprocess | Generate varied clips, rotate pool, evaluate naturalness | ✓ Good |
 | Gate STT for barge-in instead of mic mute | Mic must stay live for VAD to detect speech during playback | ✓ Good |
-| AI-driven quick response library | Dumb random fillers sound wrong in context; AI should choose what to say | — v1.2 |
+| AI-driven quick response library | Dumb random fillers sound wrong in context; AI should choose what to say | ✓ Good (v1.2) |
+| Decouple inputs from LLM processing | PTT-gated sequential pipeline prevents always-on and proactive participation | — v2.0 |
+| Ollama for monitoring layer | Free, local, ~200ms, fits local-first philosophy. Haiku comparable but costs money and needs network | — v2.0 |
+| Configurable response backend | System picks Claude or Ollama based on network, latency, complexity. Self-healing when network drops | — v2.0 |
+| PTT replaced by always-on | Always-on with name-based interruption. No more push-to-talk activation | — v2.0 |
 
 ---
-*Last updated: 2026-02-18 after v1.2 milestone started*
+*Last updated: 2026-02-21 after v2.0 milestone started*
