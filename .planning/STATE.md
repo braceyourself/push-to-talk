@@ -11,20 +11,18 @@ See: .planning/PROJECT.md (updated 2026-02-21)
 
 Milestone: v2.0 Always-On Observer
 Phase: 12 of 16 (Infrastructure + Safety Net)
-Plan: —
-Status: Ready to plan
-Last activity: 2026-02-21 — Roadmap created for v2.0 (phases 12-16)
+Plan: 1 of 3 (awaiting checkpoint approval)
+Status: In progress
+Last activity: 2026-02-21 — Completed 12-01-PLAN.md (VRAM validation, VRAMMonitor, PipeWire AEC)
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [█░░░░░░░░░] ~3% (1 of ~30 total plans, pending checkpoint)
 
 ## Performance Metrics
 
-**Velocity (v1.2):**
-- Total plans completed: 5
-- Average duration: 3.6min
-- Total execution time: 18min
-
-*Reset for v2.0 after first plan completes*
+**Velocity (v2.0):**
+- Total plans completed: 1 (pending checkpoint)
+- Average duration: 11min
+- Total execution time: 11min
 
 ## Accumulated Context
 
@@ -45,10 +43,15 @@ v2.0 milestone decisions:
 - PipeWire echo cancellation as primary feedback loop prevention
 - Start conservative (name-activation only), expand to proactive after validation
 
+Phase 12-01 decisions:
+- VRAM GO: Whisper+Ollama concurrent peak 5421MB (66%) leaves 2771MB headroom on RTX 3070
+- AEC device name: "Echo Cancellation Source" (with spaces) for pasimple device_name param
+- VRAMMonitor uses factory method create() returning None for graceful GPU-less operation
+
 ### Research Flags
 
-- **Phase 12:** PipeWire AEC device selection needs 30-min spike on this machine
-- **Phase 12:** VRAM validation is go/no-go gate — measure before building anything else
+- **Phase 12:** ~~PipeWire AEC device selection needs 30-min spike on this machine~~ DONE: "Echo Cancellation Source"
+- **Phase 12:** ~~VRAM validation is go/no-go gate~~ DONE: GO (5421MB peak, 2771MB headroom)
 - **Phase 13:** Llama 3.2 3B decision quality unknown — benchmark 20-30 scenarios before committing
 
 ### Pending Todos
@@ -69,5 +72,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-21
-Stopped at: v2.0 roadmap created, ready to plan Phase 12
+Stopped at: Completed 12-01-PLAN.md, awaiting checkpoint approval
 Resume file: None
