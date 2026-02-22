@@ -64,6 +64,9 @@ class ContinuousSTT:
 
         self._running = False
         self._stop_event = threading.Event()
+        self._playing_audio = False  # Set by LiveSession during TTS playback
+        self._playback_end_time = 0.0  # Cooldown after TTS ends
+        self._PLAYBACK_COOLDOWN = 0.5  # Seconds to wait after TTS before processing
 
         # Audio queue for capture thread -> processing loop
         self._audio_q = asyncio.Queue(maxsize=200)
@@ -288,6 +291,17 @@ class ContinuousSTT:
         self._running = False
         self._stop_event.set()
 
+    def set_playing_audio(self, playing):
+        """Called by LiveSession when TTS playback starts/stops.
+
+        When playing, audio chunks are discarded to prevent transcribing
+        the AI's own speech. A brief cooldown after playback ends avoids
+        catching the tail end of TTS output.
+        """
+        self._playing_audio = playing
+        if not playing:
+            self._playback_end_time = time.time()
+
     def _capture_thread(self, device_name, loop):
         """Record audio in a daemon thread, push to async queue."""
         import pasimple
@@ -340,6 +354,14 @@ class ContinuousSTT:
 
     def _process_chunk(self, audio_data):
         """Process a single audio chunk through VAD and manage speech buffer."""
+        # Suppress during TTS playback + cooldown to avoid transcribing AI speech
+        if self._playing_audio:
+            self._reset_buffer()
+            return
+        if time.time() - self._playback_end_time < self._PLAYBACK_COOLDOWN:
+            self._reset_buffer()
+            return
+
         vad_prob = self._run_vad(audio_data)
 
         if vad_prob > VAD_THRESHOLD:
