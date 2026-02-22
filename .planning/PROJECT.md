@@ -20,15 +20,18 @@ An always-present AI that listens, understands context, and contributes when it 
 
 **Status:** Phases 8-9 completed (classifier + response library + semantic matching + StreamComposer). Phases 10-11 (library growth, non-speech) folded into v2.0.
 
-## Current Milestone: v2.0 Always-On Observer
+## Current Milestone: v2.0 Always-On Observer (Refreshed)
 
 **Goal:** Transform from push-to-talk to always-on listening with the LLM as an autonomous observer that decides when and how to respond.
 
-**Core idea:** Decouple input capture from LLM processing. Audio capture and STT run continuously as an independent stream. A local LLM (Ollama + Llama 3.2 3B) monitors this stream, builds context, and decides when the AI should respond. Response generation uses a configurable backend — Claude CLI for complex work, Ollama for quick responses — chosen automatically based on conditions (network, latency, complexity).
+**Core idea:** Hybrid cloud+local architecture. Silero VAD gates audio locally (free, <1ms). Speech segments stream to Deepgram Nova-3 for real-time transcription (~150ms latency, ~$0.08/hr). A local decision model monitors the transcript stream and decides when to respond. Response generation uses a configurable backend — Claude CLI for complex work, Ollama for quick responses — chosen automatically based on conditions.
+
+**Architectural pivot (2026-02-22):** Original v2.0 plan used local Whisper distil-large-v3 for STT. Testing revealed batch-transcribe latency (850ms silence gap + 500ms-2s Whisper inference) was too slow for natural conversational awareness. Switched to Deepgram streaming STT for near-real-time word-level results. This frees ~1.5GB GPU VRAM previously reserved for Whisper, allowing a larger/better local decision model.
 
 **Target features:**
-- Always-on mic with continuous Whisper STT (no PTT activation)
-- Local LLM monitoring layer (Ollama) that decides when to respond
+- Always-on mic with Deepgram streaming STT (no PTT activation)
+- Local VAD cost gate (Silero) — only stream speech to Deepgram
+- Local decision model that monitors transcript stream and decides when to respond
 - Configurable response backend (Claude CLI / Ollama) — system picks based on conditions
 - Name-based interruption ("hey Russel") to cut the AI off mid-response
 - Proactive participation — AI joins conversations when it has something to add
@@ -59,9 +62,10 @@ An always-present AI that listens, understands context, and contributes when it 
 
 ### Active
 
-- [ ] Always-on continuous listening (no PTT activation required)
+- [ ] Always-on continuous listening via Deepgram streaming STT (no PTT activation required)
+- [ ] Local VAD cost gate — Silero VAD gates what reaches Deepgram (saves API cost)
 - [ ] Independent input stream (audio capture + STT decoupled from LLM)
-- [ ] Local LLM monitoring layer (Ollama + Llama 3.2 3B) decides when to respond
+- [ ] Local decision model monitors transcript stream and decides when to respond
 - [ ] Configurable response backend (Claude CLI / Ollama), auto-selected by conditions
 - [ ] Name-based interruption ("hey Russel") to cut AI off mid-response
 - [ ] Proactive AI participation in conversations
@@ -73,7 +77,7 @@ An always-present AI that listens, understands context, and contributes when it 
 - OpenAI TTS (sticking with local Piper for now) — latency vs quality tradeoff, revisit later
 - Visual task dashboard — voice-first tool
 - Persistent tasks across sessions — each session starts fresh
-- Cloud STT — local Whisper is sufficient and free
+- Fully local STT — Deepgram streaming provides better latency than local Whisper for always-on use
 - Wake word detection hardware — using software-based name recognition instead
 
 ## Context
@@ -85,8 +89,8 @@ v1.0-v1.2 built a solid PTT-gated voice pipeline. The architecture proved that l
 - **Platform**: Linux X11 with PipeWire — no cross-platform concerns
 - **Architecture**: Evolving from 5-stage sequential pipeline to decoupled input stream + LLM observer
 - **TTS**: Piper local (22050Hz → 24000Hz resampling)
-- **STT**: Local Whisper "small" model, continuous operation
-- **Monitoring LLM**: Ollama + Llama 3.2 3B (local, free, ~200ms inference)
+- **STT**: Deepgram Nova-3 streaming (~$0.08/hr, ~150ms latency) with local Silero VAD cost gate
+- **Decision Model**: Local (TBD — more VRAM available now that Whisper is off GPU)
 - **Response LLM**: Configurable — Claude CLI or Ollama, auto-selected
 
 ## Key Decisions
@@ -103,6 +107,8 @@ v1.0-v1.2 built a solid PTT-gated voice pipeline. The architecture proved that l
 | Ollama for monitoring layer | Free, local, ~200ms, fits local-first philosophy. Haiku comparable but costs money and needs network | — v2.0 |
 | Configurable response backend | System picks Claude or Ollama based on network, latency, complexity. Self-healing when network drops | — v2.0 |
 | PTT replaced by always-on | Always-on with name-based interruption. No more push-to-talk activation | — v2.0 |
+| Deepgram streaming over local Whisper | Local Whisper batch-transcribe adds 1.5-3s latency (silence gap + inference). Deepgram streaming gives ~150ms word-level results. Cost (~$0.08/hr) is trivial for personal use. Frees ~1.5GB VRAM. | — v2.0 |
+| Hybrid cloud+local architecture | VAD local (free), STT cloud (cheap, fast), decision model local (private), response backend configurable | — v2.0 |
 
 ---
-*Last updated: 2026-02-21 after v2.0 milestone started*
+*Last updated: 2026-02-22 after v2.0 architectural pivot (Deepgram streaming + local decision model)*

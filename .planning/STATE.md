@@ -2,27 +2,27 @@
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-02-21)
+See: .planning/PROJECT.md (updated 2026-02-22)
 
 **Core value:** An always-present AI that listens, understands context, and contributes when it has something useful to add
-**Current focus:** v2.0 Always-On Observer — Phase 12: Infrastructure + Safety Net
+**Current focus:** v2.0 Always-On Observer (Refreshed) — Defining requirements
 
 ## Current Position
 
-Milestone: v2.0 Always-On Observer
-Phase: 12 of 16 (Infrastructure + Safety Net)
-Plan: 2 of 3
-Status: In progress
-Last activity: 2026-02-21 — Completed 12-02-PLAN.md (TranscriptBuffer, hallucination filter)
+Milestone: v2.0 Always-On Observer (Refreshed)
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-02-22 — Architectural pivot: Deepgram streaming STT + local decision model
 
-Progress: [██░░░░░░░░] ~7% (2 of ~30 total plans)
+Progress: [░░░░░░░░░░] 0%
 
 ## Performance Metrics
 
 **Velocity (v2.0):**
-- Total plans completed: 2
-- Average duration: 8min
-- Total execution time: 16min
+- Total plans completed: 0 (reset after pivot)
+- Average duration: —
+- Total execution time: —
 
 ## Accumulated Context
 
@@ -35,29 +35,29 @@ Carried forward from v1.2:
 - Heuristic pattern matching first (<1ms), model2vec semantic fallback second (5-10ms)
 - Configurable idle timeout (0 = always-on)
 
-v2.0 milestone decisions:
+v2.0 milestone decisions (original, still valid):
 - Decouple inputs from LLM processing (independent input stream)
-- Ollama + Llama 3.2 3B for monitoring layer (free, local, ~200ms)
 - Configurable response backend (Claude CLI / Ollama), auto-selected
-- Whisper distil-large-v3 for continuous STT (~1.5GB VRAM vs 3.5GB for large-v3)
 - PipeWire echo cancellation as primary feedback loop prevention
 - Start conservative (name-activation only), expand to proactive after validation
 
-Phase 12-01 decisions:
-- VRAM GO: Whisper+Ollama concurrent peak 5421MB (66%) leaves 2771MB headroom on RTX 3070
-- AEC device name: "Echo Cancellation Source" (with spaces) for pasimple device_name param
-- VRAMMonitor uses factory method create() returning None for graceful GPU-less operation
+v2.0 architectural pivot (2026-02-22):
+- Deepgram Nova-3 streaming replaces local Whisper (~150ms vs 1.5-3s latency)
+- Silero VAD stays as local cost gate (only stream speech segments to Deepgram)
+- Local decision model for "should I respond?" (more VRAM available with Whisper off GPU)
+- TranscriptBuffer stays (already built and committed)
+- VRAMMonitor stays (already built and committed)
+- ContinuousSTT module replaced by Deepgram streaming integration
 
-Phase 12-02 decisions:
-- get_context() always returns at least one segment even if it exceeds token budget
-- 46 hallucination phrases (18 existing + 28 research-backed from arXiv 2501.11378)
-- TranscriptSegment is frozen (immutable) for thread safety
+### Artifacts retained from original Phase 12:
+- `transcript_buffer.py` — TranscriptSegment, TranscriptBuffer, is_hallucination() (committed: 4bb48ff)
+- `vram_monitor.py` — VRAMMonitor with NVML (committed: 1f7c396)
+- `~/.config/pipewire/pipewire.conf.d/echo-cancel.conf` — PipeWire AEC (committed: 1f7c396)
 
 ### Research Flags
 
-- **Phase 12:** ~~PipeWire AEC device selection needs 30-min spike on this machine~~ DONE: "Echo Cancellation Source"
-- **Phase 12:** ~~VRAM validation is go/no-go gate~~ DONE: GO (5421MB peak, 2771MB headroom)
-- **Phase 13:** Llama 3.2 3B decision quality unknown — benchmark 20-30 scenarios before committing
+- **Decision model quality:** Which local model works best for respond/wait/ignore classification? Benchmark needed.
+- **Deepgram SDK integration:** WebSocket streaming, KeepAlive patterns, error handling, reconnection.
 
 ### Pending Todos
 
@@ -76,6 +76,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-02-21
-Stopped at: Completed 12-02-PLAN.md
+Last session: 2026-02-22
+Stopped at: Architectural pivot, spawning researchers
 Resume file: None
