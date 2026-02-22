@@ -2993,6 +2993,190 @@ def test_cstt_model_name():
 
 
 # ══════════════════════════════════════════════════════════════════
+# Test Group 29: DeepgramSTT Integration in LiveSession
+# ══════════════════════════════════════════════════════════════════
+
+@test("DeepgramSTT: live_session imports DeepgramSTT (not ContinuousSTT)")
+def test_deepgram_import():
+    """live_session.py imports DeepgramSTT, not ContinuousSTT."""
+    import live_session
+    assert hasattr(live_session, 'DeepgramSTT'), "DeepgramSTT should be imported in live_session"
+    # ContinuousSTT should not be imported
+    assert not hasattr(live_session, 'ContinuousSTT'), "ContinuousSTT should NOT be imported in live_session"
+
+
+@test("DeepgramSTT: LiveSession.__init__ has _deepgram_stt and _deepgram_transcript_q")
+def test_deepgram_init_attrs():
+    """LiveSession should have _deepgram_stt and _deepgram_transcript_q attributes."""
+    session = make_session()
+    assert hasattr(session, '_deepgram_stt'), "Missing _deepgram_stt attribute"
+    assert hasattr(session, '_deepgram_transcript_q'), "Missing _deepgram_transcript_q attribute"
+    assert session._deepgram_stt is None, "_deepgram_stt should be None before run()"
+    assert session._deepgram_transcript_q is None, "_deepgram_transcript_q should be None before run()"
+
+
+@test("DeepgramSTT: _stt_stage consumes from _deepgram_transcript_q")
+async def test_stt_stage_deepgram_consumer():
+    """The new _stt_stage reads TranscriptSegments from _deepgram_transcript_q."""
+    from transcript_buffer import TranscriptSegment
+
+    session = make_session()
+    session.running = True
+    session._stt_out_q = asyncio.Queue(maxsize=50)
+    session._stt_flush_event = asyncio.Event()
+    session._deepgram_transcript_q = asyncio.Queue(maxsize=50)
+    session.generation_id = 0
+    session._bus = None
+
+    # Put a transcript segment into the queue
+    segment = TranscriptSegment(text="Hello from Deepgram", timestamp=time.time(), source="user")
+    await session._deepgram_transcript_q.put(segment)
+
+    # Run _stt_stage for a brief time, then stop
+    async def run_stt_briefly():
+        task = asyncio.create_task(session._stt_stage())
+        await asyncio.sleep(0.2)
+        session.running = False
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    await run_stt_briefly()
+
+    # Should have emitted END_OF_UTTERANCE + TRANSCRIPT
+    frames = []
+    while not session._stt_out_q.empty():
+        frames.append(session._stt_out_q.get_nowait())
+
+    eou = [f for f in frames if f.type == FrameType.END_OF_UTTERANCE]
+    transcripts = [f for f in frames if f.type == FrameType.TRANSCRIPT]
+    assert len(eou) == 1, f"Expected 1 END_OF_UTTERANCE, got {len(eou)}"
+    assert len(transcripts) == 1, f"Expected 1 TRANSCRIPT, got {len(transcripts)}"
+    assert transcripts[0].data == "Hello from Deepgram"
+
+
+@test("DeepgramSTT: _stt_stage suppresses during mute")
+async def test_stt_stage_mute_suppression():
+    """When muted, _stt_stage should discard incoming segments."""
+    from transcript_buffer import TranscriptSegment
+
+    session = make_session()
+    session.running = True
+    session.muted = True  # Muted
+    session._stt_out_q = asyncio.Queue(maxsize=50)
+    session._stt_flush_event = asyncio.Event()
+    session._deepgram_transcript_q = asyncio.Queue(maxsize=50)
+    session.generation_id = 0
+    session._bus = None
+
+    segment = TranscriptSegment(text="Should be dropped", timestamp=time.time(), source="user")
+    await session._deepgram_transcript_q.put(segment)
+
+    async def run_stt_briefly():
+        task = asyncio.create_task(session._stt_stage())
+        await asyncio.sleep(0.2)
+        session.running = False
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    await run_stt_briefly()
+
+    # Should NOT have emitted anything
+    assert session._stt_out_q.empty(), "Muted: no frames should be emitted"
+
+
+@test("DeepgramSTT: _stt_stage suppresses during STT gating")
+async def test_stt_stage_gated_suppression():
+    """When _stt_gated, _stt_stage should discard incoming segments."""
+    from transcript_buffer import TranscriptSegment
+
+    session = make_session()
+    session.running = True
+    session._stt_gated = True
+    session._stt_out_q = asyncio.Queue(maxsize=50)
+    session._stt_flush_event = asyncio.Event()
+    session._deepgram_transcript_q = asyncio.Queue(maxsize=50)
+    session.generation_id = 0
+    session._bus = None
+
+    segment = TranscriptSegment(text="Should be dropped during gating", timestamp=time.time(), source="user")
+    await session._deepgram_transcript_q.put(segment)
+
+    async def run_stt_briefly():
+        task = asyncio.create_task(session._stt_stage())
+        await asyncio.sleep(0.2)
+        session.running = False
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    await run_stt_briefly()
+
+    assert session._stt_out_q.empty(), "Gated: no frames should be emitted"
+    assert session._was_stt_gated == True, "_was_stt_gated should be set during gating"
+
+
+@test("DeepgramSTT: _on_deepgram_unavailable exists and emits event")
+def test_deepgram_unavailable_handler():
+    """_on_deepgram_unavailable should exist and emit stt_fallback event."""
+    session = make_session()
+    assert hasattr(session, '_on_deepgram_unavailable'), "Missing _on_deepgram_unavailable method"
+    assert callable(session._on_deepgram_unavailable), "_on_deepgram_unavailable should be callable"
+
+
+@test("DeepgramSTT: _barge_in_vad_stage drains _audio_in_q")
+async def test_barge_in_vad_drains_queue():
+    """_barge_in_vad_stage should consume frames from _audio_in_q."""
+    session = make_session()
+    session.running = True
+    session._audio_in_q = asyncio.Queue(maxsize=100)
+    session._stt_gated = False  # Not gated, so VAD not active but queue still drained
+
+    # Put some audio frames
+    for _ in range(5):
+        await session._audio_in_q.put(PipelineFrame(
+            type=FrameType.AUDIO_RAW, generation_id=0, data=b'\x00' * 4096
+        ))
+
+    async def run_vad_briefly():
+        task = asyncio.create_task(session._barge_in_vad_stage())
+        await asyncio.sleep(0.3)
+        session.running = False
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    await run_vad_briefly()
+
+    assert session._audio_in_q.empty(), f"Queue should be drained, but has {session._audio_in_q.qsize()} frames"
+
+
+@test("DeepgramSTT: stop() calls _deepgram_stt.stop()")
+def test_stop_calls_deepgram_stop():
+    """stop() should call _deepgram_stt.stop() when _deepgram_stt is set."""
+    session = make_session()
+    mock_stt = MagicMock()
+    session._deepgram_stt = mock_stt
+
+    session.stop()
+
+    mock_stt.stop.assert_called_once()
+
+
+# ══════════════════════════════════════════════════════════════════
 # Run all tests
 # ══════════════════════════════════════════════════════════════════
 

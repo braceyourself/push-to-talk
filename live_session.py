@@ -2192,213 +2192,118 @@ class LiveSession:
 
         print(f"Live session: Audio capture stopped ({chunks_sent} chunks, {restarts} restarts)", flush=True)
 
-    # ── Pipeline Stage 2: STT (Whisper local) ───────────────────
+    # ── Pipeline Stage 2: STT (Deepgram streaming) ──────────────
 
     async def _stt_stage(self):
-        """Accumulate audio, detect silence, transcribe with Whisper."""
-        import numpy as np
+        """Consume DeepgramSTT transcripts and emit pipeline frames.
 
-        print("STT: Using local Whisper", flush=True)
-        audio_buffer = bytearray()
-        SILENCE_THRESHOLD = 150  # RMS below this = silence (ambient noise ~20-100)
-        SILENCE_DURATION_NORMAL = 0.8     # seconds of silence to trigger transcription
-        SILENCE_DURATION_POST_BARGE = 0.4 # Faster response after interruption
-        SPEECH_ENERGY_MIN = 200  # Per-chunk RMS to flag speech (well above ambient)
-        SPEECH_CHUNKS_MIN = 3    # Need ~255ms of speech-level audio
-        MIN_BUFFER_SECONDS = 0.5 # Minimum buffer length to transcribe
-        MAX_BUFFER_SECONDS = 10  # Safety cap: force transcription after this long
-        # Whisper hallucinates these on silence/noise — reject them
-        HALLUCINATION_PHRASES = {
-            "thank you", "thanks for watching", "thanks for listening",
-            "thank you for watching", "thanks for your time",
-            "goodbye", "bye", "you", "the end", "to", "so",
-            "please subscribe", "like and subscribe", "i'm sorry",
-            "hmm", "uh", "um", "oh",
-        }
+        Reads TranscriptSegment objects from _deepgram_transcript_q (populated
+        by DeepgramSTT callbacks). Emits END_OF_UTTERANCE + TRANSCRIPT frames
+        into _stt_out_q for the LLM stage.
 
-        silence_start = None
-        has_speech = False  # True if enough chunks exceeded SPEECH_ENERGY_MIN
-        speech_chunk_count = 0  # Number of chunks exceeding SPEECH_ENERGY_MIN
-        peak_rms = 0.0  # Track peak for debugging
+        Handles:
+        - _stt_gated: suppress during playback (barge-in VAD runs in separate stage)
+        - muted: suppress when user mutes
+        - _stt_flush_event: immediate flush on mute toggle
+        - generation_id: tag frames for interrupt coherence
+        """
+        print("STT: Using Deepgram streaming", flush=True)
 
-        def _is_hallucination(text):
-            return text.lower().strip().rstrip('.!?') in HALLUCINATION_PHRASES
+        try:
+            while self.running:
+                try:
+                    segment = await asyncio.wait_for(
+                        self._deepgram_transcript_q.get(), timeout=0.5
+                    )
+                except asyncio.TimeoutError:
+                    # Check flush event during idle
+                    if self._stt_flush_event and self._stt_flush_event.is_set():
+                        self._stt_flush_event.clear()
+                        # Deepgram handles flushing automatically via speech_final
+                        # No local buffer to flush -- just clear the event
+                    continue
 
+                # Gate checks
+                if self.muted:
+                    continue
+                if self._stt_gated:
+                    self._was_stt_gated = True
+                    continue
+
+                # Gated -> ungated transition (same logic as before)
+                if self._was_stt_gated:
+                    self._was_stt_gated = False
+                    # Discard any segments that arrived during gating
+                    # (they are from AI's own speech or post-echo)
+                    continue
+
+                transcript = segment.text
+                self._emit_event("stt_complete", text=transcript[:60],
+                                 latency_ms=0, rejected=False)
+                print(f"STT [deepgram]: {transcript}", flush=True)
+
+                await self._stt_out_q.put(PipelineFrame(
+                    type=FrameType.END_OF_UTTERANCE,
+                    generation_id=self.generation_id
+                ))
+                await self._stt_out_q.put(PipelineFrame(
+                    type=FrameType.TRANSCRIPT,
+                    generation_id=self.generation_id,
+                    data=transcript
+                ))
+                self._post_barge_in = False
+
+        except Exception as e:
+            print(f"STT stage error: {e}", flush=True)
+
+    # ── Pipeline Stage 2b: Barge-in VAD ───────────────────────
+
+    async def _barge_in_vad_stage(self):
+        """Consume _audio_in_q for barge-in VAD detection during playback.
+
+        Extracted from the old _stt_stage. Reads audio frames from
+        _audio_in_q and runs VAD to detect user speech during AI playback.
+        When sustained speech is detected, triggers barge-in interruption.
+
+        Also drains _audio_in_q when not needed, preventing queue backup.
+        """
         try:
             while self.running:
                 try:
                     frame = self._audio_in_q.get_nowait()
                 except asyncio.QueueEmpty:
                     await asyncio.sleep(0.02)
-
-                    # Check for flush signal (key released / mic muted)
-                    if self._stt_flush_event and self._stt_flush_event.is_set():
-                        self._stt_flush_event.clear()
-                        if len(audio_buffer) > int(SAMPLE_RATE * MIN_BUFFER_SECONDS * BYTES_PER_SAMPLE):
-                            pcm_data = bytes(audio_buffer)
-                            audio_buffer.clear()
-                            silence_start = None
-                            has_speech = False
-                            speech_chunk_count = 0
-                            transcript = await asyncio.get_event_loop().run_in_executor(
-                                None, self._whisper_transcribe, pcm_data
-                            )
-                            if transcript and not _is_hallucination(transcript):
-                                print(f"STT: Flushed on mute: \"{transcript[:60]}\"", flush=True)
-                                await self._stt_out_q.put(PipelineFrame(
-                                    type=FrameType.END_OF_UTTERANCE,
-                                    generation_id=self.generation_id
-                                ))
-                                await self._stt_out_q.put(PipelineFrame(
-                                    type=FrameType.TRANSCRIPT,
-                                    generation_id=self.generation_id,
-                                    data=transcript
-                                ))
-                                self._post_barge_in = False
-                            elif transcript:
-                                print(f"STT: Rejected hallucination: \"{transcript}\"", flush=True)
-                        else:
-                            audio_buffer.clear()
-                            silence_start = None
-                            has_speech = False
-                            speech_chunk_count = 0
                     continue
 
                 if frame.type != FrameType.AUDIO_RAW:
                     continue
 
-                # Branch 1: User pressed mute — discard everything
-                if self.muted:
-                    audio_buffer.clear()
-                    silence_start = None
-                    has_speech = False
-                    speech_chunk_count = 0
-                    self._was_stt_gated = self._stt_gated
+                # Only run VAD during playback when barge-in is enabled
+                if not (self._stt_gated and self.barge_in_enabled
+                        and self._vad_model and self.playing_audio):
                     continue
 
-                # Branch 2: STT gated (AI playback) — run VAD but don't transcribe
-                if self._stt_gated:
-                    audio_buffer.clear()
-                    silence_start = None
-                    has_speech = False
-                    speech_chunk_count = 0
-                    self._was_stt_gated = True
-
-                    # Run VAD to detect barge-in speech
-                    if self.barge_in_enabled and self._vad_model and self.playing_audio:
-                        if time.time() < self._barge_in_cooldown_until:
-                            continue
-                        prob = self._run_vad(frame.data)
-                        if prob > 0.5:
-                            self._vad_speech_count += 1
-                            # Show "listening" indicator on first detected speech chunk
-                            if self._vad_speech_count == 1:
-                                self._set_status("listening")
-                            # ~0.5s sustained speech: 4096 bytes at 24kHz 16-bit = ~85ms per chunk
-                            # 0.5s / 0.085s ~ 6 chunks
-                            if self._vad_speech_count >= 6:
-                                print(f"Barge-in: Sustained speech detected ({self._vad_speech_count} chunks, prob={prob:.2f})", flush=True)
-                                await self._trigger_barge_in()
-                        else:
-                            if self._vad_speech_count > 0:
-                                self._set_status("speaking")
-                            self._vad_speech_count = 0
+                if time.time() < self._barge_in_cooldown_until:
                     continue
 
-                # Branch 3: Gated->ungated transition — reset silence tracking for clean start
-                if self._was_stt_gated:
-                    self._was_stt_gated = False
-                    audio_buffer.clear()
-                    silence_start = None
-                    has_speech = False
-                    speech_chunk_count = 0
-                    peak_rms = 0.0
-                    # Don't continue — fall through to normal audio processing below
-
-                audio_buffer.extend(frame.data)
-
-                # Check RMS for silence detection
-                samples = np.frombuffer(frame.data, dtype=np.int16)
-                rms = np.sqrt(np.mean(samples.astype(np.float64) ** 2))
-
-                # SSE: decimated audio RMS
-                buf_seconds_approx = len(audio_buffer) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
-                self._emit_audio_rms(rms=round(float(rms), 1), has_speech=has_speech,
-                                     speech_chunks=speech_chunk_count, buf_seconds=round(buf_seconds_approx, 2))
-
-                # Track whether we've seen real speech energy
-                if rms > SPEECH_ENERGY_MIN:
-                    speech_chunk_count += 1
-                    self._last_speech_energy_time = time.time()
-                    if speech_chunk_count >= SPEECH_CHUNKS_MIN:
-                        has_speech = True
-                if rms > peak_rms:
-                    peak_rms = rms
-
-                # Determine if we should transcribe
-                should_transcribe = False
-                trigger_reason = ""
-
-                buf_bytes = len(audio_buffer)
-                buf_seconds = buf_bytes / (SAMPLE_RATE * BYTES_PER_SAMPLE)
-                min_buf = int(SAMPLE_RATE * MIN_BUFFER_SECONDS * BYTES_PER_SAMPLE)
-
-                if rms < SILENCE_THRESHOLD:
-                    if silence_start is None:
-                        silence_start = time.time()
-                    else:
-                        current_silence_duration = SILENCE_DURATION_POST_BARGE if self._post_barge_in else SILENCE_DURATION_NORMAL
-                        if time.time() - silence_start > current_silence_duration and has_speech and buf_bytes > min_buf:
-                            should_transcribe = True
-                            trigger_reason = "silence"
+                prob = self._run_vad(frame.data)
+                if prob > 0.5:
+                    self._vad_speech_count += 1
+                    # Show "listening" indicator on first detected speech chunk
+                    if self._vad_speech_count == 1:
+                        self._set_status("listening")
+                    # ~0.5s sustained speech: 4096 bytes at 24kHz 16-bit = ~85ms per chunk
+                    # 0.5s / 0.085s ~ 6 chunks
+                    if self._vad_speech_count >= 6:
+                        print(f"Barge-in: Sustained speech detected ({self._vad_speech_count} chunks, prob={prob:.2f})", flush=True)
+                        await self._trigger_barge_in()
                 else:
-                    silence_start = None
-
-                # Safety cap: force transcription if buffer is too long
-                # No has_speech requirement — Whisper + hallucination filter handles empty audio
-                if not should_transcribe and buf_seconds > MAX_BUFFER_SECONDS:
-                    should_transcribe = True
-                    trigger_reason = "max_buffer"
-
-                if should_transcribe:
-                    pcm_data = bytes(audio_buffer)
-                    actual_seconds = len(pcm_data) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
-                    print(f"STT: Transcribing {actual_seconds:.1f}s buffer (peak RMS: {peak_rms:.0f}, trigger: {trigger_reason})", flush=True)
-                    self._emit_event("stt_start", trigger=trigger_reason,
-                                     buf_seconds=round(actual_seconds, 2), peak_rms=round(peak_rms, 0))
-                    stt_t0 = time.time()
-                    audio_buffer.clear()
-                    silence_start = None
-                    has_speech = False
-                    speech_chunk_count = 0
-                    peak_rms = 0.0
-
-                    # Run Whisper in executor to avoid blocking event loop
-                    transcript = await asyncio.get_event_loop().run_in_executor(
-                        None, self._whisper_transcribe, pcm_data
-                    )
-                    stt_ms = (time.time() - stt_t0) * 1000
-                    if transcript and not _is_hallucination(transcript):
-                        self._emit_event("stt_complete", text=transcript[:60],
-                                         latency_ms=round(stt_ms, 1), rejected=False)
-                        print(f"STT [whisper]: {transcript}", flush=True)
-                        await self._stt_out_q.put(PipelineFrame(
-                            type=FrameType.END_OF_UTTERANCE,
-                            generation_id=self.generation_id
-                        ))
-                        await self._stt_out_q.put(PipelineFrame(
-                            type=FrameType.TRANSCRIPT,
-                            generation_id=self.generation_id,
-                            data=transcript
-                        ))
-                        self._post_barge_in = False
-                    elif transcript:
-                        self._emit_event("stt_complete", text=transcript[:60],
-                                         latency_ms=round(stt_ms, 1), rejected=True)
-                        print(f"STT: Rejected hallucination: \"{transcript}\"", flush=True)
+                    if self._vad_speech_count > 0:
+                        self._set_status("speaking")
+                    self._vad_speech_count = 0
 
         except Exception as e:
-            print(f"STT Whisper error: {e}", flush=True)
+            print(f"Barge-in VAD stage error: {e}", flush=True)
 
     # ── DeepgramSTT Callbacks (Phase 12) ─────────────────────────
 
@@ -2970,6 +2875,7 @@ class LiveSession:
             stages = [
                 self._audio_capture_stage(),
                 self._stt_stage(),
+                self._barge_in_vad_stage(),  # Consumes _audio_in_q, detects barge-in
                 self._llm_stage(),
                 self._composer.run(),  # Composer replaces _tts_stage
                 self._playback_stage(),
