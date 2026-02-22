@@ -29,6 +29,12 @@ from response_library import ResponseLibrary
 from stream_composer import StreamComposer, AudioSegment, SegmentType
 from task_manager import TaskManager, ClaudeTask, TaskStatus
 from event_bus import EventBus, EventBusWriter, BusEvent, EventType, build_llm_context
+from continuous_stt import ContinuousSTT
+from transcript_buffer import TranscriptBuffer, TranscriptSegment
+try:
+    from vram_monitor import VRAMMonitor
+except ImportError:
+    VRAMMonitor = None  # pynvml not installed -- GPU monitoring disabled
 
 # Module-level sentence segmenter for post-tool-buffer and end-of-turn flushing
 _sentence_segmenter = pysbd.Segmenter(language="en", clean=False)
@@ -297,6 +303,11 @@ class LiveSession:
         # STT flush signal — set when mic mutes to flush accumulated transcripts
         self._stt_flush_event = None  # Created in run()
         self._loop = None  # Event loop reference for thread-safe calls
+
+        # Continuous STT (Phase 12) — always-on speech capture + transcription
+        self._transcript_buffer = None  # Created in run()
+        self._vram_monitor = None       # Created in run()
+        self._continuous_stt = None     # Created in run()
 
         # Claude CLI subprocess and IPC
         self._cli_process = None
@@ -2382,6 +2393,33 @@ class LiveSession:
         except Exception as e:
             print(f"STT Whisper error: {e}", flush=True)
 
+    # ── ContinuousSTT Callbacks (Phase 12) ────────────────────────
+
+    def _on_transcript_segment(self, segment):
+        """Called when ContinuousSTT produces a clean transcript segment."""
+        if self._bus:
+            self._bus.emit("continuous_stt_segment",
+                           gen=self.generation_id,
+                           text=segment.text,
+                           source=segment.source)
+        self._emit_event("continuous_stt_segment",
+                         text=segment.text[:60],
+                         buffer_depth=len(self._transcript_buffer))
+
+    def _on_stt_stats(self, stats):
+        """Called periodically with ContinuousSTT performance stats."""
+        parts = [
+            f"segs={stats['segment_count']}",
+            f"hal={stats['hallucination_count']}",
+            f"lat={stats['avg_latency_ms']:.0f}ms",
+            f"buf={stats['buffer_depth']}",
+        ]
+        if 'vram_level' in stats:
+            parts.append(f"vram={stats.get('vram_level', '?')}")
+        if 'vram_used_mb' in stats:
+            parts.append(f"{stats['vram_used_mb']}MB")
+        print(f"ContinuousSTT stats: {' | '.join(parts)}", flush=True)
+
     # ── Pipeline Stage 3: LLM (Claude CLI) ────────────────────────
 
     async def _llm_stage(self):
@@ -2873,9 +2911,27 @@ class LiveSession:
             on_event=lambda etype, **d: self._bus.emit(etype, gen=self.generation_id, **d) if self._bus else None,
         )
 
+        # Set up continuous STT infrastructure (Phase 12)
+        self._transcript_buffer = TranscriptBuffer(max_segments=200, max_age_seconds=300.0)
+        self._vram_monitor = VRAMMonitor.create() if VRAMMonitor else None  # Returns None if no GPU/pynvml
+        if self._vram_monitor:
+            vram_stats = self._vram_monitor.get_stats()
+            print(f"Live session: VRAM monitor active ({vram_stats['used_mb']}MB used, "
+                  f"{vram_stats['utilization_pct']}%)", flush=True)
+
+        self._continuous_stt = ContinuousSTT(
+            transcript_buffer=self._transcript_buffer,
+            vram_monitor=self._vram_monitor,
+            aec_device_name=self.config.get("aec_device_name", "Echo Cancellation Source")
+                if hasattr(self, 'config') and isinstance(getattr(self, 'config', None), dict)
+                else "Echo Cancellation Source",
+            on_segment=self._on_transcript_segment,
+            on_stats=self._on_stt_stats,
+        )
+
         self._set_status("listening")
         self._reset_idle_timer()
-        print("Live session: Pipeline started (with StreamComposer)", flush=True)
+        print("Live session: Pipeline started (with StreamComposer + ContinuousSTT)", flush=True)
 
         try:
             # Run interrupt checker as background task
@@ -2892,6 +2948,7 @@ class LiveSession:
                 self._playback_stage(),
                 interrupt_loop(),
                 self._sse_server_stage(),
+                self._continuous_stt.start(),  # Phase 12: always-on STT
             ]
 
             await asyncio.gather(*stages, return_exceptions=True)
@@ -2902,8 +2959,12 @@ class LiveSession:
             self._log_event("session_end",
                             duration_s=round(time.time() - self._started_at, 1))
             self.running = False
+            if self._continuous_stt:
+                self._continuous_stt.stop()
             if self._composer:
                 self._composer.stop()
+            if self._vram_monitor:
+                self._vram_monitor.shutdown()
             if self._bus:
                 self._bus.close()
                 self._bus = None
@@ -2969,6 +3030,8 @@ class LiveSession:
     def stop(self):
         """Stop the session gracefully."""
         self.running = False
+        if self._continuous_stt:
+            self._continuous_stt.stop()
         if self._composer:
             self._composer.stop()
         self._cancel_idle_timer()
