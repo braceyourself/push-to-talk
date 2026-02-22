@@ -260,6 +260,12 @@ def load_config():
         "auto_start_listening": True,    # Auto-start live session on service startup
         "live_auto_mute": True,          # Allow key-based muting (tap/hold to mute)
         "live_idle_timeout": 0,          # Idle disconnect (seconds). 0 = never (always-on)
+        # Deepgram streaming STT settings
+        "deepgram_idle_timeout": 10,     # Seconds of silence before switching to KeepAlive
+        "deepgram_sleep_timeout": 60,    # Seconds of KeepAlive before disconnecting WebSocket
+        "deepgram_endpointing_ms": 300,  # Deepgram endpointing threshold (ms)
+        "deepgram_utterance_end_ms": 1000,  # Deepgram utterance end detection (ms)
+        "deepgram_daily_budget_cents": 200,  # Daily cost cap in cents ($2.00 default)
         "verbal_hooks": [
             # Example hooks - customize these:
             # {"trigger": "open browser", "command": "xdg-open https://google.com"},

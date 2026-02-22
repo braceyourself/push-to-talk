@@ -20,8 +20,8 @@ pathvalidate
 # Audio processing helpers (optional, for noise detection)
 numpy
 
-# Streaming STT
-deepgram-sdk>=3.0
+# Streaming STT (Deepgram Nova-3, pin below v6 to avoid breaking API changes)
+deepgram-sdk>=5.3,<6.0
 
 # Audio capture (PulseAudio Simple API via PipeWire compat)
 pasimple
