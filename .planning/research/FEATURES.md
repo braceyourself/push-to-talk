@@ -1,517 +1,813 @@
-# Feature Landscape: Always-On Voice Assistant with Proactive AI
+# Feature Landscape: Streaming STT + Local Decision Model for Always-On Voice Assistant
 
-**Domain:** Desktop always-on voice assistant with autonomous participation
-**Researched:** 2026-02-21
-**Confidence:** MEDIUM-HIGH (strong ecosystem research, Inner Thoughts framework well-documented, Gemini Proactive Audio validates the pattern; specific Llama 3.2 3B latency for this task is LOW confidence -- needs benchmarking)
+**Domain:** Desktop always-on voice assistant with Deepgram streaming STT and local decision model
+**Researched:** 2026-02-22
+**Confidence:** HIGH (Deepgram API docs verified, latency numbers from official sources, billing model confirmed by Deepgram staff on GitHub)
+
+**Architectural Context:** This is a REFRESH of the v2.0 features research. The original plan used local Whisper distil-large-v3 for batch transcription. Testing revealed batch-transcribe latency (850ms silence gap + 500ms-2s Whisper inference) was too slow for natural conversational awareness. The pivot to Deepgram streaming STT changes the feature landscape significantly: streaming interim results enable new capabilities (real-time word tracking, progressive transcript building) while introducing new concerns (WebSocket lifecycle, cost management, network dependency).
 
 ## Existing Foundation
 
 The system already has:
-- 5-stage asyncio pipeline: Audio Capture -> STT (Whisper) -> LLM (Claude CLI) -> TTS (Piper) -> Playback
-- Heuristic + semantic input classification (6 categories, <10ms)
+- 5-stage asyncio pipeline: Audio Capture -> STT -> LLM (Claude CLI) -> TTS (OpenAI/Piper) -> Playback
+- Deepgram SDK already in requirements.txt (`deepgram-sdk>=3.0`), API key wired through LiveSession constructor
+- Tests already validate the `is_final`/`speech_final` accumulation pattern (test_live_session.py lines 132-178)
+- Heuristic + semantic input classification (6 categories, <10ms via model2vec)
 - Categorized quick response library with situation-matched audio clips
-- StreamComposer for unified audio queue with pre-buffering
-- Barge-in interruption with VAD detection
-- Configurable idle timeout (0 = always-on, already implemented)
-- Personality system (Russel: direct, opinionated, helpful colleague)
-- Event bus for cross-component communication (JSONL)
-- Tool use (run_command, read_file, spawn_task via Claude CLI + MCP)
+- StreamComposer for unified audio queue with pre-buffering and barge-in
+- Barge-in interruption with Silero VAD detection
+- TranscriptBuffer ring buffer (200 segments, 5min TTL)
+- Silero VAD ONNX model already loaded for barge-in
+- Event bus (JSONL) for cross-component communication
+- CircuitBreaker class for service fallback (already exists for STT/Deepgram)
 
-The v2.0 transformation keeps all of this intact and adds three new layers: (1) continuous input stream decoupled from LLM, (2) a local LLM monitoring/decision layer, and (3) configurable response backend selection.
+**What this pivot changes vs. the original v2.0 plan:**
+
+| Aspect | Original Plan (Whisper) | New Plan (Deepgram Streaming) |
+|--------|------------------------|-------------------------------|
+| STT latency | 850ms silence + 500ms-2s inference = 1.3-2.8s | ~150ms streaming interim, <300ms finals |
+| GPU VRAM | ~3GB Whisper + ~2.5GB Ollama = tight on 8GB | 0 GPU for STT, full budget for decision model |
+| Cost | Free (local) | ~$0.0077/min audio sent (~$0.46/hr continuous) |
+| Transcript granularity | Batch: complete utterance after silence | Streaming: word-by-word with timestamps |
+| Network dependency | None for STT | Required for STT (fallback to Whisper if down) |
+| Hallucination risk | High (Whisper on ambient noise) | Low (Deepgram trained on real-world audio) |
 
 ---
 
 ## Table Stakes
 
-Features the system MUST have for always-on to work at all. Without any one of these, the system is broken or unusable.
-
-### TS-1: Continuous Audio Capture with VAD Gating
-
-**What:** Microphone stays open permanently. Audio flows through Silero VAD to detect speech segments. Only speech segments are sent to Whisper for transcription. Silence/noise is discarded without STT processing.
-
-**Why Required:** Running Whisper continuously on all audio (including silence) would consume 100% GPU and produce hallucinated transcripts from noise. VAD gating is how every always-on system works -- Alexa, Google, Siri all use a lightweight detector before the expensive STT model. The existing barge-in VAD (Silero, already loaded in live_session.py line 1306) proves this works. Silero VAD uses <0.5% CPU for real-time processing (RTF 0.004 on AMD CPU, MIT license, 2MB model).
-
-**Complexity:** LOW -- Silero VAD already exists in the codebase for barge-in. Repurpose it as the always-on gate.
-
-**Dependencies:** None new. Extends existing `_load_vad_model()` and `_run_vad()`.
-
-**Confidence:** HIGH (Silero VAD performance verified via GitHub docs and Picovoice comparison benchmarks)
+Features the system MUST have for Deepgram streaming STT + decision model to work. Missing any one of these makes the system broken or unusable.
 
 ---
 
-### TS-2: Rolling Transcript Buffer (Context Window)
+### TS-1: Deepgram WebSocket Streaming Connection
 
-**What:** Maintain a sliding window of recent transcripts (last N minutes or N tokens) that the monitoring LLM reads to make response decisions. Older transcripts get summarized or dropped. The buffer is the LLM's "working memory" of what's been said.
+**What:** Establish and maintain a persistent WebSocket connection to Deepgram's streaming API (`wss://api.deepgram.com/v1/listen`) using the official Python SDK (`deepgram-sdk`). Audio flows from the mic through the WebSocket as binary frames; transcripts flow back as JSON events.
 
-**Why Required:** The monitoring LLM cannot make good decisions about when to respond without knowing what's been discussed. A single utterance in isolation ("yeah that's true") is meaningless -- the LLM needs the preceding context to know whether it has something to add. Every ambient AI system maintains a conversation buffer: whisper.cpp's sliding window mode keeps context tokens across chunks, LiveKit agents maintain rolling chat history trimmed to token limits, and the Inner Thoughts framework (CHI 2025) uses a full conversation log for thought generation.
+**Why Required:** This replaces the entire local Whisper STT pipeline. Without a working Deepgram connection, there is no transcription at all. The SDK is already a dependency (`deepgram-sdk>=3.0` in requirements.txt), the API key is already wired through the LiveSession constructor, and the test suite already validates Deepgram response patterns.
 
-**Implementation approach:**
-- Ring buffer of (timestamp, speaker, text) tuples
-- Configurable window: 5-10 minutes or ~2000 tokens (Llama 3.2 3B context is 128K, but shorter context = faster inference)
-- Summarize or drop entries older than the window
-- Include speaker attribution where detectable (user vs AI vs "other" if multi-party)
-
-**Complexity:** MEDIUM -- The data structure is simple but tuning the window size and deciding what to summarize vs drop requires experimentation.
-
-**Dependencies:** TS-1 (needs continuous transcripts to buffer)
-
-**Confidence:** HIGH (pattern validated across multiple systems)
-
----
-
-### TS-3: Response Decision Engine (The "Should I Respond?" Classifier)
-
-**What:** After each speech segment is transcribed, the local LLM (Ollama + Llama 3.2 3B) evaluates the rolling transcript buffer and decides: (a) should Russel respond, and (b) if yes, what kind of response (quick acknowledgment, substantive answer, proactive contribution). Returns a structured JSON decision.
-
-**Why Required:** This is the core of the always-on system. Without it, the AI either responds to everything (annoying) or nothing (useless). The existing input classifier (heuristic + model2vec) classifies WHAT was said but not WHETHER to respond. The monitoring LLM adds the "should I speak?" judgment that incorporates full conversation context.
-
-**Decision factors (derived from Inner Thoughts framework and Gemini Proactive Audio):**
-1. **Addressee detection:** Was the utterance directed at Russel? (Name mention, question directed at AI, or generic room conversation)
-2. **Relevance score:** Does Russel have something useful to add based on conversation context?
-3. **Urgency:** Is this time-sensitive? (e.g., "what time is my meeting" vs casual chat)
-4. **Interruption cost:** Is someone else speaking? Is the user focused?
-5. **Confidence threshold:** How sure is the LLM that responding would be helpful?
-
-**Output format (structured JSON from Ollama):**
-```json
+**Key configuration parameters (verified from Deepgram API docs):**
+```python
 {
-  "should_respond": true,
-  "confidence": 0.85,
-  "response_type": "substantive",
-  "reason": "User asked a factual question directed at the room",
-  "suggested_approach": "answer directly"
+    "model": "nova-3",           # Best accuracy, $0.0077/min PAYG
+    "language": "en-US",
+    "encoding": "linear16",      # Match existing 24kHz 16-bit mono PCM
+    "sample_rate": 24000,        # Match SAMPLE_RATE constant
+    "channels": 1,               # Mono mic input
+    "interim_results": True,     # Get word-by-word updates (~150ms)
+    "endpointing": 300,          # 300ms silence = speech_final (tunable)
+    "utterance_end_ms": 1000,    # 1s silence = UtteranceEnd event
+    "vad_events": True,          # SpeechStarted events for latency tracking
+    "smart_format": True,        # Auto-format numbers, currency, etc.
+    "punctuate": True,           # Auto-punctuation
 }
 ```
 
-**Complexity:** HIGH -- This is the hardest feature. The prompt engineering for the monitoring LLM is critical. Too aggressive = annoying. Too conservative = useless. Needs extensive tuning.
+**Complexity:** MEDIUM -- The SDK handles WebSocket lifecycle, but integrating it into the existing asyncio pipeline requires replacing the Whisper-based `_stt_stage` and adapting the audio capture flow. The existing tests already validate the callback pattern.
 
-**Dependencies:** TS-1 (continuous transcripts), TS-2 (context buffer)
+**Dependencies:** Deepgram API key (already wired), `deepgram-sdk` (already in requirements.txt)
 
-**Confidence:** MEDIUM (Inner Thoughts framework validates the concept, but Llama 3.2 3B's ability to do this reliably at <500ms is unverified -- needs benchmarking)
+**Confidence:** HIGH (SDK API verified from official docs, tests already exist for the transcript accumulation pattern)
 
 ---
 
-### TS-4: Name-Based Activation ("Hey Russel")
+### TS-2: Interim + Final Transcript Accumulation
 
-**What:** The AI monitors transcripts for its name ("Russel", "Russell", "hey Russel") as a high-confidence activation signal. Name mentions bypass the confidence threshold -- if you say the name, the AI always responds. Also serves as the interruption mechanism (say "Russel" to cut the AI off mid-response, replacing the current PTT-based barge-in).
+**What:** Manage the three-tier Deepgram transcript lifecycle:
+1. **Interim results** (`is_final: false`): Preliminary word-by-word updates, may change. Display for feedback, do NOT use for decisions.
+2. **Final results** (`is_final: true`): Accurate transcript for a segment. Accumulate in a buffer.
+3. **Speech final** (`speech_final: true`): Silence detected (endpointing). Concatenate all accumulated finals = complete utterance. Feed to decision engine.
 
-**Why Required:** Users need a guaranteed way to get the AI's attention. Proactive participation is probabilistic (the AI might not speak up), but name-based activation must be deterministic. Every always-on assistant has this: "Alexa", "Hey Siri", "OK Google", "Hey Copilot". Research shows users strongly prefer an explicit activation path even when proactive features exist (CHI 2024 study: participants favored utterance starter "Hey, are you available?" before VA initiated conversation).
+Plus the **UtteranceEnd** event: fires after `utterance_end_ms` of silence after the last finalized word. Signals "user is done talking, safe to process."
 
-**Implementation approach:**
-- Simple string matching on transcripts (no wake word model needed -- STT is already running)
-- Fuzzy match for common misspellings/misheard variants: "Russell", "Rusel", "hey Russ"
-- Name detection feeds directly into TS-3 decision engine as a forced-respond signal
-- For interruption: name detected during AI playback triggers existing barge-in flow
+**Why Required:** This is the core data flow. Getting it wrong means either: (a) acting on interim results that get corrected (wrong decisions), (b) waiting too long for speech_final (laggy responses), or (c) missing multi-segment utterances (truncated context). The existing test suite (test_live_session.py lines 132-178) already validates the correct accumulation pattern:
+
+```python
+# From existing test: accumulate is_final segments, flush on speech_final
+def on_message_logic(transcript, is_final, speech_final):
+    if not transcript:
+        return
+    if is_final:
+        accumulated.append(transcript)
+        if speech_final:
+            full_text = " ".join(accumulated).strip()
+            accumulated.clear()
+```
+
+**Implementation detail -- endpointing value tradeoff:**
+- `endpointing=10` (default): Near-instant speech_final. Good for chatbots. Too aggressive for natural speech -- 10ms pauses between words would split mid-sentence.
+- `endpointing=300`: 300ms silence = speech_final. Good balance for conversational. Natural pauses (commas, thinking) are ~200ms, so 300ms catches sentence boundaries without splitting.
+- `endpointing=500-1000`: Very conservative. Waits for clear end of thought. Adds latency but reduces false splits.
+
+**Recommended starting value:** `endpointing=300` with `utterance_end_ms=1000`. The 300ms catches natural sentence boundaries; the 1000ms UtteranceEnd signals "user is truly done, not just pausing."
+
+**Complexity:** LOW-MEDIUM -- The pattern is already tested. Implementation is wiring the Deepgram SDK callbacks to the existing pipeline queues.
+
+**Dependencies:** TS-1 (Deepgram connection)
+
+**Confidence:** HIGH (pattern validated in existing tests, Deepgram docs are clear on the lifecycle)
+
+---
+
+### TS-3: VAD-Gated Audio Streaming (Cost Optimization)
+
+**What:** Use the existing Silero VAD (already loaded for barge-in) to gate what audio reaches Deepgram. Only stream audio when speech is detected. During silence, send KeepAlive messages to maintain the WebSocket connection without billing.
+
+**Why Required:** Deepgram bills per second of audio sent ($0.0077/min). In an always-on scenario with ~8 hours/day of mic-open time, naive continuous streaming would cost:
+- All audio streamed: 480 min x $0.0077 = $3.70/day
+- VAD-gated (assume 20% speech): 96 min x $0.0077 = $0.74/day
+
+That is an 80% cost reduction. More importantly, not streaming silence prevents Deepgram from producing empty transcripts and avoids wasting bandwidth.
+
+**Billing model (verified by Deepgram staff on GitHub Discussion #1423):**
+- Billing is per second of audio SENT to Deepgram
+- An open WebSocket NOT transmitting audio does NOT cost anything
+- KeepAlive messages do NOT incur charges
+- KeepAlive must be sent every 3-5 seconds to prevent 10-second timeout (NET-0001 error)
+
+**Implementation pattern:**
+```
+Audio chunk (85ms) -> Silero VAD (CPU, <1ms)
+  |
+  +-- Speech detected (prob > 0.5) -> Stream to Deepgram as binary frame
+  |
+  +-- Silence detected -> Do NOT stream
+                          Send KeepAlive every 3-5s instead
+```
+
+**Why Silero VAD, not Deepgram's built-in VAD:**
+Deepgram has `vad_events=true` which fires SpeechStarted events, but this runs SERVER-SIDE after audio is already sent and billed. Local Silero VAD runs BEFORE sending audio, preventing unnecessary data from reaching Deepgram at all. The two are complementary: Silero gates locally for cost, Deepgram's VAD provides server-side speech boundary detection for accurate endpointing.
+
+**Complexity:** MEDIUM -- The Silero VAD infrastructure exists but needs adaptation. Currently VAD only runs during AI playback for barge-in detection (the `_stt_gated` path in `_stt_stage`). For always-on, VAD must run on every audio chunk. The key change: VAD output controls whether to send audio to Deepgram, not whether to suppress STT.
+
+**Edge case -- speech onset latency:** When VAD transitions from silence to speech, the first ~85ms chunk that triggered VAD has already been consumed. If this chunk is NOT sent to Deepgram, the first word may be clipped. Solution: buffer the previous 1-2 silence chunks and send them when speech starts (a "lookback buffer"). This is a well-known pattern in VAD-gated streaming.
+
+**Dependencies:** Silero VAD (already loaded), TS-1 (Deepgram connection to send KeepAlive to)
+
+**Confidence:** HIGH (VAD already works, billing model confirmed, pattern well-established)
+
+---
+
+### TS-4: Transcript Buffer Integration
+
+**What:** Feed Deepgram streaming transcripts into the existing TranscriptBuffer ring buffer. On each `speech_final`, create a TranscriptSegment and append it. The buffer provides the context window that the decision model reads.
+
+**Why Required:** The decision model needs conversation history to make respond/don't-respond decisions. "Yeah that's true" in isolation is meaningless; with 3 minutes of preceding context, the model can tell if it's a response to a question it should follow up on. The TranscriptBuffer already exists (transcript_buffer.py) with proper threading, time-based eviction, and LLM-friendly formatting via `get_context(max_tokens)`.
+
+**Key change from the Whisper-based plan:** With Whisper batch, each segment was a complete utterance (1-10 seconds of speech processed at once). With Deepgram streaming, segments arrive faster and in smaller pieces. The buffer will receive more frequent, shorter segments. This is actually better for the decision model -- it gets context updates in near-real-time rather than in delayed batches.
+
+**What goes into the buffer:**
+- `speech_final` utterances as `source="user"` segments
+- AI responses as `source="ai"` segments (already tracked in existing `_spoken_sentences`)
+- Optionally: interim results as temporary entries that get replaced by finals (for real-time monitoring display only, not for decision model input)
+
+**Complexity:** LOW -- TranscriptBuffer.append() already works. The change is in the source of segments (Deepgram callbacks instead of Whisper transcription results).
+
+**Dependencies:** TS-2 (needs finalized transcripts to buffer)
+
+**Confidence:** HIGH (TranscriptBuffer is tested and proven)
+
+---
+
+### TS-5: Decision Engine with Transcript Stream
+
+**What:** After each complete utterance (speech_final or UtteranceEnd), the local decision model (Ollama + Llama 3.2 3B) evaluates the transcript buffer and decides: should Russel respond? If yes, what kind of response?
+
+**Why Required:** This is the intelligence layer. Without it, the system is just a transcription service. The decision engine is what makes the assistant "always-on" rather than "always-recording." It is the single most important feature.
+
+**Decision input:** The `get_context()` output from TranscriptBuffer, plus the current utterance that triggered evaluation.
+
+**Decision output (structured JSON via Ollama `format` parameter):**
+```json
+{
+    "should_respond": true,
+    "confidence": 0.85,
+    "response_type": "substantive",
+    "complexity": "quick",
+    "tone": "casual",
+    "reason": "User asked a factual question directed at the room"
+}
+```
+
+**Trigger timing -- when to evaluate:**
+- On every `speech_final` event (natural sentence boundary)
+- On `UtteranceEnd` event (user done talking for >1s)
+- NOT on every interim result (too frequent, wastes Ollama cycles)
+
+**Latency budget for decision:**
+- Deepgram streaming final: ~150-300ms from end of speech
+- Ollama classification (3B, `num_predict: 100`, `temperature: 0`): ~200ms
+- Total decision latency: ~350-500ms from end of speech to "should I respond?" answer
+- This is within the 500-800ms natural conversation response window
+
+**Complexity:** HIGH -- This is the hardest feature. The prompt engineering must balance sensitivity (not missing direct questions) with restraint (not responding to everything). The latency budget is tight.
+
+**Dependencies:** TS-4 (transcript buffer as input), Ollama + Llama 3.2 3B (already planned in STACK.md)
+
+**Confidence:** MEDIUM (concept validated in research, but Llama 3.2 3B reliability for this specific task needs benchmarking)
+
+---
+
+### TS-6: Name-Based Activation via Transcript Matching
+
+**What:** Monitor streaming transcripts for the assistant's name ("Russel", "Russell", "hey Russel", "Russ"). Name mentions bypass the decision engine's confidence threshold -- if you say the name, the AI always responds. Also serves as name-based barge-in (say "Russel" to stop playback, replacing PTT-based barge-in).
+
+**Why Required:** Users need a deterministic activation path. The decision model is probabilistic (might or might not respond). Name activation is guaranteed. Every always-on assistant has this: "Alexa", "Hey Siri", "OK Google."
+
+**Why NOT a separate wake word model:**
+- Deepgram streaming STT is already running continuously and produces transcripts
+- `if "russel" in transcript.lower()` is instant and free
+- A separate wake word model (Picovoice, openWakeWord) would require a separate audio pipeline, separate model loading, and adds complexity for no benefit when STT is already transcribing everything
+- The only downside: name detection has STT latency (~150-300ms). A dedicated wake word model runs in ~80ms. For this use case, 300ms is acceptable.
+
+**New capability from streaming:** With Deepgram interim results, name detection can happen on INTERIM transcripts, not just finals. This means "Hey Russel" can be detected as soon as those words appear in the stream (~150ms), before endpointing fires. This is faster than waiting for speech_final.
+
+**Implementation:**
+```python
+# On EVERY interim/final result:
+def check_name(transcript: str) -> bool:
+    lower = transcript.lower().strip()
+    triggers = ["hey russel", "hey russell", "russel", "russell", "hey russ"]
+    return any(t in lower for t in triggers)
+
+# During AI playback: name in interim -> immediate barge-in
+# During silence: name in final -> force decision engine to respond
+```
 
 **Complexity:** LOW -- String matching on existing transcript stream. The barge-in infrastructure already exists.
 
-**Dependencies:** TS-1 (continuous transcripts). Extends existing barge-in system.
+**Dependencies:** TS-1 (Deepgram producing transcripts)
 
-**Confidence:** HIGH (trivial string matching, well-understood pattern)
-
----
-
-### TS-5: Configurable Response Backend (Claude CLI / Ollama)
-
-**What:** After the decision engine says "respond," the system picks which LLM generates the actual response: Claude CLI for complex/tool-using queries, Ollama for quick conversational responses. Selection is automatic based on query complexity, network availability, and expected latency.
-
-**Why Required:** Claude CLI (via the existing pipeline) is powerful but slow (2-5s to first token) and requires network. Ollama is fast (~200ms for short responses) but less capable. Always-on proactive responses need to be fast -- if someone makes a joke and Russel wants to quip back, waiting 3 seconds kills the moment. But for "refactor the auth module," Claude CLI's tool access is essential.
-
-**Selection heuristics:**
-- Name mention + simple question -> Ollama (speed)
-- Task/tool request -> Claude CLI (capability)
-- Proactive contribution to casual conversation -> Ollama (speed, low stakes)
-- Network down -> Ollama (only option)
-- Explicit "hey Russel, use Claude for this" -> Claude CLI (user override)
-
-**Complexity:** MEDIUM -- The routing logic is straightforward. The complexity is in maintaining two separate response pipelines and ensuring the TTS/playback path works identically for both.
-
-**Dependencies:** TS-3 (decision engine determines response type, which informs backend selection)
-
-**Confidence:** HIGH (Ollama API is well-documented, Claude CLI pipeline already exists)
+**Confidence:** HIGH (trivial implementation, well-understood pattern)
 
 ---
 
-### TS-6: Resource Management for Continuous Operation
+### TS-7: WebSocket Lifecycle Management
 
-**What:** The system must run indefinitely without memory leaks, GPU exhaustion, or CPU runaway. This means: bounded transcript buffer, Whisper model kept warm but not running during silence, Ollama connection pooling, audio buffer overflow protection.
+**What:** Handle the full Deepgram WebSocket lifecycle: connection, KeepAlive during silence, reconnection on errors, graceful shutdown, and timestamp management across reconnections.
 
-**Why Required:** The current PTT system runs for minutes at a time. Always-on runs for hours or days. Memory leaks that are invisible in a 5-minute session become OOM kills after 8 hours. Whisper on GPU + Ollama on GPU + Piper TTS on CPU is a significant resource footprint.
+**Why Required:** An always-on system runs for 8+ hours. WebSocket connections drop. Networks hiccup. Deepgram server restarts happen. Without proper lifecycle management, the system silently stops transcribing and the user doesn't know.
 
-**Key concerns:**
-- Whisper "small" model: ~461MB GPU VRAM (already loaded). Note: PROJECT.md says "small" but push-to-talk.py line 215 uses "large-v3" -- need to confirm which model for always-on.
-- Ollama Llama 3.2 3B: ~2GB VRAM (new)
-- Total GPU: ~2.5GB VRAM concurrent. Must fit alongside desktop GPU usage.
-- Transcript buffer must be bounded (ring buffer, not unbounded list)
-- Audio capture buffer overflow detection (existing pattern: whisper.cpp drops audio if buffer > 2x expected)
+**Key behaviors:**
+1. **KeepAlive during VAD silence:** Send `{"type": "KeepAlive"}` as text frame every 3-5 seconds when no audio is being streamed. The SDK may handle this automatically (needs verification), but defensive sending is recommended.
+2. **Auto-reconnection:** On connection drop (NET-0001 timeout, network error), immediately reconnect. Buffer audio during reconnection gap.
+3. **Timestamp offset management:** Each new connection resets timestamps to 00:00:00. Maintain a running offset: `real_timestamp = deepgram_timestamp + offset`. Update offset on reconnection.
+4. **Audio must flow within 10 seconds of connection:** After opening the WebSocket, audio (or KeepAlive) must arrive within 10 seconds or Deepgram closes the connection.
+5. **Graceful shutdown:** Send `{"type": "CloseStream"}` before closing the WebSocket to flush any pending transcripts.
+6. **Finalize message:** Send `{"type": "Finalize"}` to flush the current audio buffer without closing the connection. Useful before transitioning to KeepAlive mode.
 
-**Complexity:** MEDIUM -- Mostly engineering discipline (bounded buffers, proper cleanup), but GPU memory management across Whisper + Ollama needs testing.
+**Error recovery strategy:**
+- Connection error -> Log, increment CircuitBreaker (already exists: `_stt_breaker`), attempt reconnection
+- Circuit breaker trips (3 consecutive failures) -> Fall back to local Whisper STT (`_stt_whisper_fallback` already exists)
+- Recover after 60s -> Attempt Deepgram reconnection
 
-**Dependencies:** All other features (this is a cross-cutting concern)
+**Complexity:** MEDIUM -- The patterns are well-documented, but edge cases (audio buffering during reconnection, timestamp alignment) need careful handling.
 
-**Confidence:** MEDIUM (known patterns, but specific GPU sharing between Whisper large-v3 and Llama 3.2 3B needs testing on the actual hardware)
+**Dependencies:** TS-1 (connection to manage)
+
+**Confidence:** HIGH (Deepgram docs on recovery are thorough, CircuitBreaker already exists)
 
 ---
 
-### TS-7: Graceful Degradation
+### TS-8: Echo Suppression During AI Playback
 
-**What:** When components fail, the system degrades gracefully rather than crashing. Ollama down -> fall back to Claude CLI only. Network down -> Ollama only. Whisper overloaded -> drop frames, don't queue indefinitely. GPU OOM -> restart the affected model.
+**What:** When the AI is speaking via TTS, prevent the AI's own voice from being transcribed. This is the "audio feedback loop" problem -- the single most reported problem in always-on voice assistants.
 
-**Why Required:** An always-on system that crashes is worse than no system. The user will lose trust after the second crash and disable it. Cloud assistants (Alexa, Google) handle degradation through massive redundancy. A local system handles it through intelligent fallback chains.
+**Why Required:** Without echo suppression, the AI speaks -> Deepgram transcribes the AI's speech -> decision engine sees it as user input -> AI responds to itself -> infinite loop. This WILL happen if not addressed.
 
-**Fallback chain:**
-1. Full system: Silero VAD -> Whisper STT -> Ollama decision -> Claude/Ollama response -> Piper TTS
-2. Network down: Silero VAD -> Whisper STT -> Ollama decision -> Ollama response -> Piper TTS
-3. Ollama down: Silero VAD -> Whisper STT -> heuristic classifier (existing) -> Claude CLI response -> Piper TTS
-4. GPU pressure: Switch Whisper from large-v3 to small or tiny model, reduce quality for survival
-5. Total failure: Mute mic, show error in overlay, wait for manual restart
+**Implementation layers (defense in depth):**
 
-**Complexity:** MEDIUM -- Each fallback path is simple, but testing all combinations is thorough work.
+1. **PipeWire AEC (primary):** Already planned from the original v2.0 research. Route capture through `echo-cancel-capture` virtual source. Subtracts playback signal from mic input. The ContinuousSTT module already supports an `aec_device_name` parameter.
 
-**Dependencies:** TS-5 (backend selection handles part of this)
+2. **Transcript gating during playback (secondary):** During AI playback, tag Deepgram transcripts as `during_ai_speech=True`. The decision engine ignores these UNLESS they contain the AI's name (barge-in). This is a streaming-aware evolution of the existing `_stt_gated` binary gate.
 
-**Confidence:** HIGH (well-understood engineering patterns)
+3. **Transcript fingerprinting (tertiary):** Compare incoming transcripts against the last N sentences the AI spoke (already tracked in `_spoken_sentences`). Fuzzy match (Levenshtein ratio > 0.7) = echo. Reject before reaching the decision engine.
+
+**Key difference from Whisper-based approach:** With Whisper, `_stt_gated` simply discarded all audio during playback. With Deepgram streaming, audio must CONTINUE flowing (for KeepAlive and to avoid reconnection issues), but transcripts from that audio should be filtered. The WebSocket stays open; the transcript consumer applies the gating logic.
+
+**Complexity:** MEDIUM-HIGH -- PipeWire AEC setup is straightforward but system-level. Transcript gating during streaming requires careful state management (what if speech_final crosses the playback boundary?).
+
+**Dependencies:** TS-1 (audio flowing to Deepgram), TS-2 (transcript accumulation), existing barge-in infrastructure
+
+**Confidence:** MEDIUM (PipeWire AEC is well-documented, but effectiveness with desktop speakers in a real room needs testing)
+
+---
+
+### TS-9: Configurable Response Backend (Claude CLI / Ollama)
+
+**What:** After the decision engine says "respond," route to the appropriate LLM backend. Claude CLI for complex/tool-using queries. Ollama for quick conversational responses. Selection is automatic based on the decision engine's `complexity` field and network state.
+
+**Why Required:** The decision engine produces a decision, not a response. Something needs to generate the actual words. Claude CLI is powerful but slow (2-5s TTFT). Ollama is fast (~200ms TTFT) but less capable. The system needs both.
+
+**Routing logic:**
+```
+decision.complexity == "quick" AND Ollama available -> Ollama
+decision.complexity == "deep" OR tool request -> Claude CLI
+Network down -> Ollama (forced, regardless of complexity)
+Ollama down -> Claude CLI with heuristic classifier
+```
+
+**Latency impact on streaming vs batch:**
+With Deepgram streaming, the decision happens ~300-500ms after speech ends. If routed to Ollama, first audio can arrive ~700ms after speech ends (300ms decision + 200ms Ollama TTFT + 200ms TTS). This is within the natural 500-800ms response window. With Claude CLI, it's 2-5s -- still acceptable for complex requests but not for quick quips.
+
+**Complexity:** MEDIUM -- Two separate response pipelines, but the existing StreamComposer handles TTS audio from either source identically.
+
+**Dependencies:** TS-5 (decision engine provides routing signal), Ollama (STACK.md), existing Claude CLI pipeline
+
+**Confidence:** HIGH (Ollama API verified, Claude CLI pipeline battle-tested)
+
+---
+
+### TS-10: Resource Management for Continuous Operation
+
+**What:** The system must run 8+ hours without memory leaks, connection failures, or degraded performance. Specific concerns for the streaming architecture:
+
+1. **WebSocket connection health monitoring:** Detect silent failures where the connection appears open but stops delivering transcripts
+2. **Transcript buffer bounding:** Already implemented (ring buffer, 200 segments, 5min TTL)
+3. **Deepgram SDK memory:** The SDK maintains internal buffers for audio and response data. Monitor for growth over time.
+4. **Ollama model keep-alive:** Ensure the decision model stays loaded in GPU VRAM via `keep_alive=-1`
+5. **Audio buffer overflow:** During network hiccups, audio buffers in the capture stage can grow unbounded. Cap at 10s of audio and drop oldest frames.
+
+**GPU VRAM budget (post-pivot):**
+
+| Model | VRAM | Notes |
+|-------|------|-------|
+| Whisper (removed) | 0 GB | No longer running -- freed by Deepgram pivot |
+| Ollama Llama 3.2 3B | ~2-2.5 GB | Decision model + quick responses |
+| Silero VAD | ~50 MB | ONNX on CPU, negligible |
+| **Total GPU** | **~2-2.5 GB** | Massively better than the original ~5-6GB |
+
+The freed VRAM opens options: run a larger decision model (Llama 3.2 8B at ~4.5GB), or keep headroom for desktop GPU usage.
+
+**Complexity:** MEDIUM -- Mostly engineering discipline. The streaming architecture adds network-related failure modes not present in the local-only plan.
+
+**Dependencies:** All other features (cross-cutting concern)
+
+**Confidence:** HIGH (known patterns, much better VRAM situation than original plan)
 
 ---
 
 ## Differentiators
 
-Features that make this system better than Alexa/Siri/Google/Copilot for its specific use case (desktop developer companion). Not required for basic operation, but these are what make users prefer this.
-
-### D-1: Proactive Conversation Participation
-
-**What:** Russel joins conversations even when not addressed. If two people are discussing a code problem and Russel knows the answer, he speaks up. If someone makes a factual error, Russel corrects it. If someone asks a question to the room, Russel offers his take.
-
-**Value Proposition:** This is the core differentiator from every existing voice assistant. Alexa/Siri/Google only respond when addressed. They are reactive. Russel is a participant -- "like having a knowledgeable colleague in the room." No mainstream consumer product does this. Google's Proactive Audio (Gemini Live API) is the closest, but it only proactively responds to device-directed queries -- it explicitly does NOT respond to background conversation.
-
-**The Inner Thoughts Framework (CHI 2025):**
-The most directly relevant research. Defines three participation modes:
-- **Overt proactivity:** How often the AI participates (system-1 probability, 0-1)
-- **Covert proactivity:** How much motivation it needs to speak (imThreshold, 1-5)
-- **Tonal proactivity:** How assertively it speaks
-
-For Russel's "aggressive participation" goal, tune toward:
-- High overt proactivity (speak frequently)
-- Low covert threshold (low bar to contribute)
-- Moderate tonal proactivity (confident but not domineering)
-
-**Eight scoring heuristics for whether to speak:**
-1. Relevance to current topic
-2. Information gap (does the AI know something others don't?)
-3. Expected impact of contributing
-4. Urgency
-5. Coherence with conversation flow
-6. Originality (not just restating what was said)
-7. Balance (has the AI been hogging the conversation?)
-8. Dynamics (is now a natural entry point?)
-
-**Complexity:** HIGH -- This is the most ambitious feature. The prompt engineering for the Ollama monitoring layer must encode these heuristics. Too aggressive and Russel becomes that coworker who won't shut up. Too conservative and he's just another Alexa.
-
-**Dependencies:** TS-2 (context buffer), TS-3 (decision engine), TS-5 (fast Ollama backend for quick contributions)
-
-**Confidence:** MEDIUM (concept validated in research, but implementing it with a 3B local model vs the large models used in research papers introduces quality risk)
+Features that make this system better than existing voice assistants. Not required for basic operation, but these are what make the experience feel natural and useful.
 
 ---
 
-### D-2: Conversation-Aware Response Calibration
+### D-1: Real-Time Transcript Display from Interim Results
 
-**What:** The response style and length vary based on conversation context. In a focused work discussion, Russel gives precise technical answers. In casual banter, Russel quips or jokes. If the user sounds frustrated, Russel is measured and empathetic. If the user is excited, Russel matches the energy.
+**What:** Display interim results (word-by-word) in the overlay/dashboard as the user speaks. Provides immediate visual feedback that the system is hearing and transcribing. Replace interim text with final text when `is_final` arrives.
 
-**Value Proposition:** Alexa has one mode. Siri has one mode. Russel adapts. The personality system already encodes this ("Match the user's energy" in 04-voice.md), but currently the classifier only operates on single utterances. With the rolling transcript buffer, the monitoring LLM can detect conversation MOOD and REGISTER over multiple turns.
+**Value Proposition:** No consumer voice assistant shows you what it's hearing in real-time. This creates a "glass box" experience where the user can see the system is working, correct if it mishears, and feel confident the assistant is paying attention. It's the difference between talking to a person who nods vs. one who stares blankly.
 
 **Implementation approach:**
-- The Ollama decision engine includes a "tone" field in its output: `"tone": "casual"` / `"focused"` / `"supportive"` / `"excited"`
-- This tone instruction is passed to the response backend (Claude or Ollama) as a system prompt modifier
-- The existing personality files provide the base; tone is a runtime overlay
+- On each interim result: Update the overlay with current text (with a "..." indicator)
+- On `is_final`: Replace interim with final text
+- On `speech_final`: Move accumulated text to the conversation log, clear the interim display
 
-**Complexity:** LOW-MEDIUM -- Mostly prompt engineering. The infrastructure (decision engine -> response backend) handles the plumbing.
+**Complexity:** LOW -- The overlay already exists. This is a new data source for it.
 
-**Dependencies:** TS-3 (decision engine provides tone assessment)
+**Dependencies:** TS-2 (interim results from Deepgram)
 
-**Confidence:** MEDIUM (prompt engineering quality determines success)
-
----
-
-### D-3: Non-Speech Event Awareness
-
-**What:** Detect coughs, sighs, laughter, throat clearing, typing sounds, and respond appropriately. A cough gets "bless you" or concerned silence. Laughter might get the AI joining in or asking "what's funny?" A long sigh after a frustrating conversation gets "rough day?"
-
-**Value Proposition:** This is what makes Russel feel like a real presence in the room, not just a chatbot with a microphone. No consumer assistant does this. The existing Whisper STT already detects these events (they show up as rejected segments with high no_speech_prob or specific hallucinated patterns like "[laughter]", "[cough]"). The v1.2 research identified SenseVoice (FunAudioLLM) as capable of explicit non-speech event classification, but the existing Whisper metadata approach is sufficient and avoids a second model.
-
-**Carried forward from v1.2 scope.** This was part of the original v1.2 plan but folded into v2.0.
-
-**Complexity:** MEDIUM -- Leverages existing STT rejection metadata. Needs mapping from rejection patterns to response categories. Integration with the response library.
-
-**Dependencies:** TS-1 (continuous audio), existing STT filtering pipeline, existing response library
-
-**Confidence:** HIGH (existing codebase already detects these events, just currently discards them)
+**Confidence:** HIGH (trivial UI update)
 
 ---
 
-### D-4: Post-Session Library Growth (Curator Daemon)
+### D-2: Word-Level Timestamp Analysis for Response Timing
 
-**What:** After a session ends (or during long idle periods), a curator process reviews conversation logs, identifies new response phrases that would have been useful, generates them via Piper TTS, evaluates quality, and adds them to the response library.
+**What:** Use Deepgram's word-level timestamps to make smarter decisions about when to respond. Analyze speaking pace, pause patterns, and sentence rhythm to detect natural turn-taking points.
 
-**Value Proposition:** The response library grows organically based on actual usage patterns. Over time, Russel's quick responses become more varied and more appropriate to the specific user's communication style. This is the self-improving loop that no consumer assistant has.
+**Value Proposition:** Research shows the average gap between speakers in natural conversation is ~200ms. Responses after 300-400ms feel "awkward." With word-level timestamps, the system can calculate:
+- Speaking rate (words/second) -- is the user speaking slowly (thinking) or fast (excited)?
+- Pause duration between words -- is this a within-sentence pause or a between-sentence pause?
+- Utterance duration -- short utterance after a question = likely an answer; long utterance = ongoing thought
 
-**Carried forward from v1.2 scope.** Phase 10 of v1.2 was "library growth." Folded into v2.0.
+This enables the decision engine to time responses more naturally than relying solely on a fixed endpointing threshold.
 
-**Complexity:** MEDIUM -- The clip factory infrastructure already exists. The curator needs conversation analysis logic (which phrases were missing, what should be generated).
+**Complexity:** MEDIUM -- Requires analyzing the timestamp data from Deepgram word arrays. The analytics are straightforward but tuning the thresholds needs experimentation.
 
-**Dependencies:** Existing clip_factory.py, response_library.py, event bus conversation logs
+**Dependencies:** TS-2 (word-level timestamps from Deepgram finals)
 
-**Confidence:** HIGH (infrastructure exists, this is a new consumer of existing systems)
-
----
-
-### D-5: Multi-Speaker Awareness
-
-**What:** Distinguish between different speakers in the room. Know when the user is talking vs a guest vs TV audio. Attribute transcript segments to speakers so the context buffer has speaker labels. This enables better "should I respond?" decisions (e.g., respond to user's questions but not to TV dialogue).
-
-**Value Proposition:** Dramatically reduces false activations and inappropriate responses. The biggest complaint about always-on assistants is responding to TV/radio/other people. Amazon's device-directed speech detection uses LSTM classifiers on acoustic + ASR features to achieve 5.2% EER. Gemini Proactive Audio filters out "external chatter" explicitly.
-
-**Implementation approach (tiered):**
-- **Tier 1 (simple):** Use Whisper's VAD energy levels + speaking patterns to distinguish "primary user" (consistent voice, close to mic) from "other" (different energy profile, farther away)
-- **Tier 2 (better):** Speaker diarization via pyannote.audio or similar -- assigns speaker IDs to segments
-- **Tier 3 (best):** Voice enrollment -- user registers their voice, system recognizes them specifically
-
-**Complexity:** LOW for Tier 1, MEDIUM for Tier 2, HIGH for Tier 3
-
-**Dependencies:** TS-1 (continuous audio), TS-2 (context buffer needs speaker labels)
-
-**Confidence:** MEDIUM (Tier 1 is straightforward heuristic, Tier 2 requires pyannote.audio which adds dependencies, Tier 3 is research-grade)
+**Confidence:** MEDIUM (data is available, but whether a 3B local model can meaningfully use this information is unverified)
 
 ---
 
-### D-6: Attention Signals Before Proactive Responses
+### D-3: Speaker Diarization via Deepgram
 
-**What:** Before Russel proactively interjects, play a brief "attention signal" -- a subtle sound or short verbal cue like "hey" or "actually" or a soft chime. This gives the user a moment to register that Russel is about to speak, preventing the jarring experience of an AI suddenly talking over a conversation.
+**What:** Enable Deepgram's `diarize=true` parameter to get per-word speaker IDs in transcripts. Use speaker labels to distinguish "user talking to Russel" from "user talking to someone else" or "TV audio."
 
-**Value Proposition:** Research strongly supports this. The CHI 2024 "Better to Ask Than Assume" study found that participants favored the "utterance starter" approach where the VA says "Hey, are you available?" before initiating. For a casual companion like Russel, a full "are you available?" is too formal -- a brief verbal marker or audio cue is more natural.
+**Value Proposition:** The biggest complaint about always-on assistants is responding to TV/radio/other people. Deepgram's diarization assigns speaker IDs per word, trained on 100,000+ voices across real-world conversational data. This is dramatically better than the energy-based heuristics planned in the original v2.0 research.
 
-**Implementation options:**
-- Short verbal: "Hey," / "Actually," / "Oh," / "(throat clear)" -- played from the quick response library
-- Audio cue: Subtle notification sound (200-500ms) from a pre-generated clip
-- Contextual: Vary the signal based on urgency. Low urgency = soft sound. High urgency = verbal "hey"
+**Tradeoff:** Diarization adds $0.0020/min to the streaming cost (from $0.0077 to $0.0097/min). For 8 hours of VAD-gated audio (~96 min actual speech), this is ~$0.19/day additional cost. Worth it for significantly reduced false activations.
 
-**Complexity:** LOW -- Uses existing StreamComposer and response library infrastructure. Just needs a new "attention signal" category in the library.
+**Complexity:** LOW -- It's a single parameter in the Deepgram connection config. The transcript response includes `speaker` field per word. The harder part is teaching the decision model to use speaker labels effectively.
 
-**Dependencies:** D-1 (proactive participation triggers the signal), existing StreamComposer
+**Dependencies:** TS-1 (Deepgram connection), TS-5 (decision engine needs to understand speaker context)
 
-**Confidence:** HIGH (well-researched pattern, simple implementation)
+**Confidence:** MEDIUM (Deepgram diarization works well in pre-recorded audio; real-time streaming diarization quality needs testing. Historical GitHub issue #108 reported diarize always returning speaker 0 in streaming -- may be resolved in Nova-3 but needs verification.)
 
 ---
 
-### D-7: Interruptibility Detection
+### D-4: Proactive Conversation Participation
 
-**What:** Detect when the user is likely busy/focused and suppress proactive responses. Signals: user hasn't spoken in a while (deep work), keyboard typing sounds detected, user explicitly said "quiet mode" or "give me a minute."
+**What:** Russel joins conversations even when not addressed. If someone discusses a code problem and Russel knows the answer, he speaks up. If someone makes a factual error, Russel corrects it.
 
-**Value Proposition:** The biggest risk with proactive AI is annoying the user. Research on proactive VAs (CUI 2022 "Proactivity Dilemma") identifies interruptibility as the key factor: personal context (busyness, mood) matters more than the content being offered. Interestingly, one study found 30 proactive interactions in 2.5 hours caused zero annoyance -- but that was in a cooperative setting. A developer in deep focus would react very differently.
+**Value Proposition:** This is the core differentiator from every existing voice assistant. Alexa/Siri/Google only respond when addressed. Russel is a participant.
+
+**How streaming STT improves this:** With batch Whisper, the system only knew what was said after silence detection + transcription (1.5-3s delay). With Deepgram streaming, the system sees words as they are spoken (~150ms). The decision model can begin thinking about whether to respond while the user is still talking, enabling faster proactive contributions that feel natural rather than delayed.
+
+**Complexity:** HIGH -- The prompt engineering for proactive participation must encode the "eight scoring heuristics" from the Inner Thoughts framework (CHI 2025). Too aggressive = annoying. Too conservative = useless.
+
+**Dependencies:** TS-5 (decision engine), TS-9 (fast Ollama backend for quick contributions), D-6 (attention signals to avoid startling)
+
+**Confidence:** MEDIUM (concept validated in research, implementation quality depends on prompt engineering)
+
+---
+
+### D-5: Attention Signals Before Proactive Responses
+
+**What:** Before Russel proactively interjects, play a brief attention signal: a subtle sound, or a short verbal cue like "Hey," "Actually," or "Oh." This gives the user a moment to register that Russel is about to speak.
+
+**Value Proposition:** Research (CHI 2024 "Better to Ask Than Assume") shows users strongly prefer an explicit signal before unsolicited VA contributions. Without it, the AI suddenly talking is startling and annoying.
+
+**Implementation:** Add an "attention_signal" category to the response library. Before proactive responses, enqueue an attention clip into the StreamComposer before the main response. The StreamComposer's cadence system (post_clip_pause) handles the natural gap between signal and response.
+
+**Complexity:** LOW -- Uses existing StreamComposer and response library infrastructure.
+
+**Dependencies:** D-4 (proactive participation triggers the signal)
+
+**Confidence:** HIGH (simple implementation, well-researched pattern)
+
+---
+
+### D-6: Interruptibility Detection
+
+**What:** Detect when the user is busy/focused and suppress proactive responses. Signals: long silence (deep work), explicit "quiet mode" command, sustained ambient non-speech (typing).
+
+**Value Proposition:** The biggest risk with proactive AI is annoying the user during focus time.
+
+**How streaming STT helps:** With continuous transcript monitoring, the system can detect silence duration in real-time. "No speech_final events for 10 minutes" = user is in deep work mode. No need for a separate timer or OS integration -- the transcript stream (or absence of it) IS the signal.
 
 **Implementation approach:**
-- **Time-based:** If user hasn't spoken in >10 minutes, assume deep work. Raise the confidence threshold for proactive responses.
-- **Explicit:** User says "quiet mode" / "shut up for a bit" -> suppress all non-addressed responses for N minutes.
-- **Ambient:** Detect sustained keyboard typing via audio features -> assume coding focus -> raise threshold.
-- **OS integration:** Check if a fullscreen app is running (gaming, presentations) -> suppress.
+- **Time-based:** Track time since last `speech_final`. If >10min, raise decision confidence threshold.
+- **Explicit:** Detect "quiet mode" / "shut up" in transcripts. Suppress proactive responses for configurable duration.
+- **Ambient:** If VAD detects speech but Deepgram returns empty transcripts (non-speech sound), tag as ambient noise.
 
-**Complexity:** LOW-MEDIUM -- Time-based and explicit are trivial. Ambient and OS integration add complexity.
+**Complexity:** LOW-MEDIUM -- Time-based and explicit are trivial. Ambient classification is harder.
 
-**Dependencies:** TS-3 (decision engine respects interruptibility signals)
+**Dependencies:** TS-5 (decision engine respects interruptibility signals)
 
-**Confidence:** HIGH for time-based/explicit, LOW for ambient/OS integration
+**Confidence:** HIGH for time-based/explicit, MEDIUM for ambient
+
+---
+
+### D-7: Non-Speech Event Awareness
+
+**What:** Detect coughs, sighs, laughter, and respond appropriately. A cough gets "bless you." Laughter might get the AI joining in.
+
+**Value Proposition:** This makes Russel feel like a real presence in the room. No consumer assistant does this.
+
+**How Deepgram changes this vs Whisper:** With Whisper, non-speech events appeared as rejected segments with high `no_speech_prob`. With Deepgram, the situation is different:
+- Deepgram may transcribe some non-speech events as words (e.g., laughter as empty transcript with specific patterns)
+- The SpeechStarted event fires for any vocal activity, including coughs -- but the resulting transcript may be empty
+- The VAD gate might not pass non-speech events to Deepgram at all (Silero VAD is trained on speech, not coughs)
+
+**This needs investigation** during implementation. The approach may need to differ from the original Whisper-based plan.
+
+**Complexity:** MEDIUM -- Uncertain how non-speech events flow through the Deepgram pipeline.
+
+**Dependencies:** TS-1 (Deepgram producing events), TS-3 (VAD gating may need adjustment for non-speech)
+
+**Confidence:** LOW -- The interaction between Silero VAD, Deepgram, and non-speech events is unverified.
+
+---
+
+### D-8: Post-Session Library Growth (Curator Daemon)
+
+**What:** After a session, a curator process reviews conversations, identifies response gaps, generates new quick response clips, and adds them to the response library.
+
+**Value Proposition:** The response library grows organically based on usage. Over time, Russel's quick responses become more varied and appropriate.
+
+**Unchanged from original plan.** This feature is independent of the STT backend. It operates on conversation logs (JSONL events), not on raw audio. The Deepgram pivot does not affect it.
+
+**Complexity:** MEDIUM -- Carried forward from v1.2 scope.
+
+**Dependencies:** Existing clip_factory.py, response_library.py, event bus logs
+
+**Confidence:** HIGH (infrastructure exists)
 
 ---
 
 ## Anti-Features
 
-Features to explicitly NOT build. These seem valuable but create problems that outweigh benefits.
-
-### AF-1: Hardware Wake Word Detection (Picovoice Porcupine / openWakeWord)
-
-**Why It Seems Good:** Dedicated wake word models are optimized for this exact task. Picovoice Porcupine can create custom wake words "in seconds." openWakeWord runs 15-20 models simultaneously on a Raspberry Pi.
-
-**Why Problematic:** Whisper STT is ALREADY running continuously. Adding a separate wake word model creates two parallel audio processing paths -- one for wake word, one for STT. The wake word model is solving a problem that doesn't exist: "detect speech before running expensive STT." But we're already running STT on everything. Name detection on the transcript ("hey Russel") is simpler, cheaper, and more flexible (handles variations naturally via STT's language model).
-
-**Do This Instead:** TS-4 (name-based activation via transcript string matching). Zero additional models, zero additional CPU/GPU, instant implementation.
-
-**When to revisit:** Only if Whisper continuous STT proves too expensive and we need to gate it behind a wake word.
+Features to explicitly NOT build. These seem valuable but create problems.
 
 ---
 
-### AF-2: Cloud-Based Monitoring LLM
+### AF-1: Continuous Audio Streaming Without VAD Gate
 
-**Why It Seems Good:** Claude Haiku or GPT-4o-mini would be far more capable at the "should I respond?" decision than Llama 3.2 3B. Higher accuracy means fewer false positives and false negatives.
+**Why It Seems Good:** Simpler architecture -- just pipe all audio to Deepgram. Let Deepgram handle silence detection. No local VAD complexity.
 
-**Why Problematic:** The monitoring LLM evaluates EVERY speech segment -- potentially dozens per minute in an active conversation. At $0.25/1M input tokens (Haiku), monitoring 8 hours of conversation (~50K tokens/hour) costs ~$0.10/day. Not expensive, but: (1) adds network latency to every decision (200-500ms round-trip), (2) requires internet for basic operation, (3) sends all ambient conversation to cloud servers -- a serious privacy concern for an always-on mic. The local-first philosophy is a core value of this project.
+**Why Problematic:**
+1. **Cost:** 8 hours continuous = $3.70/day. With VAD gating, ~$0.74/day. Over a month: $111 vs $22.
+2. **Bandwidth:** 24kHz 16-bit mono = ~48KB/s = ~173MB/hour. Over 8 hours = ~1.4GB upstream.
+3. **Unnecessary load on Deepgram servers:** Empty transcripts from silence waste resources on both sides.
+4. **Privacy:** Sending all ambient audio to cloud is a bigger privacy surface than sending only speech segments.
 
-**Do This Instead:** TS-3 (Ollama + Llama 3.2 3B local). If 3B proves inadequate, try Llama 3.2 8B or Mistral 7B locally before going to cloud. The system already runs on a desktop with a capable GPU.
-
-**When to revisit:** Only if local models prove fundamentally incapable of the task after extensive prompt tuning.
-
----
-
-### AF-3: Full Conversation Transcription Storage / Searchable History
-
-**Why It Seems Good:** "Record everything Russel hears, make it searchable later." Like an always-on meeting recorder.
-
-**Why Problematic:** This is a surveillance feature that happens to be technically easy. Storing continuous transcripts of ambient room audio crosses a privacy line that even the user themselves may not realize until it's too late. Guests don't know they're being recorded. Family members don't know. Even for a single-user system, having a searchable record of every word spoken near your desk is a liability, not a feature.
-
-**Do This Instead:** The rolling transcript buffer (TS-2) is ephemeral -- it holds the last N minutes for context, then drops it. Conversation logs (existing JSONL) only capture DELIBERATE interactions (where the user chose to engage). No ambient logging.
-
-**When to revisit:** Never. This is a values decision, not a technical one.
+**Do This Instead:** TS-3 (VAD-gated streaming). Only send speech.
 
 ---
 
-### AF-4: Continuous Full-Duplex Conversation (Speech-to-Speech Model)
+### AF-2: Using Interim Results for Decision Making
 
-**Why It Seems Good:** Models like GPT-4o Realtime and Gemini Live API offer native audio-to-audio with natural turn-taking, backchannels, and overlapping speech. NVIDIA PersonaPlex handles interruptions and conversational rhythm natively.
+**Why It Seems Good:** Interim results arrive ~150ms after speech. Acting on interims would make responses faster.
 
-**Why Problematic:** These are cloud-only, expensive ($5-15/hr for continuous connection), and fundamentally designed for 1:1 conversation -- not ambient monitoring. They assume the model IS the conversation partner, not an observer who occasionally joins. The architecture is incompatible with "listen to a room and decide when to participate." Also: cloud dependency for always-on = reliability nightmare.
+**Why Problematic:** Interim results are preliminary guesses that get corrected. "What's the wetter like" becomes "What's the weather like" in the final. If the decision engine acts on "wetter," it may make wrong choices. Worse: if the system starts generating a response based on interim text that then changes, the response is based on stale/wrong input.
 
-**Do This Instead:** The cascaded pipeline (STT -> LLM -> TTS) with the Ollama monitoring layer. Less "natural" turn-taking but compatible with the observer model and fully local.
+**Do This Instead:** Use interims ONLY for name detection (TS-6) and real-time display (D-1). Use finals/speech_final for decision engine input (TS-5). This is the Deepgram-recommended pattern.
 
-**When to revisit:** When open-source speech-to-speech models (like Moshi or similar) mature enough to run locally and support observer/monitoring mode.
-
----
-
-### AF-5: Learning User Schedule / Routine-Based Proactivity
-
-**Why It Seems Good:** Alexa Hunches learns daily patterns (user always asks about weather at 7am) and proactively offers information. The system could learn "Ethan always reviews PRs at 9am" and proactively offer a summary.
-
-**Why Problematic:** This is a different product. Russel is a conversational companion, not a scheduling assistant. Routine-based proactivity requires persistent state across days/weeks, pattern detection algorithms, and a fundamentally different interaction model. It also requires the system to initiate conversation from nothing -- not "I heard something relevant and want to contribute" but "it's 9am so I should say something." That's much harder to get right and much easier to get annoying.
-
-**Do This Instead:** Russel participates proactively in CONVERSATIONS that are happening. He doesn't initiate conversations from silence. If the user wants a morning briefing, they say "hey Russel, what's up today?" The proactivity is reactive-proactive (responds within conversation context), not schedule-proactive (initiates based on time patterns).
-
-**When to revisit:** After the core always-on conversation participation is solid and users request it.
+**Exception:** Name detection on interims IS safe because "Russel" doesn't get corrected to something else -- proper nouns are stable across interim/final.
 
 ---
 
-### AF-6: Multi-Room / Multi-Device Mesh
+### AF-3: Hardware Wake Word Detection (Picovoice / openWakeWord)
 
-**Why It Seems Good:** Run Russel on multiple devices, share context across rooms.
+**Why It Seems Good:** Dedicated wake word models run in ~80ms, faster than Deepgram's ~150-300ms for name detection.
 
-**Why Problematic:** Massive scope expansion. Network synchronization, conflict resolution, echo cancellation across devices, and distributed state management. This is a product category change, not a feature.
+**Why Problematic:** With Deepgram streaming already producing continuous transcripts, name detection via string matching is free, instant on each interim result, and requires zero additional infrastructure. Adding a separate audio pipeline for wake word detection adds complexity without meaningful benefit.
 
-**Do This Instead:** One device, one room, one mic. The desktop. Keep scope tight.
+**Do This Instead:** TS-6 (name detection on Deepgram transcripts). The 150ms difference is not perceptible.
+
+**When to revisit:** Only if Deepgram goes down frequently and name activation must work during STT outage.
+
+---
+
+### AF-4: Cloud-Based Decision Model
+
+**Why It Seems Good:** Claude Haiku or GPT-4o-mini would be more capable than Llama 3.2 3B for the "should I respond?" decision.
+
+**Why Problematic:** The decision model evaluates EVERY speech_final event -- potentially dozens per minute. Cloud latency (200-500ms) stacks ON TOP of Deepgram latency. The total decision chain becomes: speech -> Deepgram (300ms) -> cloud LLM (300ms) -> response (200ms+) = 800ms minimum, pushing past the natural response window. Plus: sends all conversation transcripts to a second cloud service = doubled privacy exposure.
+
+**Do This Instead:** TS-5 (local Ollama). The Deepgram pivot frees ~3GB of GPU VRAM that was used by Whisper, making room for a larger local model if 3B proves inadequate.
+
+---
+
+### AF-5: Full Conversation Transcription Storage
+
+**Why It Seems Good:** With streaming transcripts, it's trivial to log everything to disk.
+
+**Why Problematic:** This is surveillance. An always-on mic that records and stores everything crosses a privacy line. Guests, family members, and the user themselves don't need a permanent transcript of every word spoken near the computer.
+
+**Do This Instead:** Rolling transcript buffer (TS-4) with 5-minute TTL. Ephemeral by design. Conversation logs only capture deliberate AI interactions, not ambient speech.
+
+---
+
+### AF-6: Streaming to Multiple STT Providers Simultaneously
+
+**Why It Seems Good:** Redundancy -- if Deepgram goes down, AssemblyAI or Google take over instantly.
+
+**Why Problematic:** Double the cost, double the bandwidth, double the API keys, double the billing complexity. The CircuitBreaker + Whisper fallback (TS-7) provides sufficient redundancy: Deepgram streaming as primary, local Whisper as fallback. No need for a second cloud STT.
+
+**Do This Instead:** TS-7 (connection lifecycle with Whisper fallback).
 
 ---
 
 ## Feature Dependencies
 
 ```
-TS-1: Continuous Audio + VAD
+TS-1: Deepgram WebSocket Connection
   |
-  +---> TS-2: Rolling Transcript Buffer
+  +---> TS-2: Interim + Final Transcript Accumulation
   |       |
-  |       +---> TS-3: Response Decision Engine (Ollama)
+  |       +---> TS-4: Transcript Buffer Integration
   |       |       |
-  |       |       +---> TS-5: Backend Selection (Claude/Ollama)
+  |       |       +---> TS-5: Decision Engine
   |       |       |       |
-  |       |       |       +---> D-1: Proactive Participation
+  |       |       |       +---> TS-9: Response Backend (Claude/Ollama)
   |       |       |       |       |
-  |       |       |       |       +---> D-6: Attention Signals
+  |       |       |       |       +---> D-4: Proactive Participation
+  |       |       |       |       |       |
+  |       |       |       |       |       +---> D-5: Attention Signals
+  |       |       |       |       |
+  |       |       |       |       +---> D-2: Word-Level Timing Analysis
   |       |       |       |
-  |       |       |       +---> D-2: Response Calibration
+  |       |       |       +---> D-6: Interruptibility Detection
   |       |       |
-  |       |       +---> D-7: Interruptibility Detection
+  |       |       +---> D-3: Speaker Diarization
   |       |
-  |       +---> D-5: Multi-Speaker Awareness
+  |       +---> D-1: Real-Time Transcript Display (interims)
   |
-  +---> TS-4: Name-Based Activation ("Hey Russel")
+  +---> TS-3: VAD-Gated Audio Streaming
   |
-  +---> D-3: Non-Speech Event Awareness
+  +---> TS-6: Name-Based Activation (on interims)
   |
-  +---> TS-6: Resource Management (cross-cutting)
+  +---> TS-7: WebSocket Lifecycle Management
   |
-  +---> TS-7: Graceful Degradation (cross-cutting)
+  +---> TS-8: Echo Suppression
+  |
+  +---> D-7: Non-Speech Event Awareness
+  |
+  +---> TS-10: Resource Management (cross-cutting)
 
-D-4: Library Growth (independent -- post-session, uses existing infrastructure)
+D-8: Library Growth (independent, post-session)
 ```
+
+## Latency Budget
+
+End-to-end from user stops speaking to AI starts responding:
+
+### Fast Path (Ollama quick response)
+
+| Stage | Time | Cumulative | Source |
+|-------|------|------------|--------|
+| User stops speaking | 0ms | 0ms | - |
+| Endpointing silence (configurable) | 300ms | 300ms | Deepgram `endpointing=300` |
+| Deepgram processes + returns speech_final | ~100-150ms | 400-450ms | Deepgram streaming latency |
+| Decision engine (Ollama 3B, classify) | ~200ms | 600-650ms | Ollama with `num_predict: 100` |
+| Ollama response TTFT | ~200ms | 800-850ms | Streaming response |
+| TTS first sentence | ~200ms | 1000-1050ms | OpenAI TTS or Piper |
+| **User hears first audio** | | **~1.0s** | |
+
+### Deep Path (Claude CLI complex response)
+
+| Stage | Time | Cumulative | Source |
+|-------|------|------------|--------|
+| User stops speaking | 0ms | 0ms | - |
+| Endpointing + Deepgram final | ~400-450ms | 400-450ms | Same as fast path |
+| Decision engine (Ollama 3B) | ~200ms | 600-650ms | Same as fast path |
+| Claude CLI TTFT | ~2-5s | 2.6-5.6s | Network + model loading |
+| TTS first sentence | ~200ms | 2.8-5.8s | OpenAI TTS |
+| **User hears first audio** | | **~3-6s** | Acceptable for complex queries |
+
+### Name-Based Activation (fastest)
+
+| Stage | Time | Cumulative | Source |
+|-------|------|------------|--------|
+| User says "Hey Russel, what time is it?" | 0ms | 0ms | - |
+| "Hey Russel" detected in interim | ~150ms | 150ms | Deepgram interim latency |
+| Wait for speech_final (rest of utterance) | Variable | Variable | Depends on utterance length |
+| Route to Ollama (name = force respond) | ~200ms | - | Skip decision engine threshold |
+| **Total from end of utterance to audio** | | **~600-800ms** | |
+
+### Comparison: Old Whisper vs New Deepgram
+
+| Metric | Whisper Batch | Deepgram Streaming | Improvement |
+|--------|--------------|-------------------|-------------|
+| Silence detection | 850ms | 300ms (configurable) | 2.8x faster |
+| STT processing | 500ms-2s | ~150ms (streaming) | 3-13x faster |
+| Decision latency | Same | Same | - |
+| Total to decision | 1.5-2.8s | 400-650ms | 2-4x faster |
+| First audio to user | 2.5-4.5s | 1.0-1.5s | 2-3x faster |
+
+---
+
+## Cost Analysis
+
+### Deepgram Streaming Cost (PAYG, Nova-3 monolingual)
+
+**Rate:** $0.0077/min of audio sent
+
+**Scenario: 8-hour workday, VAD-gated**
+
+| Metric | Value |
+|--------|-------|
+| Total mic-open time | 480 min |
+| Estimated speech fraction (single user, home office) | 15-25% |
+| Audio sent to Deepgram | 72-120 min |
+| Daily cost | $0.55-$0.92 |
+| Monthly cost (22 workdays) | $12-$20 |
+
+**With diarization (+$0.0020/min):** Add ~$0.15-0.25/day, ~$3-5/month.
+
+**Free tier:** $200 of credits, no expiry. At $0.75/day, that is ~267 days of free usage.
+
+**Comparison to Whisper (local):** $0/day, but 2-4x worse latency and requires 3GB GPU VRAM.
+
+### Ollama Decision Model Cost
+
+**Rate:** Free (local inference)
+
+**GPU VRAM:** ~2-2.5GB (Llama 3.2 3B Q4_K_M)
+
+**Compute per decision:** ~200ms on RTX 3070
+
+**Decisions per day (8 hours, moderate speech):** ~200-500 (one per speech_final)
+
+**Total daily GPU time for decisions:** ~40-100 seconds. Negligible.
+
+---
 
 ## MVP Recommendation
 
-For MVP (first shippable version of always-on), prioritize:
+For MVP (first shippable version of Deepgram streaming + decision model):
 
-1. **TS-1: Continuous Audio + VAD** -- Foundation, everything depends on it
-2. **TS-4: Name-Based Activation** -- Deterministic interaction path, low complexity
-3. **TS-2: Rolling Transcript Buffer** -- Minimal version: last 3 minutes, no summarization
-4. **TS-3: Response Decision Engine** -- Core intelligence, even if initial prompts are rough
-5. **TS-5: Backend Selection** -- Start simple: Ollama for everything the decision engine flags, Claude CLI only on explicit name-mention task requests
-6. **TS-6: Resource Management** -- Bounded buffers from day one, not retrofitted
+1. **TS-1: Deepgram WebSocket** -- Everything depends on this
+2. **TS-2: Transcript Accumulation** -- Core data flow
+3. **TS-3: VAD-Gated Streaming** -- Cost control from day one
+4. **TS-7: WebSocket Lifecycle** -- Must-have for reliability
+5. **TS-8: Echo Suppression** -- Without this, infinite loop
+6. **TS-4: Transcript Buffer** -- Feed for decision engine
+7. **TS-6: Name-Based Activation** -- Deterministic activation path
+8. **TS-5: Decision Engine** -- The intelligence layer
+9. **TS-9: Response Backend** -- Start with Ollama-only, add Claude routing later
+10. **TS-10: Resource Management** -- Bounded buffers from day one
 
 Defer to post-MVP:
-- **D-1 (Proactive Participation):** Start with respond-when-addressed only. Add proactive gradually by lowering thresholds once the decision engine is proven reliable.
-- **D-5 (Multi-Speaker):** Start without speaker diarization. Add if false activations from other people/TV become a problem.
-- **D-3 (Non-Speech Events):** Nice-to-have, not blocking.
-- **D-4 (Library Growth):** Independent track, can ship whenever.
-- **TS-7 (Graceful Degradation):** Basic fallbacks in MVP, comprehensive chain post-MVP.
+- **D-1 (Real-Time Display):** Nice visual feedback, not blocking
+- **D-2 (Word-Level Timing):** Optimization, not core functionality
+- **D-3 (Speaker Diarization):** Enable if false activations from TV/guests are a problem
+- **D-4 (Proactive Participation):** Start with respond-when-addressed only, lower thresholds gradually
+- **D-5 (Attention Signals):** Required only when D-4 is enabled
+- **D-6 (Interruptibility):** Add when proactive mode is active
+- **D-7 (Non-Speech Events):** Needs investigation, defer
+- **D-8 (Library Growth):** Independent track
 
-**The critical path is TS-1 -> TS-2 -> TS-3 -> TS-5.** This is the minimum chain that transforms PTT into always-on.
+**The critical path is: TS-1 -> TS-2 -> TS-3 -> TS-8 -> TS-4 -> TS-5 -> TS-9.**
 
 ## Phasing Recommendation
 
-**Phase 1: Infrastructure** (TS-1, TS-2, TS-6)
-- Decouple audio capture from LLM processing
-- Continuous VAD-gated STT running independently
-- Rolling transcript buffer with bounded memory
-- System runs but makes no autonomous decisions yet
-- Existing PTT interaction still works alongside
+**Phase 1: Deepgram Streaming Infrastructure** (TS-1, TS-2, TS-3, TS-7, TS-8, TS-10)
+- Replace Whisper STT with Deepgram streaming WebSocket
+- VAD-gated audio streaming (cost optimization)
+- Transcript accumulation (interim -> final -> speech_final)
+- Echo suppression via PipeWire AEC + transcript gating
+- WebSocket lifecycle (KeepAlive, reconnection, timestamp management)
+- Resource monitoring and bounded buffers
+- System transcribes continuously but makes no autonomous decisions yet
+- Existing PTT-triggered pipeline still works as a fallback
 
-**Phase 2: Decision Engine** (TS-3, TS-4)
-- Ollama integration for monitoring
-- Name-based activation via transcript matching
-- Decision engine evaluates transcripts, initially conservative (high threshold)
-- Addresses only direct name mentions at first
+**Phase 2: Decision Engine + Name Activation** (TS-5, TS-6, TS-4)
+- Ollama integration for transcript monitoring
+- Decision engine evaluates each speech_final
+- Name-based activation ("Hey Russel") via interim transcript matching
+- Transcript buffer provides context window
+- Initially conservative (high confidence threshold, name-only activation)
 
-**Phase 3: Response Backend** (TS-5, TS-7)
-- Ollama as response generator for quick responses
+**Phase 3: Response Backend + Integration** (TS-9)
+- Ollama as quick response generator
 - Claude CLI for complex/tool-using requests
 - Backend selection logic
-- Basic fallback chains
+- Full pipeline integration (STT -> Decision -> Response -> TTS -> Playback)
 
-**Phase 4: Proactive Participation** (D-1, D-2, D-6, D-7)
+**Phase 4: Proactive Participation** (D-4, D-5, D-6)
 - Lower decision thresholds for proactive contributions
 - Attention signals before unsolicited responses
-- Conversation-aware tone calibration
 - Interruptibility detection
+- Conversation balance tracking
 
-**Phase 5: Polish** (D-3, D-4, D-5)
+**Phase 5: Polish + Enrichment** (D-1, D-2, D-3, D-7, D-8)
+- Real-time transcript display
+- Word-level timing analysis
+- Speaker diarization
 - Non-speech event awareness
 - Library growth curator
-- Multi-speaker awareness (if needed)
 
 ## Key Risks
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Llama 3.2 3B too slow/dumb for decision engine | Blocks TS-3, the critical feature | Benchmark early. Fallback: Llama 3.2 8B, Mistral 7B, or Phi-3 mini. Or: heuristic classifier as fast path with LLM only for ambiguous cases. |
-| GPU VRAM exhaustion (Whisper large-v3 + Llama 3.2 3B) | System crashes or slows to crawl | Profile actual VRAM usage. Fallback: Whisper small instead of large-v3 for continuous STT. Or: CPU inference for Ollama. |
-| Proactive responses are annoying | Users disable the feature | Start conservative (high threshold). Let user control aggressiveness. D-7 interruptibility detection as safety valve. |
-| Whisper hallucinations in continuous mode | False transcripts trigger false responses | Existing multi-layer STT filtering helps. Add minimum speech duration threshold. VAD gating prevents silence hallucinations. |
-| Latency budget blown | Responses feel laggy | Budget: VAD (1ms) + Whisper (500ms) + Ollama decision (200ms) + Ollama/Claude response (200ms-3s) + Piper TTS (200ms). Total: ~1-4s. Acceptable for proactive but tight for reactive. Optimize the critical path. |
+| Deepgram network dependency | No STT = no transcription = deaf assistant | CircuitBreaker + Whisper fallback (already exists) |
+| VAD onset clipping | First word of utterance cut off by VAD gate delay | Lookback buffer: keep last 2 silence chunks, send when speech starts |
+| Endpointing too aggressive (300ms) | Splits sentences mid-thought | Start at 300ms, expose as config. User can raise to 500ms+ if needed |
+| Deepgram diarization unreliable in streaming | Speaker labels wrong/missing, decision engine confused | Start WITHOUT diarization. Add as an optional enhancement once base system works |
+| Decision engine latency exceeds budget | Ollama 3B takes >500ms, pushing total past natural response window | Profile on actual hardware. Fallback: reduce `num_predict`, use smaller model, or use heuristic fast-path for obvious cases (name mention = always respond) |
+| KeepAlive not handled by SDK automatically | Connection drops during long silence periods | Defensive KeepAlive timer in application code, every 5 seconds during VAD silence |
+| Cost higher than expected | Speech fraction higher than 20% assumption | Monitor billing via Deepgram dashboard. VAD threshold tuning (raise to reduce speech detection) |
 
 ## Sources
 
-**Academic / Research:**
-- [Inner Thoughts: Proactive Conversational Agents (CHI 2025)](https://arxiv.org/html/2501.00383v2) -- Core framework for proactive AI participation with motivation thresholds
-- [Better to Ask Than Assume (CHI 2024)](https://dl.acm.org/doi/10.1145/3613904.3642193) -- User preference for VA communication strategies
-- [Proactivity Dilemma (CUI 2022)](https://dl.acm.org/doi/10.1145/3543829.3543834) -- When proactive VA behavior is desirable vs annoying
-- [Device-Directed Utterance Detection (Amazon Science)](https://arxiv.org/abs/1808.02504) -- Classifier for determining if speech is directed at assistant
-- [Proactive Conversational AI: Comprehensive Survey (ACM TOIS)](https://dl.acm.org/doi/10.1145/3715097) -- Broad survey of proactive CA approaches
+**Deepgram Official Documentation (HIGH confidence):**
+- [Configure Endpointing and Interim Results](https://developers.deepgram.com/docs/understand-endpointing-interim-results) -- is_final, speech_final, accumulation pattern
+- [Interim Results](https://developers.deepgram.com/docs/interim-results) -- Interim result behavior and timing
+- [Endpointing](https://developers.deepgram.com/docs/endpointing) -- VAD-based silence detection, configurable values
+- [UtteranceEnd](https://developers.deepgram.com/docs/utterance-end) -- Post-speech silence detection, 1000ms default
+- [Audio Keep Alive](https://developers.deepgram.com/docs/audio-keep-alive) -- KeepAlive message format, 10s timeout
+- [Speech Started](https://developers.deepgram.com/docs/speech-started) -- vad_events=true, SpeechStarted event
+- [Live Audio API Reference](https://developers.deepgram.com/reference/speech-to-text/listen-streaming) -- All query parameters, response format
+- [Measuring Streaming Latency](https://developers.deepgram.com/docs/measuring-streaming-latency) -- 80ms min, 674ms avg latency measurement
+- [Recovering From Connection Errors](https://developers.deepgram.com/docs/recovering-from-connection-errors-and-timeouts-when-live-streaming-audio) -- Reconnection, buffering, timestamp offsets
+- [Speaker Diarization](https://developers.deepgram.com/docs/diarization) -- Per-word speaker IDs
+- [Deepgram Pricing](https://deepgram.com/pricing) -- $0.0077/min Nova-3, $200 free credits
 
-**Industry / Product:**
-- [Gemini Proactive Audio (Google Cloud)](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/live-api/proactive-audio) -- Google's approach to model-decides-when-to-respond
-- [Alexa Hunches](https://www.amazon.com/gp/help/customer/display.html?nodeId=G7F5F7K93GKSLC4F) -- Amazon's pattern-based proactive assistance
-- [Microsoft Copilot Voice ("Hey Copilot")](https://support.microsoft.com/en-us/topic/using-copilot-voice-with-microsoft-copilot-efad42fc-d593-49c6-98bf-5ed94c881c32) -- Desktop voice activation with on-device wake word
+**Deepgram Billing (HIGH confidence):**
+- [GitHub Discussion #1423](https://github.com/orgs/deepgram/discussions/1423) -- Official: "bill based on duration of audio sent," "open websocket not transmitting audio does not have a cost," "keep-alive messages do not incur a charge"
 
-**Technical / Libraries:**
-- [Silero VAD](https://github.com/snakers4/silero-vad) -- Pre-trained VAD, MIT license, <1ms per chunk, 2MB model
-- [openWakeWord](https://github.com/dscripka/openWakeWord) -- Open-source wake word detection (noted as anti-feature for this project)
-- [Whisper continuous mode (whisper.cpp)](https://github.com/ggml-org/whisper.cpp/issues/304) -- Sliding window context management for continuous STT
-- [Ollama Llama 3.2](https://ollama.com/library/llama3.2) -- Local LLM with 128K context, structured output support
-- [Building a Fully Local LLM Voice Assistant (Towards AI)](https://towardsai.net/p/machine-learning/building-a-fully-local-llm-voice-assistant-a-practical-architecture-guide) -- Architecture patterns for local voice assistant
+**Deepgram SDK (HIGH confidence):**
+- [deepgram-sdk on PyPI](https://pypi.org/project/deepgram-sdk/) -- v5.3.2 stable, v6.0.0rc2 pre-release
+- [deepgram-python-sdk GitHub](https://github.com/deepgram/deepgram-python-sdk) -- AsyncClient, event handlers, streaming
 
-**Voice UX:**
-- [NVIDIA PersonaPlex](https://research.nvidia.com/labs/adlr/personaplex/) -- Natural conversational AI with backchanneling and interruption handling
-- [Wake Word Detection Guide 2026 (Picovoice)](https://picovoice.ai/blog/complete-guide-to-wake-word/) -- FAR/FRR tradeoffs, wake word vs always-listening
-- [Turn-Based Voice AI Agents (MLPills)](https://mlpills.substack.com/p/issue-120-turn-based-voice-ai-agents) -- Turn-taking architecture comparison
+**Latency Research (MEDIUM-HIGH confidence):**
+- [Twilio Voice Agent Latency Guide](https://www.twilio.com/en-us/blog/developers/best-practices/guide-core-latency-ai-voice-agents) -- STT 100-300ms, LLM 375ms, TTS 100ms typical breakdown
+- [Tavus Turn-Taking Guide](https://www.tavus.io/post/ai-turn-taking) -- 200ms natural response gap, 300-400ms feels awkward
+- [Krisp Turn-Taking Model](https://krisp.ai/blog/turn-taking-for-voice-ai/) -- Semantic endpointing, TRP detection
+
+**Existing Codebase (HIGH confidence):**
+- test_live_session.py lines 132-178: Deepgram `is_final`/`speech_final` accumulation tests
+- live_session.py line 294: `CircuitBreaker("STT/Deepgram")` already exists
+- requirements.txt line 24: `deepgram-sdk>=3.0` already a dependency
+- continuous_stt.py: ContinuousSTT with VAD gating pattern (to be replaced by Deepgram streaming)
+- transcript_buffer.py: TranscriptBuffer ring buffer (to be reused)
+
+---
+*Feature landscape research for: v2.0 Always-On Observer (Deepgram streaming pivot)*
+*Researched: 2026-02-22*
+*Supersedes: 2026-02-21 features research (Whisper batch-based)*

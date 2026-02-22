@@ -1,772 +1,1126 @@
-# Architecture: v2.0 Decoupled Input Stream + LLM Observer
+# Architecture: Deepgram Streaming STT + Local Decision Model Integration
 
-**Domain:** Always-on voice assistant with independent input capture, monitoring layer, and configurable response backend
-**Researched:** 2026-02-21
-**Overall Confidence:** HIGH (codebase fully read, existing pipeline thoroughly understood, patterns verified)
+**Domain:** Always-on voice assistant -- Deepgram streaming replaces local Whisper for STT
+**Researched:** 2026-02-22
+**Overall Confidence:** HIGH (codebase fully read, Deepgram SDK docs verified, existing patterns mapped)
 
 ## Executive Summary
 
-The v2.0 architecture transforms the current 5-stage sequential pipeline into a decoupled system with three independent loops: (1) an always-on input stream that continuously captures audio and produces transcripts, (2) a monitoring loop that watches the transcript stream via a local LLM and decides when and how to respond, and (3) a response generation layer that produces the actual reply through either Claude CLI or Ollama.
+This document maps how Deepgram streaming STT integrates with the existing push-to-talk pipeline. The pivot replaces local Whisper batch-transcribe (~1.5-3s latency) with Deepgram Nova-3 WebSocket streaming (~150ms word-level results). The integration touches three files significantly: `continuous_stt.py` is replaced by a new `deepgram_stt.py`, `live_session.py` rewires stage 2 to consume Deepgram output, and `transcript_buffer.py` gains minor additions. Everything downstream (LLM stage, StreamComposer, playback, event bus) is unchanged.
 
-The critical insight from reading the existing codebase: the current pipeline is already partially decoupled. Audio capture runs in a daemon thread, STT runs in a thread executor, and the LLM stage consumes from a queue independently. The main coupling point is the `_stt_gated` flag -- STT is suppressed during AI playback because the system assumes a strict turn-taking model (user speaks, AI responds, user waits). Removing this assumption is the single biggest architectural change. Everything else -- composer, playback, barge-in, filler system, event bus -- can remain largely unchanged.
+The critical architectural insight: the existing `ContinuousSTT` class already has the right interface -- it produces `TranscriptSegment` objects into a `TranscriptBuffer`. The new `DeepgramSTT` class keeps this exact interface but replaces the internals (Whisper inference with Deepgram WebSocket, local VAD-gated silence detection with Deepgram's server-side endpointing). The `_stt_stage()` method in `live_session.py` also has a parallel code path that does VAD + Whisper -- this gets replaced by consuming `DeepgramSTT` output.
 
-The second insight: GPU memory is the binding constraint. The RTX 3070 has 8GB VRAM. Whisper large-v3 uses ~3-4GB. Ollama with Llama 3.2 3B at int4 uses ~2GB. Together they fit, but switching Whisper to the `small` or `medium` model (0.5-1.5GB) gives comfortable headroom and makes continuous operation sustainable. Continuous Whisper transcription fundamentally changes the GPU utilization profile from burst (transcribe on silence) to sustained (transcribe every few seconds).
+The second insight: Deepgram's `speech_final` flag maps directly to the existing `END_OF_UTTERANCE` frame type. When Deepgram signals `speech_final=True`, we emit `END_OF_UTTERANCE` + `TRANSCRIPT` into `_stt_out_q`, exactly as the Whisper path does today. The LLM stage does not know or care that the transcript came from Deepgram instead of Whisper.
 
-## Current Architecture (v1.x)
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     SEQUENTIAL PIPELINE                         │
-│                                                                 │
-│  ┌──────────┐  audio_in_q  ┌──────────┐  stt_out_q  ┌───────┐ │
-│  │  Audio   ├─────────────>│   STT    ├────────────>│  LLM  │ │
-│  │ Capture  │              │ (Whisper) │             │(Claude│ │
-│  │(PulseAudio)             │ +VAD     │             │  CLI) │ │
-│  └──────────┘              └──────────┘             └───┬───┘ │
-│       ^                        ^                        │     │
-│       │                        │ _stt_gated             │     │
-│       │                        │ (suppressed             │     │
-│       │                        │  during playback)       v     │
-│  ┌──────────┐              ┌──────────┐           ┌─────────┐ │
-│  │ Playback │<─────────────│ Composer │<──────────│ Filler  │ │
-│  │(PyAudio) │  audio_out_q │(TTS+queue)│          │ Manager │ │
-│  └──────────┘              └──────────┘           └─────────┘ │
-│                                                                 │
-│  PTT key held = mic unmuted, STT active                        │
-│  PTT key released = STT flush, generation cycle                │
-│  AI speaking = _stt_gated=True, VAD active for barge-in       │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Key Coupling Points in Current Architecture
-
-1. **`_stt_gated` flag** (live_session.py line 211): When AI is speaking, STT discards all audio. The mic stays live (for VAD barge-in), but no transcription happens. This prevents the system from hearing anything while responding.
-
-2. **`set_muted()` / `_stt_flush_event`** (lines 2656-2673): The PTT key directly controls whether STT accumulates audio. Key release triggers a flush-and-transcribe cycle. This is the fundamental PTT coupling.
-
-3. **`_llm_stage()` blocking on `_stt_out_q`** (line 2395): The LLM stage sits idle waiting for a transcript. It processes exactly one transcript per cycle, then blocks again. There is no concept of "monitoring" an ongoing stream.
-
-4. **`generation_id` for coherence** (line 219): All frames carry a generation ID. When the user interrupts (barge-in), the ID increments and stale frames are discarded. This system works well and should be preserved.
-
-5. **Filler manager races with LLM** (line 2421): The filler system and LLM response run concurrently, with the filler canceled when LLM text arrives. This pattern translates directly to the new architecture.
-
-## Target Architecture (v2.0)
+## Current Architecture (What Exists Today)
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                                                                      │
-│  ╔══════════════════════════════════╗                                 │
-│  ║  INPUT STREAM (always running)  ║                                 │
-│  ║                                  ║                                 │
-│  ║  ┌──────────┐    ┌───────────┐  ║                                 │
-│  ║  │  Audio   ├───>│Continuous │  ║                                 │
-│  ║  │ Capture  │    │ Whisper   │  ║                                 │
-│  ║  │          │    │ STT       │  ║                                 │
-│  ║  └──────────┘    └─────┬─────┘  ║                                 │
-│  ║                        │        ║                                 │
-│  ║               TranscriptSegment ║                                 │
-│  ║                        │        ║                                 │
-│  ║                        v        ║                                 │
-│  ║              ┌──────────────┐   ║                                 │
-│  ║              │ Transcript   │   ║                                 │
-│  ║              │ Buffer       │   ║  ──> EventBus (all events)      │
-│  ║              │ (ring buffer │   ║                                 │
-│  ║              │  + context)  │   ║                                 │
-│  ║              └──────┬───────┘   ║                                 │
-│  ╚═════════════════════╪═══════════╝                                 │
-│                        │ (read-only access)                          │
-│                        v                                             │
-│  ╔═════════════════════════════════════╗                              │
-│  ║  MONITOR (Ollama, polling loop)    ║                              │
-│  ║                                     ║                              │
-│  ║  ┌────────────────────────────┐    ║                              │
-│  ║  │ Monitor Loop               │    ║                              │
-│  ║  │ - Reads transcript buffer  │    ║                              │
-│  ║  │ - Builds context window    │    ║                              │
-│  ║  │ - Calls Ollama (3B)       │    ║                              │
-│  ║  │ - Decides: RESPOND / WAIT │    ║                              │
-│  ║  │ - Routes to backend       │    ║                              │
-│  ║  └─────────────┬──────────────┘    ║                              │
-│  ╚════════════════╪═══════════════════╝                              │
-│                   │                                                   │
-│         ResponseDecision                                             │
-│         {action, backend,                                            │
-│          prompt, context}                                            │
-│                   │                                                   │
-│                   v                                                   │
-│  ╔═════════════════════════════════════╗                              │
-│  ║  RESPONSE (Claude CLI or Ollama)   ║                              │
-│  ║                                     ║                              │
-│  ║  ┌────────────┐  ┌─────────────┐  ║                              │
-│  ║  │ Claude CLI │  │ Ollama      │  ║                              │
-│  ║  │ (deep/     │  │ (quick/     │  ║                              │
-│  ║  │  tools)    │  │  local)     │  ║                              │
-│  ║  └─────┬──────┘  └──────┬──────┘  ║                              │
-│  ║        └────────┬───────┘         ║                              │
-│  ╚═════════════════╪═════════════════╝                              │
-│                    │                                                  │
-│           text deltas / sentences                                    │
-│                    │                                                  │
-│                    v                                                  │
-│  ╔═════════════════════════════════════╗                              │
-│  ║  OUTPUT (unchanged from v1.x)      ║                              │
-│  ║                                     ║                              │
-│  ║  ┌──────────┐    ┌──────────┐     ║                              │
-│  ║  │ Stream   ├───>│ Playback │     ║                              │
-│  ║  │ Composer │    │ (PyAudio)│     ║                              │
-│  ║  │ (+TTS)   │    │          │     ║                              │
-│  ║  └──────────┘    └──────────┘     ║                              │
-│  ╚═════════════════════════════════════╝                              │
-│                                                                      │
-│  ┌────────────────────────────────────────────────────┐              │
-│  │ SUPPORT (unchanged from v1.x)                      │              │
-│  │ - Filler/Response library (quick clips)            │              │
-│  │ - Input classifier (heuristic + semantic)          │              │
-│  │ - Learner daemon                                   │              │
-│  │ - Event bus (JSONL)                                │              │
-│  │ - SSE dashboard                                    │              │
-│  │ - Task manager                                     │              │
-│  └────────────────────────────────────────────────────┘              │
-└──────────────────────────────────────────────────────────────────────┘
+ PIPELINE STAGES (asyncio.gather in run(), live_session.py:2951-2959)
+ =====================================================================
+
+ Stage 1: _audio_capture_stage()     [daemon thread -> asyncio Queue]
+           pasimple.read(4096) at 24kHz 16-bit mono
+           -> PipelineFrame(AUDIO_RAW) -> _audio_in_q (maxsize=100)
+
+ Stage 2: _stt_stage()               [asyncio coroutine]
+           Reads _audio_in_q
+           VAD + silence detection + energy thresholds
+           Whisper transcription (run_in_executor)
+           -> PipelineFrame(END_OF_UTTERANCE) -> _stt_out_q
+           -> PipelineFrame(TRANSCRIPT, data=text) -> _stt_out_q
+
+ Stage 3: _llm_stage()               [asyncio coroutine]
+           Reads _stt_out_q
+           Sends transcript to Claude CLI subprocess
+           Streams response text -> StreamComposer
+
+ Stage 4: _composer.run()            [asyncio coroutine]
+           Receives AudioSegment(TTS_SENTENCE)
+           Calls Piper TTS for each sentence
+           -> PipelineFrame(TTS_AUDIO) -> _audio_out_q
+
+ Stage 5: _playback_stage()          [asyncio coroutine]
+           Reads _audio_out_q
+           Writes PCM to PyAudio callback stream
+
+ Parallel: _continuous_stt.start()   [daemon thread + asyncio processing]
+            Separate pasimple capture
+            VAD + Whisper -> TranscriptSegment -> TranscriptBuffer
+            (Phase 12 always-on layer, currently runs alongside)
+
+ Parallel: interrupt_loop()          [asyncio coroutine, 50ms poll]
+ Parallel: _sse_server_stage()       [asyncio TCP server]
 ```
 
-### New Components
+### Key Files and Integration Points
 
-#### 1. Continuous STT (`ContinuousSTT`)
+| File | Lines | Role |
+|------|-------|------|
+| `live_session.py` | ~3050 | Pipeline orchestrator, all 5 stages |
+| `continuous_stt.py` | ~437 | ContinuousSTT class (BEING REPLACED) |
+| `transcript_buffer.py` | ~168 | TranscriptSegment, TranscriptBuffer, is_hallucination() (KEEPING) |
+| `pipeline_frames.py` | ~29 | FrameType enum, PipelineFrame dataclass (KEEPING) |
+| `event_bus.py` | ~335 | JSONL event bus (KEEPING) |
+| `stream_composer.py` | ~80+ | Unified audio output queue (KEEPING) |
+| `vram_monitor.py` | ~50+ | GPU VRAM monitoring (KEEPING, less critical with Whisper gone) |
+| `openai_realtime.py` | ~439 | Reference WebSocket patterns (READ-ONLY reference) |
 
-**What it replaces:** The `_stt_stage()` method in `live_session.py` (lines 2179-2383).
+### Current Data Flow for a Single Utterance
 
-**Key change:** Instead of accumulating audio until silence-after-speech and producing one transcript per turn, the continuous STT produces a stream of `TranscriptSegment` objects. Each segment represents a chunk of recognized speech, tagged with timestamps, speaker confidence, and whether it is final or interim.
+```
+User speaks "What time is it?"
+  |
+  v
+_audio_capture_stage (thread) -> PipelineFrame(AUDIO_RAW, data=4096 bytes)
+  |                                          |
+  v                                          v
+_audio_in_q ----+-----------------------+---> _stt_stage()
+                |                       |
+                |  (muted? skip)        |  (stt_gated? skip, but run VAD for barge-in)
+                |                       |
+                |                       v
+                |              RMS silence detection + energy thresholds
+                |              Accumulate until silence (0.8s) or safety cap (10s)
+                |                       |
+                |                       v
+                |              Whisper transcribe (run_in_executor, 500ms-2s)
+                |              Hallucination filter
+                |                       |
+                |                       v
+                |              PipelineFrame(END_OF_UTTERANCE) -> _stt_out_q
+                |              PipelineFrame(TRANSCRIPT, "What time is it?") -> _stt_out_q
+                |
+                v
+        _continuous_stt (separate capture, separate VAD, separate Whisper)
+        -> TranscriptSegment -> TranscriptBuffer (Phase 12)
+```
 
-**Implementation approach:** Use the existing faster-whisper library in a rolling-buffer pattern. Process audio in overlapping windows (e.g., every 2-3 seconds, with 1 second overlap). Compare consecutive transcriptions to extract stable (confirmed) text versus speculative (in-progress) text.
+### Current ContinuousSTT Interface (continuous_stt.py)
+
+This is the interface we must replicate:
 
 ```python
-@dataclass
-class TranscriptSegment:
-    text: str                    # Transcribed text
-    timestamp: float             # Wall clock time
-    is_final: bool               # True = confirmed, False = interim
-    audio_start: float           # Start time in audio stream
-    audio_end: float             # End time in audio stream
-    confidence: float            # Whisper confidence
-    has_speech: bool             # VAD confirmed speech
-    metadata: dict               # no_speech_prob, avg_logprob, etc.
+class ContinuousSTT:
+    def __init__(self, transcript_buffer, vram_monitor=None,
+                 aec_device_name=None, on_segment=None, on_stats=None):
+        # transcript_buffer: TranscriptBuffer to append segments to
+        # on_segment: callback(TranscriptSegment) for each new segment
+        # on_stats: callback(dict) for periodic stats
+
+    async def start(self):       # Begin capture + transcription loop
+    def stop(self):              # Signal graceful shutdown
+    def set_playing_audio(self, playing):  # Gate during TTS playback + cooldown
+
+    @property
+    def running(self) -> bool:
+    @property
+    def stats(self) -> dict:
 ```
 
-**Why rolling windows, not streaming Whisper:** Whisper is not a streaming model. Libraries like WhisperLive and whisper_streaming simulate streaming by re-transcribing overlapping audio windows and diffing the results. This is the proven approach. The key optimization: use a smaller Whisper model (`small` or `medium` instead of `large-v3`) to make repeated transcription fast enough for continuous operation.
+Used by `live_session.py`:
+- Line 2930: `self._continuous_stt = ContinuousSTT(transcript_buffer=..., on_segment=..., on_stats=...)`
+- Line 2959: `self._continuous_stt.start()` (in asyncio.gather)
+- Line 2642-2643: `self._continuous_stt.set_playing_audio(False)` (on playback end)
+- Line 2674-2675: `self._continuous_stt.set_playing_audio(True)` (on playback start)
+- Line 2728-2729: `self._continuous_stt.set_playing_audio(False)` (on barge-in)
+- Line 2788-2789: `self._continuous_stt.set_playing_audio(False)` (post barge-in)
+- Line 2970-2971: `self._continuous_stt.stop()` (cleanup)
 
-**Whisper model size trade-off:**
+## Target Architecture (After Deepgram Integration)
 
-| Model | VRAM | Transcription Speed (3s audio) | WER | Continuous Feasible? |
-|-------|------|-------------------------------|-----|---------------------|
-| large-v3 | ~3.9GB | 400-800ms | Best | Marginal (GPU contention with Ollama) |
-| medium | ~1.5GB | 150-300ms | Good | Yes |
-| small | ~0.5GB | 50-150ms | Acceptable | Yes, comfortable |
-| distil-large-v3 | ~1.5GB | 100-200ms | Near large-v3 | Yes (best trade-off) |
+```
+ PIPELINE STAGES (modified)
+ =====================================================================
 
-**Recommendation:** Use `distil-large-v3` for the continuous STT. It has near-large-v3 accuracy at medium-model speed and VRAM. This leaves ~4-5GB free for Ollama. Falls back to `small` if GPU memory is tight.
+ Stage 1: _audio_capture_stage()     [UNCHANGED]
+           pasimple.read(4096) at 24kHz 16-bit mono
+           -> PipelineFrame(AUDIO_RAW) -> _audio_in_q
 
-**Confidence: MEDIUM** -- distil-large-v3 performance claims are from the faster-whisper docs and community benchmarks, not independently verified. The rolling-window approach is proven by WhisperLive and whisper_streaming projects.
+ Stage 2: _stt_stage()               [REWRITTEN - consumes DeepgramSTT output]
+           No longer does VAD/silence/Whisper internally
+           Reads from deepgram_transcript_q (fed by DeepgramSTT callbacks)
+           Emits same END_OF_UTTERANCE + TRANSCRIPT frames
+           -> _stt_out_q (SAME interface to LLM stage)
 
-**STT gating removal:** The `_stt_gated` flag is removed entirely. The input stream runs continuously regardless of whether the AI is speaking. The monitor decides whether incoming speech is relevant (user talking to the AI vs. background conversation). This is a fundamental shift.
+ Stage 3: _llm_stage()               [UNCHANGED]
+ Stage 4: _composer.run()            [UNCHANGED]
+ Stage 5: _playback_stage()          [UNCHANGED]
 
-**VAD integration:** Silero VAD (already loaded, line 1306) continues to run on the audio stream. Its role changes from "detect barge-in during playback" to "detect any speech activity at any time." VAD-positive chunks get transcribed; VAD-negative chunks are silently discarded. This prevents wasting GPU on silence/noise.
+ Parallel: _deepgram_stt.start()     [NEW - replaces _continuous_stt.start()]
+            DeepgramSTT class
+            Reads audio from _audio_in_q (shared with Stage 2)
+              OR has its own pasimple capture (see design choice below)
+            VAD gates what reaches Deepgram WebSocket
+            Deepgram callbacks -> TranscriptSegment -> TranscriptBuffer
+            Deepgram callbacks -> _deepgram_transcript_q -> STT stage
 
-#### 2. Transcript Buffer (`TranscriptBuffer`)
+ Parallel: interrupt_loop()          [UNCHANGED]
+ Parallel: _sse_server_stage()       [UNCHANGED]
 
-**What it is:** A shared, thread-safe data structure that accumulates transcript segments and provides a sliding-window view for the monitor.
+ REMOVED: _continuous_stt.start() (Whisper-based)
+ REMOVED: _stt_whisper_fallback() method (lines 1406-1457)
+ REMOVED: _whisper_transcribe() method (lines 1459-1517)
+```
 
-**Why a separate component:** The monitor needs to read the full recent context (last N seconds or N tokens of conversation). The STT produces segments one at a time. The buffer bridges these two rates, handling deduplication of interim-then-final segments and managing the context window.
+### Target Data Flow
+
+```
+User speaks "What time is it?"
+  |
+  v
+_audio_capture_stage (thread) -> PipelineFrame(AUDIO_RAW, data=4096 bytes)
+  |
+  v
+_audio_in_q (maxsize=100)
+  |
+  +--> _stt_stage() [NEW: thin consumer, reads deepgram_transcript_q]
+  |        |
+  |        |  Reads from _deepgram_transcript_q (populated by DeepgramSTT)
+  |        |  Checks _stt_gated (suppress during playback)
+  |        |  Checks muted
+  |        |  Emits END_OF_UTTERANCE + TRANSCRIPT on speech_final
+  |        |
+  |        v
+  |    _stt_out_q -> _llm_stage() [UNCHANGED from here]
+  |
+  +--> DeepgramSTT._audio_forwarder() [NEW]
+           |
+           |  Reads AUDIO_RAW frames from _audio_in_q (or own capture)
+           |  Runs Silero VAD on each chunk
+           |  If speech: sends raw PCM to Deepgram WebSocket
+           |  If silence: sends KeepAlive every 5s
+           |
+           v
+       Deepgram WebSocket (wss://api.deepgram.com/v1/listen)
+           |  model=nova-3, encoding=linear16, sample_rate=24000
+           |  interim_results=true, endpointing=300, utterance_end_ms=1000
+           |  smart_format=true, vad_events=true
+           |
+           v
+       Deepgram Callbacks:
+           on_message -> parse is_final, speech_final
+               interim (is_final=false): log/display only
+               final (is_final=true): accumulate text
+               speech_final (is_final=true, speech_final=true):
+                   -> flush accumulated -> TranscriptSegment
+                   -> TranscriptBuffer.append()
+                   -> _deepgram_transcript_q.put()
+                   -> on_segment callback
+           on_utterance_end -> secondary end-of-speech signal
+           on_speech_started -> emit event bus "stt_start"
+           on_error -> log, trigger reconnect
+           on_close -> reconnect with backoff
+```
+
+## New Component: DeepgramSTT (deepgram_stt.py)
+
+### Class Design
 
 ```python
-class TranscriptBuffer:
-    """Thread-safe, append-only transcript accumulator with sliding window access."""
+"""Deepgram streaming STT with VAD cost-gating.
 
-    def __init__(self, max_age_seconds: float = 300, max_tokens: int = 2048):
-        self._segments: deque[TranscriptSegment] = deque()
-        self._lock = asyncio.Lock()
-        self._max_age = max_age_seconds
-        self._max_tokens = max_tokens
-        self._new_segment_event = asyncio.Event()
-        self._token_count = 0
+Replaces ContinuousSTT. Same external interface:
+- Produces TranscriptSegment objects into a TranscriptBuffer
+- on_segment/on_stats callbacks
+- set_playing_audio() for playback suppression
+- start()/stop() lifecycle
 
-    async def append(self, segment: TranscriptSegment):
-        """Add a new segment. Replaces interim segment with same audio range if final."""
-        async with self._lock:
-            # Replace interim with final if covering same time range
-            if segment.is_final:
-                self._segments = deque(
-                    s for s in self._segments
-                    if not (not s.is_final
-                            and s.audio_start >= segment.audio_start - 0.5
-                            and s.audio_end <= segment.audio_end + 0.5)
-                )
-            self._segments.append(segment)
-            self._evict_old()
-            self._new_segment_event.set()
+Key difference: STT inference is cloud-based (Deepgram WebSocket),
+not local (Whisper). Silero VAD runs locally to gate what audio
+reaches Deepgram (cost saving, not latency saving).
+"""
 
-    async def get_context(self, max_tokens: int = 0) -> list[TranscriptSegment]:
-        """Get recent segments within token budget."""
-        budget = max_tokens or self._max_tokens
-        async with self._lock:
-            result = []
-            tokens_used = 0
-            for seg in reversed(self._segments):
-                seg_tokens = len(seg.text.split()) * 1.3  # rough token estimate
-                if tokens_used + seg_tokens > budget:
-                    break
-                result.append(seg)
-                tokens_used += seg_tokens
-            return list(reversed(result))
+import asyncio
+import time
+import threading
+from pathlib import Path
+from dataclasses import dataclass
 
-    async def get_since(self, timestamp: float) -> list[TranscriptSegment]:
-        """Get all segments since a timestamp. Used by monitor to get new input."""
-        async with self._lock:
-            return [s for s in self._segments if s.timestamp > timestamp]
+from deepgram import DeepgramClient, AsyncDeepgramClient
+from deepgram.core.events import EventType
 
-    async def wait_for_new(self, timeout: float = 1.0) -> bool:
-        """Block until a new segment arrives or timeout. Returns True if new data."""
-        self._new_segment_event.clear()
+from transcript_buffer import TranscriptBuffer, TranscriptSegment, is_hallucination
+
+# Audio settings (match live_session.py)
+SAMPLE_RATE = 24000
+CHANNELS = 1
+CHUNK_SIZE = 4096  # ~85ms at 24kHz 16-bit mono
+BYTES_PER_SAMPLE = 2
+
+# VAD settings
+VAD_THRESHOLD = 0.5
+
+# Deepgram connection settings
+KEEPALIVE_INTERVAL = 5.0  # seconds between KeepAlive when no speech
+RECONNECT_DELAY_BASE = 1.0  # seconds, doubles on each retry
+RECONNECT_MAX_DELAY = 30.0
+MAX_RECONNECT_ATTEMPTS = 10
+
+# Stats reporting
+STATS_INTERVAL_SECONDS = 5.0
+
+
+class DeepgramSTT:
+    """VAD-gated Deepgram streaming STT producing TranscriptSegments.
+
+    Architecture:
+    - Audio capture: reads from shared _audio_in_q OR own pasimple capture
+    - VAD: Silero ONNX (CPU, <1ms per chunk) gates audio to Deepgram
+    - Deepgram: WebSocket streaming, Nova-3 model
+    - Output: TranscriptSegment -> TranscriptBuffer, callbacks, _transcript_q
+
+    Args:
+        api_key: Deepgram API key
+        transcript_buffer: TranscriptBuffer to append segments to
+        transcript_q: asyncio.Queue for pipeline integration (STT stage reads this)
+        aec_device_name: PipeWire AEC source name (None = default mic)
+        on_segment: callback(TranscriptSegment) for each new segment
+        on_stats: callback(dict) for periodic stats
+    """
+
+    def __init__(self, api_key, transcript_buffer, transcript_q=None,
+                 aec_device_name=None, on_segment=None, on_stats=None):
+        self._api_key = api_key
+        self._transcript_buffer = transcript_buffer
+        self._transcript_q = transcript_q  # For pipeline STT stage
+        self._aec_device_name = aec_device_name
+        self._on_segment = on_segment
+        self._on_stats = on_stats
+
+        self._running = False
+        self._stop_event = threading.Event()
+
+        # Playback suppression (same interface as ContinuousSTT)
+        self._playing_audio = False
+        self._playback_end_time = 0.0
+        self._PLAYBACK_COOLDOWN = 0.3  # Shorter than Whisper -- Deepgram handles echo better
+
+        # Deepgram connection
+        self._dg_connection = None
+        self._connected = False
+        self._reconnect_attempts = 0
+
+        # VAD (reuse Silero ONNX)
+        self._vad_model = None
+        self._vad_state = None
+
+        # Transcript accumulation (between is_final segments until speech_final)
+        self._accumulated_finals = []
+
+        # Audio forwarding queue (capture thread -> async forwarder)
+        self._audio_q = asyncio.Queue(maxsize=200)
+
+        # KeepAlive tracking
+        self._last_audio_sent_time = 0.0
+
+        # Stats
+        self._segment_count = 0
+        self._hallucination_count = 0
+        self._latencies = []  # Time from speech_final to segment emission
+        self._last_stats_time = 0.0
+        self._speech_start_time = 0.0  # When Deepgram detected speech start
+
+    # ── Public interface (matches ContinuousSTT) ──
+
+    @property
+    def running(self):
+        return self._running
+
+    @property
+    def stats(self):
+        avg_latency = (
+            sum(self._latencies) / len(self._latencies)
+            if self._latencies else 0.0
+        )
+        return {
+            'segment_count': self._segment_count,
+            'hallucination_count': self._hallucination_count,
+            'avg_latency_ms': avg_latency,
+            'buffer_depth': len(self._transcript_buffer),
+            'connected': self._connected,
+            'reconnect_attempts': self._reconnect_attempts,
+        }
+
+    async def start(self):
+        """Begin capture + Deepgram streaming loop."""
+        self._running = True
+        self._stop_event.clear()
+        self._last_stats_time = time.time()
+
+        self._load_vad_model()
+
+        # Start audio capture thread
+        device_name = self._resolve_device()
+        loop = asyncio.get_event_loop()
+        capture_thread = threading.Thread(
+            target=self._capture_thread, args=(device_name, loop), daemon=True
+        )
+        capture_thread.start()
+
+        print("DeepgramSTT: Started", flush=True)
+
         try:
-            await asyncio.wait_for(self._new_segment_event.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            return False
+            # Main loop: connect to Deepgram, forward audio, handle reconnects
+            await self._connection_loop()
+        except Exception as e:
+            print(f"DeepgramSTT: Fatal error: {e}", flush=True)
+        finally:
+            self._running = False
+            print("DeepgramSTT: Stopped", flush=True)
 
-    def _evict_old(self):
-        """Remove segments older than max_age or exceeding token budget."""
-        cutoff = time.time() - self._max_age
-        while self._segments and self._segments[0].timestamp < cutoff:
-            self._segments.popleft()
-```
+    def stop(self):
+        """Signal graceful shutdown."""
+        self._running = False
+        self._stop_event.set()
 
-**Context window management strategy:**
+    def set_playing_audio(self, playing):
+        """Called by LiveSession during TTS playback.
 
-The buffer maintains a 5-minute rolling window of transcript segments. The monitor reads from this buffer with a configurable token budget (default 2048 tokens, which is generous for Llama 3.2 3B's context window of 131K tokens but keeps inference fast).
+        During playback, audio is still sent to Deepgram (for KeepAlive and
+        so the connection stays open), but transcripts are suppressed to
+        avoid transcribing the AI's own speech.
 
-Why NOT summarization: For a voice assistant monitoring ambient audio, the recent raw text is more valuable than a summary. The monitor needs to see exact phrasing, pauses, and turn boundaries to decide whether to respond. Summarization loses these signals. The 5-minute / 2048-token window is sufficient because conversational context rarely extends beyond a few minutes.
+        NOTE: Unlike ContinuousSTT which discards audio during playback,
+        DeepgramSTT keeps streaming audio. Deepgram handles echo better
+        than local Whisper, and PipeWire AEC removes the AI's voice
+        from the mic signal. We suppress the TRANSCRIPT output, not the
+        audio input.
+        """
+        self._playing_audio = playing
+        if not playing:
+            self._playback_end_time = time.time()
 
-Why NOT vector retrieval: The monitor needs temporal context (what was said recently, in order), not semantic retrieval. Vector stores are for "find relevant past information," not "what just happened in the last 30 seconds."
+    # ── Connection lifecycle ──
 
-#### 3. Monitor Loop (`MonitorLoop`)
+    async def _connection_loop(self):
+        """Manage Deepgram WebSocket connection with reconnection."""
+        while self._running:
+            try:
+                await self._connect_and_stream()
+            except Exception as e:
+                if not self._running:
+                    break
+                self._connected = False
+                self._reconnect_attempts += 1
+                delay = min(
+                    RECONNECT_DELAY_BASE * (2 ** (self._reconnect_attempts - 1)),
+                    RECONNECT_MAX_DELAY
+                )
+                print(f"DeepgramSTT: Connection failed ({e}), "
+                      f"retry {self._reconnect_attempts} in {delay:.1f}s", flush=True)
+                if self._reconnect_attempts > MAX_RECONNECT_ATTEMPTS:
+                    print("DeepgramSTT: Max reconnect attempts reached", flush=True)
+                    break
+                await asyncio.sleep(delay)
 
-**What it is:** An asyncio coroutine that polls the transcript buffer, builds a prompt with recent context, calls Ollama (Llama 3.2 3B) to decide whether to respond, and if yes, routes the response to the appropriate backend.
+    async def _connect_and_stream(self):
+        """Connect to Deepgram, register callbacks, forward audio."""
+        client = DeepgramClient(self._api_key)
 
-**This is the brain of v2.0.** It replaces the simple "transcript arrives -> send to LLM" flow with a deliberate decision cycle.
-
-```python
-@dataclass
-class ResponseDecision:
-    action: str                  # "respond", "wait", "acknowledge", "ignore"
-    backend: str                 # "claude", "ollama", "filler"
-    confidence: float            # 0.0 - 1.0
-    prompt: str                  # What to send to the response backend
-    reasoning: str               # Why (for logging/debugging)
-    trigger_segment_id: int      # Which segment triggered the response
-
-class MonitorLoop:
-    """Watches transcript buffer, decides when and how to respond."""
-
-    POLL_INTERVAL = 0.5          # Check for new transcripts every 500ms
-    SILENCE_THRESHOLD = 2.0      # Seconds of silence before evaluating
-    MIN_NEW_TOKENS = 5           # Minimum new words before evaluating
-    COOLDOWN_AFTER_RESPONSE = 3.0  # Don't respond again for N seconds
-
-    def __init__(self, transcript_buffer, ollama_client, response_router):
-        self._buffer = transcript_buffer
-        self._ollama = ollama_client
-        self._router = response_router
-        self._last_eval_time = 0
-        self._last_response_time = 0
-        self._last_seen_timestamp = 0
-        self._responding = False  # True while AI is generating/speaking
-
-    async def run(self):
-        """Main monitor loop. Runs forever."""
-        while True:
-            # Wait for new transcript data
-            has_new = await self._buffer.wait_for_new(timeout=self.POLL_INTERVAL)
-
-            if self._responding:
-                continue  # Don't evaluate while AI is speaking
-
-            # Cooldown: don't re-evaluate immediately after responding
-            if time.time() - self._last_response_time < self.COOLDOWN_AFTER_RESPONSE:
-                continue
-
-            # Get segments since last evaluation
-            new_segments = await self._buffer.get_since(self._last_seen_timestamp)
-            if not new_segments:
-                continue
-
-            # Update timestamp
-            self._last_seen_timestamp = new_segments[-1].timestamp
-
-            # Check if there is enough new content to evaluate
-            new_text = " ".join(s.text for s in new_segments if s.is_final)
-            if len(new_text.split()) < self.MIN_NEW_TOKENS:
-                continue
-
-            # Check for silence (user stopped speaking)
-            last_segment_age = time.time() - new_segments[-1].timestamp
-            if last_segment_age < self.SILENCE_THRESHOLD:
-                continue  # User might still be talking
-
-            # Build full context and evaluate
-            context = await self._buffer.get_context(max_tokens=1500)
-            decision = await self._evaluate(context, new_segments)
-
-            if decision.action == "respond":
-                self._responding = True
-                self._last_response_time = time.time()
-                await self._router.route(decision)
-                self._responding = False
-            elif decision.action == "acknowledge":
-                # Play a quick filler clip without full LLM response
-                await self._router.acknowledge(decision)
-```
-
-**Monitor decision prompt (sent to Ollama):**
-
-```
-You are monitoring a live conversation. Decide whether the AI assistant
-should respond to what was just said.
-
-Recent conversation context:
-{context_text}
-
-New input (since last check):
-{new_text}
-
-The AI assistant's name is "Russel". Respond in JSON:
-{
-  "action": "respond" | "wait" | "acknowledge" | "ignore",
-  "backend": "claude" | "ollama",
-  "confidence": 0.0-1.0,
-  "reasoning": "brief explanation"
-}
-
-Guidelines:
-- "respond" when the user is talking to the AI or asking a question
-- "wait" when the user is mid-thought and hasn't finished
-- "acknowledge" when the user said something that deserves a brief reaction
-  but not a full response (e.g., "interesting", sigh, laugh)
-- "ignore" when the user is talking to someone else or it is background noise
-- Use "claude" backend for complex questions, tasks, code, or anything
-  requiring tools
-- Use "ollama" backend for simple factual answers, casual chat, or when
-  speed matters more than depth
-- If the user says the AI's name ("Russel", "hey Russel"), always "respond"
-```
-
-**Ollama inference characteristics (Llama 3.2 3B):**
-
-- Model size: ~2GB VRAM at int4 quantization
-- Inference latency: 100-300ms for short structured outputs
-- Context: 131K tokens (more than enough for our 1500-token window)
-- Structured output: Supports JSON mode via `format: "json"` parameter
-
-**Confidence: MEDIUM** -- Llama 3.2 3B's ability to reliably make respond/wait/ignore decisions has not been tested. The 3B model may struggle with nuanced turn-taking detection. If it proves unreliable, a hybrid approach (heuristic pre-filter + Ollama for ambiguous cases) would be the fallback. The existing input classifier's heuristic patterns could serve as the fast path.
-
-**Monitor evaluation frequency:**
-
-The monitor does NOT call Ollama on every transcript segment. It batches: accumulate segments, wait for a silence gap (2 seconds), check minimum word count (5 words), then evaluate. This means:
-- ~1-2 Ollama calls per user utterance (not per chunk)
-- Each call takes 100-300ms
-- Total latency from user-stops-speaking to decision: 2.0-2.3 seconds
-
-This is slower than the current PTT system (which has ~0s decision latency because the key release IS the decision). The 2-second silence threshold is the primary UX parameter to tune. LiveKit's turn detection research suggests semantic endpointing can reduce this, but for v2.0, silence-based endpointing with a 2-second threshold is a reasonable starting point.
-
-#### 4. Response Router (`ResponseRouter`)
-
-**What it is:** Takes a `ResponseDecision` from the monitor and dispatches it to the appropriate backend (Claude CLI or Ollama), manages the response lifecycle, and feeds results to the existing StreamComposer.
-
-```python
-class ResponseRouter:
-    """Routes response decisions to the appropriate backend."""
-
-    def __init__(self, claude_cli, ollama_client, composer, filler_manager):
-        self._claude = claude_cli       # Existing Claude CLI management
-        self._ollama = ollama_client    # Ollama chat endpoint
-        self._composer = composer        # Existing StreamComposer
-        self._filler = filler_manager   # Existing filler/response system
-
-    async def route(self, decision: ResponseDecision):
-        """Generate and play a response."""
-        if decision.backend == "claude":
-            await self._respond_claude(decision)
-        elif decision.backend == "ollama":
-            await self._respond_ollama(decision)
-
-    async def _respond_claude(self, decision: ResponseDecision):
-        """Send to Claude CLI, stream response through composer."""
-        # Start filler while waiting for Claude
-        filler_cancel = asyncio.Event()
-        filler_task = asyncio.create_task(
-            self._filler.play_contextual(decision.prompt, filler_cancel)
+        # Use synchronous client with context manager
+        # (Deepgram SDK manages its own WebSocket thread)
+        dg_connection = client.listen.v1.connect(
+            model="nova-3",
+            encoding="linear16",
+            sample_rate=SAMPLE_RATE,
+            channels=CHANNELS,
+            interim_results=True,
+            endpointing=300,            # 300ms pause = endpoint
+            utterance_end_ms=1000,      # 1s gap between words = utterance end
+            smart_format=True,          # Punctuation, numerals
+            vad_events=True,            # Emit speech start/end events
         )
 
-        # Send to Claude CLI (reuse existing _send_to_cli / _read_cli_response)
-        await self._claude.send(decision.prompt)
-        # Stream text deltas to composer (same as existing _read_cli_response)
-        await self._claude.read_response(self._composer, filler_cancel)
+        # Register event handlers
+        dg_connection.on(EventType.OPEN, self._on_open)
+        dg_connection.on(EventType.MESSAGE, self._on_message)
+        dg_connection.on(EventType.CLOSE, self._on_close)
+        dg_connection.on(EventType.ERROR, self._on_error)
+        # Additional events if available in SDK:
+        # dg_connection.on(EventType.SPEECH_STARTED, self._on_speech_started)
+        # dg_connection.on(EventType.UTTERANCE_END, self._on_utterance_end)
 
-        filler_cancel.set()
-        if not filler_task.done():
-            filler_task.cancel()
+        self._dg_connection = dg_connection
 
-    async def _respond_ollama(self, decision: ResponseDecision):
-        """Generate response via Ollama, send to composer."""
-        # Ollama responses are fast enough that fillers are usually not needed
-        response_text = ""
-        sentence_buffer = ""
+        # Start the WebSocket listener (SDK manages internally)
+        dg_connection.start_listening()
 
-        async for chunk in self._ollama.chat_stream(decision.prompt):
-            response_text += chunk
-            sentence_buffer += chunk
+        self._connected = True
+        self._reconnect_attempts = 0
+        print("DeepgramSTT: Connected to Deepgram Nova-3", flush=True)
 
-            # Same sentence-boundary detection as existing _read_cli_response
-            while SENTENCE_END_RE.search(sentence_buffer):
-                match = SENTENCE_END_RE.search(sentence_buffer)
-                end_pos = match.end()
-                sentence = sentence_buffer[:end_pos].strip()
-                sentence_buffer = sentence_buffer[end_pos:]
-                if sentence:
-                    await self._composer.enqueue(
-                        AudioSegment(SegmentType.TTS_SENTENCE, data=sentence)
-                    )
+        try:
+            # Forward audio from capture queue to Deepgram
+            await self._audio_forward_loop()
+        finally:
+            # Clean up connection
+            try:
+                dg_connection.finish()
+            except Exception:
+                pass
+            self._connected = False
+            self._dg_connection = None
 
-        # Flush remaining
-        if sentence_buffer.strip():
-            await self._composer.enqueue(
-                AudioSegment(SegmentType.TTS_SENTENCE, data=sentence_buffer.strip())
-            )
+    # ── Deepgram event handlers ──
 
-        await self._composer.enqueue_end_of_turn()
+    def _on_open(self, _):
+        print("DeepgramSTT: WebSocket opened", flush=True)
 
-    async def acknowledge(self, decision: ResponseDecision):
-        """Play a quick acknowledgment clip without full response."""
-        await self._filler.play_contextual(decision.prompt, asyncio.Event())
+    def _on_message(self, result):
+        """Handle Deepgram transcription results.
+
+        Deepgram sends three types of results:
+        1. interim (is_final=False): partial/speculative transcript
+        2. final (is_final=True, speech_final=False): confirmed text chunk
+        3. speech_final (is_final=True, speech_final=True): end of utterance
+
+        We accumulate is_final chunks and flush on speech_final,
+        matching the pattern already validated in test_live_session.py.
+        """
+        try:
+            channel = result.channel
+            alternatives = channel.alternatives
+            if not alternatives:
+                return
+
+            transcript = alternatives[0].transcript.strip()
+            if not transcript:
+                return
+
+            is_final = result.is_final
+            speech_final = result.speech_final
+
+            if is_final:
+                self._accumulated_finals.append(transcript)
+
+                if speech_final:
+                    # Flush accumulated text as one segment
+                    full_text = " ".join(self._accumulated_finals).strip()
+                    self._accumulated_finals.clear()
+
+                    if full_text:
+                        self._emit_transcript(full_text)
+
+        except Exception as e:
+            print(f"DeepgramSTT: Message handling error: {e}", flush=True)
+
+    def _on_close(self, _):
+        print("DeepgramSTT: WebSocket closed", flush=True)
+        self._connected = False
+
+    def _on_error(self, error):
+        print(f"DeepgramSTT: Error: {error}", flush=True)
+
+    # ── Transcript emission ──
+
+    def _emit_transcript(self, text):
+        """Process a complete transcript and emit to all consumers."""
+        # Playback suppression: discard transcripts of AI's own speech
+        if self._playing_audio:
+            return
+        if time.time() - self._playback_end_time < self._PLAYBACK_COOLDOWN:
+            return
+
+        # Hallucination filter (reuse existing)
+        if is_hallucination(text):
+            self._hallucination_count += 1
+            print(f"DeepgramSTT: Rejected hallucination: \"{text}\"", flush=True)
+            return
+
+        # Create segment
+        segment = TranscriptSegment(
+            text=text,
+            timestamp=time.time(),
+            source="user",
+        )
+
+        # Append to transcript buffer (shared with decision model)
+        self._transcript_buffer.append(segment)
+        self._segment_count += 1
+        print(f"STT [deepgram]: {text}", flush=True)
+
+        # Callback for live_session event emission
+        if self._on_segment:
+            self._on_segment(segment)
+
+        # Pipeline integration: put on transcript queue for STT stage
+        if self._transcript_q:
+            try:
+                self._transcript_q.put_nowait(segment)
+            except asyncio.QueueFull:
+                pass  # Drop rather than block
+
+    # ── Audio forwarding ──
+
+    async def _audio_forward_loop(self):
+        """Read audio from capture queue, VAD-gate, forward to Deepgram."""
+        while self._running and self._connected:
+            try:
+                audio_data = self._audio_q.get_nowait()
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0.02)
+
+                # Send KeepAlive if no audio sent recently
+                if (time.time() - self._last_audio_sent_time > KEEPALIVE_INTERVAL
+                        and self._dg_connection):
+                    try:
+                        self._dg_connection.keep_alive()
+                    except Exception:
+                        pass
+                    self._last_audio_sent_time = time.time()
+
+                self._maybe_emit_stats()
+                continue
+
+            # Run VAD on chunk
+            vad_prob = self._run_vad(audio_data)
+
+            if vad_prob > VAD_THRESHOLD:
+                # Speech detected -- forward to Deepgram
+                if self._dg_connection:
+                    try:
+                        self._dg_connection.send(audio_data)
+                        self._last_audio_sent_time = time.time()
+                    except Exception as e:
+                        print(f"DeepgramSTT: Send error: {e}", flush=True)
+                        self._connected = False
+                        break
+            else:
+                # Silence -- send KeepAlive periodically
+                if (time.time() - self._last_audio_sent_time > KEEPALIVE_INTERVAL
+                        and self._dg_connection):
+                    try:
+                        self._dg_connection.keep_alive()
+                    except Exception:
+                        pass
+                    self._last_audio_sent_time = time.time()
+
+            self._maybe_emit_stats()
+
+    # ── Audio capture (same pattern as ContinuousSTT) ──
+
+    def _capture_thread(self, device_name, loop):
+        """Record audio in a daemon thread, push to async queue."""
+        import pasimple
+
+        while not self._stop_event.is_set():
+            try:
+                with pasimple.PaSimple(
+                    pasimple.PA_STREAM_RECORD,
+                    pasimple.PA_SAMPLE_S16LE,
+                    CHANNELS, SAMPLE_RATE,
+                    app_name='push-to-talk-deepgram',
+                    device_name=device_name,
+                ) as pa:
+                    while not self._stop_event.is_set():
+                        data = pa.read(CHUNK_SIZE)
+
+                        def _enqueue(d=data):
+                            try:
+                                self._audio_q.put_nowait(d)
+                            except asyncio.QueueFull:
+                                pass
+                        loop.call_soon_threadsafe(_enqueue)
+            except Exception as e:
+                if not self._stop_event.is_set():
+                    print(f"DeepgramSTT: Capture error: {e}, reconnecting...",
+                          flush=True)
+                    time.sleep(1)
+
+    # ── VAD (same as ContinuousSTT) ──
+
+    def _load_vad_model(self):
+        """Load Silero VAD ONNX model."""
+        # ... identical to ContinuousSTT._load_vad_model() ...
+
+    def _run_vad(self, audio_bytes):
+        """Run VAD, return speech probability."""
+        # ... identical to ContinuousSTT._run_vad() ...
+
+    def _resolve_device(self):
+        """Try AEC device, fall back to default."""
+        # ... identical to ContinuousSTT._resolve_device() ...
+
+    def _maybe_emit_stats(self):
+        """Emit stats periodically."""
+        now = time.time()
+        if now - self._last_stats_time >= STATS_INTERVAL_SECONDS:
+            self._last_stats_time = now
+            if self._on_stats:
+                self._on_stats(self.stats)
 ```
 
-**Backend selection criteria:**
+### Design Decisions
 
-| Criterion | Claude CLI | Ollama |
-|-----------|-----------|--------|
-| Network available | Required | Not required |
-| Complex reasoning | Yes | Limited |
-| Tool use (run commands, read files) | Yes (MCP tools) | No |
-| Code analysis | Yes | Limited |
-| Casual chat | Overkill | Ideal |
-| Simple factual Q&A | Works but slow (2-5s) | Fast (0.5-1s) |
-| Response latency | 2-5 seconds | 0.5-2 seconds |
+**1. Own audio capture vs shared _audio_in_q**
 
-**Auto-selection logic in the monitor prompt:** The monitor decides the backend as part of its structured output. If the monitor says "claude" but network is unavailable, the router falls back to Ollama with a degraded prompt. This uses the existing `CircuitBreaker` pattern (line 148) already in the codebase.
+Decision: **Own capture thread** (same pattern as ContinuousSTT).
 
-#### 5. Barge-In / Name Detection (Modified)
+Rationale: The existing `_audio_capture_stage()` feeds `_audio_in_q` which is consumed by `_stt_stage()`. If DeepgramSTT also reads from `_audio_in_q`, both consumers compete for the same frames (asyncio.Queue is single-consumer). Options:
+- (a) Fan-out: duplicate frames to two queues -- adds complexity, memory
+- (b) Single consumer: DeepgramSTT reads `_audio_in_q`, feeds `_stt_stage()` via `_deepgram_transcript_q` -- works but couples audio routing
+- (c) Own capture: DeepgramSTT has its own pasimple stream -- simple, proven pattern (ContinuousSTT already does this)
 
-**Current barge-in:** VAD detects sustained speech (6 chunks, ~0.5s) during AI playback, triggers `_trigger_barge_in()` which increments `generation_id`, drains queues, builds annotation.
+Option (c) is simplest. Two pasimple readers from the same PipeWire source works fine -- PipeWire handles multiple clients. The audio capture stage can eventually be removed when the old `_stt_stage()` Whisper path is fully deprecated, but keeping it initially provides a fallback.
 
-**New barge-in:** Two modes:
-1. **VAD barge-in** (unchanged): Sustained speech during AI output triggers interruption. Same generation_id mechanism, same composer pause/drain.
-2. **Name-based interruption** (new): The continuous STT can detect "hey Russel" even during AI playback (since STT is no longer gated). When the transcript buffer receives a segment containing the wake phrase, it triggers an interrupt.
+**2. VAD gating at the client vs letting Deepgram handle it**
 
-**Name detection approach:** Do NOT use a dedicated wake word engine (openWakeWord, Porcupine). The continuous Whisper STT already transcribes everything. Name detection is a simple string match on the transcript text:
+Decision: **VAD gate at client** (Silero, local).
+
+Rationale: Deepgram charges per audio second streamed. Sending silence costs money. Silero VAD runs on CPU in <1ms per chunk. Only stream speech-positive chunks. During silence, send KeepAlive messages (text frames, not audio) to keep the connection open. This is the documented Deepgram best practice for cost optimization.
+
+**3. Transcript suppression during playback**
+
+Decision: **Suppress transcript output, keep streaming audio.**
+
+Rationale: Unlike ContinuousSTT which discards audio chunks during playback (because Whisper would transcribe the AI's speech from the mic), DeepgramSTT keeps streaming audio. Reasons:
+- PipeWire AEC removes the AI's voice from the mic signal
+- Deepgram handles residual echo better than local Whisper
+- Keeping the connection alive avoids reconnect overhead
+- We suppress the *transcript output* (not the audio input) when `_playing_audio` is True
+
+**4. Deepgram SDK sync vs async client**
+
+Decision: **Synchronous client** (`DeepgramClient`, not `AsyncDeepgramClient`).
+
+Rationale: The Deepgram SDK's sync client manages its own WebSocket thread internally. The `on_message` callback fires on that thread. We use `loop.call_soon_threadsafe()` to push transcripts to the asyncio event loop (same pattern used for audio capture). This avoids potential async event loop conflicts between the Deepgram SDK's internal async machinery and our existing asyncio loop. The sync client is also better documented in official examples.
+
+Alternative: If the sync client proves problematic, the async client (`AsyncDeepgramClient` with `client.listen.v2.connect()`) can be used. The key difference is `await connection.start_listening()` instead of `connection.start_listening()`.
+
+**5. Audio format: no resampling needed**
+
+Decision: **Send 24kHz 16-bit mono directly.**
+
+Deepgram's streaming API accepts `linear16` encoding at any sample rate specified in the connection parameters. Our capture is already 24kHz 16-bit mono (`pasimple.PA_SAMPLE_S16LE`, `SAMPLE_RATE=24000`). Pass `sample_rate=24000, encoding="linear16", channels=1` in the connection options. No resampling required.
+
+Note: ContinuousSTT resamples to 16kHz for Silero VAD (which expects 16kHz). This resampling stays for VAD but does NOT affect what we send to Deepgram. VAD gets the resampled audio; Deepgram gets the original 24kHz audio.
+
+## Integration with live_session.py
+
+### Changes to __init__() (line 187-316)
 
 ```python
-WAKE_PHRASES = {"hey russel", "hey russell", "russel", "russell"}
+# REMOVE:
+self._continuous_stt = None     # line 310
 
-def _check_wake_phrase(self, segment: TranscriptSegment) -> bool:
-    """Check if a transcript segment contains the wake phrase."""
-    text_lower = segment.text.lower().strip()
-    for phrase in WAKE_PHRASES:
-        if phrase in text_lower:
-            return True
-    return False
+# ADD:
+self._deepgram_stt = None       # Replaces _continuous_stt
+self._deepgram_transcript_q = None  # DeepgramSTT -> STT stage
 ```
 
-**Why not openWakeWord:** Adding a wake word engine means another audio processing pipeline running in parallel with Whisper, consuming CPU/GPU. Since Whisper is already transcribing continuously, the transcript IS the wake word detection. This is simpler and more reliable for multi-syllable names (wake word engines excel at short phrases like "hey" but Whisper is better at recognizing actual names).
+### Changes to run() (line 2890-2962)
 
-**Confidence: HIGH** -- This approach is architecturally sound. The only risk is Whisper's latency (the name might be detected 2-3 seconds after being spoken due to the rolling-window transcription). For v2.0, this is acceptable. If sub-second name detection is needed later, openWakeWord can be added as a parallel fast path.
+```python
+# REMOVE (line 2930-2937):
+self._continuous_stt = ContinuousSTT(
+    transcript_buffer=self._transcript_buffer,
+    vram_monitor=self._vram_monitor,
+    aec_device_name=...,
+    on_segment=self._on_transcript_segment,
+    on_stats=self._on_stt_stats,
+)
 
-### Unchanged Components
+# ADD:
+self._deepgram_transcript_q = asyncio.Queue(maxsize=50)
+self._deepgram_stt = DeepgramSTT(
+    api_key=self.deepgram_api_key,
+    transcript_buffer=self._transcript_buffer,
+    transcript_q=self._deepgram_transcript_q,
+    aec_device_name=self.config.get("aec_device_name", "Echo Cancellation Source")
+        if hasattr(self, 'config') and isinstance(getattr(self, 'config', None), dict)
+        else "Echo Cancellation Source",
+    on_segment=self._on_transcript_segment,
+    on_stats=self._on_stt_stats,
+)
 
-These components require NO architectural changes for v2.0:
-
-| Component | File | Why Unchanged |
-|-----------|------|---------------|
-| StreamComposer | `stream_composer.py` | Receives `AudioSegment` objects from whoever is generating. Does not care if the source is Claude CLI or Ollama. |
-| Playback Stage | `live_session.py` `_playback_stage()` | Consumes `PipelineFrame` from `audio_out_q`. Source-agnostic. |
-| Filler/Response Library | `response_library.py`, `input_classifier.py` | Called by the response router before LLM response, same role as today. |
-| Event Bus | `event_bus.py` | JSONL event log. New event types can be added (e.g., `monitor_decision`, `transcript_segment`) but the bus infrastructure is unchanged. |
-| Learner Daemon | `learner.py` | Tails event bus JSONL, extracts memories. Works regardless of input mode. |
-| Task Manager | `task_manager.py` | Spawns/tracks Claude CLI background tasks. Orthogonal to input mode. |
-| SSE Dashboard | `live_session.py` `_sse_server_stage()` | Broadcasts bus events. New events are automatically included. |
-| Audio Capture | `live_session.py` `_audio_capture_stage()` | PulseAudio recording thread. Unchanged -- it already runs continuously. The only change is that it no longer checks the `muted` flag from PTT. |
-
-### Modified Components
-
-| Component | What Changes | Scope of Change |
-|-----------|-------------|-----------------|
-| `_stt_stage()` | Replaced by `ContinuousSTT`. No longer gates on `_stt_gated`. Produces `TranscriptSegment` instead of `TRANSCRIPT` frames. | Major rewrite of one method. |
-| `_llm_stage()` | Replaced by `MonitorLoop` + `ResponseRouter`. No longer blocks on `_stt_out_q`. | Major rewrite of one method. |
-| `_trigger_barge_in()` | Add name-detection path alongside VAD path. | Small addition. |
-| `__init__()` | Initialize new components (ContinuousSTT, TranscriptBuffer, MonitorLoop, ResponseRouter, OllamaClient). | Medium -- adding initializers. |
-| `run()` | Change stage list: replace `_stt_stage` and `_llm_stage` with new loops. | Medium. |
-| Config | Add new settings: `monitor_model`, `response_backend`, `wake_phrase`, `silence_threshold`. | Small. |
-
-## Data Flow: Complete Lifecycle
-
-### Normal Conversation Turn
-
-```
-1. User speaks: "What time is it in Tokyo?"
-2. Audio Capture -> audio chunks -> ContinuousSTT
-3. ContinuousSTT: VAD detects speech, starts accumulating
-4. ContinuousSTT: After 2-3s window, Whisper transcribes
-   -> TranscriptSegment(text="What time is it in Tokyo?", is_final=True)
-5. TranscriptBuffer: Appends segment, signals new data
-6. MonitorLoop: Wakes up, sees new segment
-7. MonitorLoop: Waits for 2s silence (user stopped talking)
-8. MonitorLoop: Builds context, calls Ollama:
-   "User said: 'What time is it in Tokyo?' -> respond or wait?"
-9. Ollama responds (200ms):
-   {"action": "respond", "backend": "ollama", "confidence": 0.9}
-10. ResponseRouter: Calls Ollama chat for the actual response
-11. Ollama streams: "It's currently 3:42 AM in Tokyo."
-12. ResponseRouter: Sends sentence to StreamComposer
-13. StreamComposer: Piper TTS -> audio_out_q -> Playback
-14. User hears response (~3.5s after finishing speaking)
+# CHANGE stages list (line 2951-2959):
+stages = [
+    self._audio_capture_stage(),       # Keep (may remove later)
+    self._stt_stage(),                 # REWRITTEN to consume deepgram_transcript_q
+    self._llm_stage(),                 # UNCHANGED
+    self._composer.run(),              # UNCHANGED
+    self._playback_stage(),            # UNCHANGED
+    interrupt_loop(),                  # UNCHANGED
+    self._sse_server_stage(),          # UNCHANGED
+    self._deepgram_stt.start(),        # NEW: replaces _continuous_stt.start()
+]
 ```
 
-### Barge-In During Response
+### Changes to _stt_stage() (line 2190-2394)
+
+The entire method is rewritten. Instead of doing VAD + silence detection + Whisper transcription internally, it becomes a thin consumer of DeepgramSTT output.
+
+```python
+async def _stt_stage(self):
+    """Consume DeepgramSTT transcripts and emit pipeline frames.
+
+    Reads TranscriptSegment objects from _deepgram_transcript_q (populated
+    by DeepgramSTT callbacks). Emits END_OF_UTTERANCE + TRANSCRIPT frames
+    into _stt_out_q for the LLM stage.
+
+    Handles:
+    - _stt_gated: suppress during playback (VAD barge-in still runs in DeepgramSTT)
+    - muted: suppress when user mutes
+    - _stt_flush_event: immediate flush on mute toggle
+    - generation_id: tag frames for interrupt coherence
+    """
+    print("STT: Using Deepgram streaming", flush=True)
+
+    try:
+        while self.running:
+            try:
+                segment = await asyncio.wait_for(
+                    self._deepgram_transcript_q.get(), timeout=0.5
+                )
+            except asyncio.TimeoutError:
+                # Check flush event during idle
+                if self._stt_flush_event and self._stt_flush_event.is_set():
+                    self._stt_flush_event.clear()
+                    # Deepgram handles flushing automatically via speech_final
+                    # No local buffer to flush -- just clear the event
+                continue
+
+            # Gate checks
+            if self.muted:
+                continue
+            if self._stt_gated:
+                self._was_stt_gated = True
+                continue
+
+            # Gated -> ungated transition (same logic as current)
+            if self._was_stt_gated:
+                self._was_stt_gated = False
+                # Discard any segments that arrived during gating
+                # (they are from AI's own speech or post-echo)
+                continue
+
+            transcript = segment.text
+            self._emit_event("stt_complete", text=transcript[:60],
+                             latency_ms=0, rejected=False)  # Latency tracked by DeepgramSTT
+            print(f"STT [deepgram]: {transcript}", flush=True)
+
+            await self._stt_out_q.put(PipelineFrame(
+                type=FrameType.END_OF_UTTERANCE,
+                generation_id=self.generation_id
+            ))
+            await self._stt_out_q.put(PipelineFrame(
+                type=FrameType.TRANSCRIPT,
+                generation_id=self.generation_id,
+                data=transcript
+            ))
+            self._post_barge_in = False
+
+    except Exception as e:
+        print(f"STT stage error: {e}", flush=True)
+```
+
+### Changes to playback/barge-in (multiple locations)
+
+Replace `self._continuous_stt.set_playing_audio(...)` with `self._deepgram_stt.set_playing_audio(...)`:
+
+- Line 2642-2643: `self._deepgram_stt.set_playing_audio(False)`
+- Line 2674-2675: `self._deepgram_stt.set_playing_audio(True)`
+- Line 2728-2729: `self._deepgram_stt.set_playing_audio(False)`
+- Line 2788-2789: `self._deepgram_stt.set_playing_audio(False)`
+
+### Changes to cleanup (line 2970-2971)
+
+```python
+# REMOVE:
+if self._continuous_stt:
+    self._continuous_stt.stop()
+
+# ADD:
+if self._deepgram_stt:
+    self._deepgram_stt.stop()
+```
+
+### Whisper fallback removal
+
+Remove these methods from live_session.py:
+- `_stt_whisper_fallback()` (lines 1406-1457)
+- `_whisper_transcribe()` (lines 1459-1517)
+
+The CircuitBreaker `_stt_breaker` (line 294) stays -- it can now gate Deepgram failures and trigger a reconnect or graceful degradation.
+
+## Deepgram Connection Configuration
+
+### Connection Parameters
+
+```python
+{
+    "model": "nova-3",           # Latest, best accuracy
+    "encoding": "linear16",      # 16-bit PCM, matches our capture
+    "sample_rate": 24000,        # Our native rate, no resampling
+    "channels": 1,               # Mono
+    "interim_results": True,     # Get partial results for UI feedback
+    "endpointing": 300,          # 300ms silence = end of utterance
+    "utterance_end_ms": 1000,    # 1s gap between words = utterance end
+    "smart_format": True,        # Auto punctuation, numerals
+    "vad_events": True,          # Emit speech start/end events
+    "language": "en",            # English
+}
+```
+
+### Parameter Rationale
+
+**`endpointing=300`**: Default is 10ms (too aggressive for conversation). 300-500ms is recommended for conversational AI per Deepgram docs. This controls when `speech_final=True` fires. 300ms means Deepgram considers a 300ms pause to be an endpoint -- the user finished their thought. This replaces the `SILENCE_DURATION_NORMAL = 0.8` in the current Whisper path (which used 800ms). The trade-off: 300ms may fire too early for users who pause mid-sentence. Can tune to 500ms if needed.
+
+**`utterance_end_ms=1000`**: Secondary end-of-speech detection. Looks at word timing gaps across both interim and final results. When no words appear for 1000ms, fires `UtteranceEnd` event. This is a backup to `endpointing` and works better for detecting the end of a multi-sentence utterance.
+
+**`interim_results=True`**: Required for `utterance_end_ms` to work. Also provides real-time partial transcripts for UI feedback (dashboard can show what the user is saying as they speak, before final results arrive).
+
+**`smart_format=True`**: Deepgram adds punctuation, capitalizes sentences, formats numerals. This means the transcript text arriving in the pipeline is already formatted -- no need for post-processing.
+
+**`vad_events=True`**: Deepgram emits `SpeechStarted` events when it detects the beginning of speech in the audio stream. Used for event bus emission ("stt_start" event) to show "listening" status in the dashboard.
+
+### Audio Format: No Conversion Needed
 
 ```
-1. AI is speaking (playing audio from composer)
-2. ContinuousSTT is running (NOT gated -- this is the key change)
-3. User says: "Actually, what about London?"
-4. VAD detects speech -> barge-in triggers (same as v1.x)
-5. generation_id increments, composer pauses, audio drains
-6. Meanwhile, ContinuousSTT transcribes the interruption
-7. TranscriptSegment("Actually, what about London?") -> buffer
-8. MonitorLoop sees new input, evaluates, decides to respond
-9. Response generated for the new question
+Capture: pasimple.PA_SAMPLE_S16LE at 24000 Hz, 1 channel
+         = 16-bit signed little-endian PCM, 24kHz mono
+         = "linear16" in Deepgram terminology
+
+Deepgram: encoding="linear16", sample_rate=24000, channels=1
+         = exact match
+
+Silero VAD: expects 16kHz input
+         = resample 24kHz -> 16kHz (take 2 of every 3 samples)
+         = same resampling already done in ContinuousSTT._run_vad()
 ```
 
-### Name-Based Interruption
+No audio format conversion is needed for Deepgram. The raw `pa.read(4096)` output goes directly to `dg_connection.send(audio_data)` as binary bytes.
+
+## Error Handling
+
+### Deepgram Disconnection
 
 ```
-1. AI is speaking a long response
-2. User says: "Hey Russel, stop"
-3. ContinuousSTT transcribes: "Hey Russel, stop"
-4. TranscriptBuffer receives segment, checks for wake phrase
-5. Wake phrase detected -> trigger_barge_in()
-6. Same barge-in flow as VAD (generation_id increment, drain, etc.)
-7. MonitorLoop sees "stop" in context, decides action "acknowledge"
-8. Plays brief acknowledgment clip
+Detection: on_close callback fires, OR send() raises exception
+Response:
+  1. Set _connected = False
+  2. Log error with context
+  3. Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (capped)
+  4. Reconnect: new DeepgramClient, new connection
+  5. Must send audio within 10 seconds of reconnect (Deepgram timeout)
+  6. Reset reconnect counter on successful connection
+Recovery:
+  - Audio capture continues (buffered in _audio_q)
+  - VAD continues (local, no network dependency)
+  - Transcript output pauses until reconnected
+  - CircuitBreaker tracks failures for dashboard visibility
 ```
 
-### Background Conversation (Ignored)
+### Audio Buffering During Reconnect
 
 ```
-1. User is on a phone call, talking to someone else
-2. ContinuousSTT transcribes fragments of the conversation
-3. TranscriptBuffer accumulates segments
-4. MonitorLoop evaluates:
-   "User is clearly talking to someone else (no AI name,
-    topic is unrelated to previous AI interaction)"
-5. Ollama: {"action": "ignore", "reasoning": "not addressed to AI"}
-6. No response generated
-7. Context window naturally ages out the phone call transcript
+Problem: Audio produced during reconnect is lost
+Solution:
+  - _audio_q has maxsize=200 (~17 seconds of audio)
+  - During reconnect, capture thread keeps filling queue
+  - On reconnect, drain queued audio to Deepgram
+  - If queue fills, oldest frames dropped (acceptable -- user speech
+    during a multi-second outage is stale anyway)
+Note: Deepgram processes streaming audio at max 1.25x realtime.
+  Sending a large buffer all at once may cause delayed transcripts.
+  Consider draining at controlled rate or discarding stale audio.
 ```
 
-## GPU Memory Budget
+### KeepAlive Protocol
 
 ```
-RTX 3070: 8192 MB VRAM total
-
-Component                    VRAM (estimated)
-─────────────────────────────────────────────
-Whisper distil-large-v3      ~1,500 MB
-Ollama Llama 3.2 3B (int4)  ~2,000 MB
-Silero VAD (ONNX)            ~50 MB
-PyTorch/CUDA overhead        ~500 MB
-─────────────────────────────────────────────
-Total                        ~4,050 MB
-Free                         ~4,140 MB (comfortable)
-
-Alternative: Whisper small
-─────────────────────────────────────────────
-Whisper small                ~500 MB
-Ollama Llama 3.2 3B (int4)  ~2,000 MB
-Silero VAD (ONNX)            ~50 MB
-PyTorch/CUDA overhead        ~500 MB
-─────────────────────────────────────────────
-Total                        ~3,050 MB
-Free                         ~5,140 MB (very comfortable)
+Deepgram closes connection if no audio or KeepAlive within 10 seconds.
+Implementation:
+  - Track _last_audio_sent_time
+  - In _audio_forward_loop, if no speech for KEEPALIVE_INTERVAL (5s):
+    - Call dg_connection.keep_alive() (SDK method)
+    - This sends {"type": "KeepAlive"} as a text WebSocket frame
+  - CRITICAL: KeepAlive must be TEXT frame, not binary
+    The SDK's keep_alive() method handles this correctly
 ```
 
-**Confidence: MEDIUM** -- VRAM estimates are approximate. Actual usage depends on batch sizes, CUDA allocator fragmentation, and whether Ollama keeps the model loaded between inferences. Ollama's GPU memory management (keep-alive, offloading) needs testing.
+### Rate Limits
 
-**Key concern:** Ollama runs as a Docker container (per the shell function in the user's environment). Docker GPU passthrough with `--gpus all` shares the same physical VRAM, but there may be additional overhead from the container runtime. This needs empirical testing.
+```
+Deepgram rate limits (per account):
+  - Concurrent connections: varies by plan (typically 25-100)
+  - This system uses 1 connection -- not a concern
+  - Audio throughput: max 1.25x realtime -- not a concern (we stream realtime)
+  - Cost: ~$0.0044/minute for Nova-3 = ~$0.26/hour
+    With VAD gating (only stream speech), actual cost is lower
+```
+
+### API Key Rotation
+
+```
+Deepgram API keys don't expire automatically.
+Key is read from environment or file at startup:
+  - $DEEPGRAM_API_KEY env var
+  - ~/.config/deepgram/api_key file
+  - ~/.deepgram/api_key file
+  (See push-to-talk.py get_deepgram_api_key(), line 126-137)
+
+To rotate: update the key source, restart the service.
+No in-flight rotation needed -- single long-lived connection.
+```
+
+## Thread/Async Model
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    ASYNCIO EVENT LOOP (main)                      │
+│                                                                    │
+│  Coroutines:                                                       │
+│  - _audio_capture_stage()    reads _audio_in_q (from thread)     │
+│  - _stt_stage()              reads _deepgram_transcript_q        │
+│  - _llm_stage()              reads _stt_out_q                    │
+│  - _composer.run()           reads segment_q                     │
+│  - _playback_stage()         reads _audio_out_q                  │
+│  - _deepgram_stt.start()     manages Deepgram connection         │
+│    ├─ _connection_loop()     reconnect manager                   │
+│    └─ _audio_forward_loop()  VAD + send to Deepgram              │
+│                                                                    │
+├──────────────────────────────────────────────────────────────────┤
+│                     DAEMON THREADS                                 │
+│                                                                    │
+│  Thread 1: Audio capture (live_session._audio_capture_stage)     │
+│            pasimple.read() -> loop.call_soon_threadsafe()         │
+│            -> PipelineFrame(AUDIO_RAW) -> _audio_in_q            │
+│                                                                    │
+│  Thread 2: DeepgramSTT._capture_thread()                         │
+│            pasimple.read() -> loop.call_soon_threadsafe()         │
+│            -> raw bytes -> _audio_q                               │
+│                                                                    │
+│  Thread 3: Deepgram SDK internal WebSocket thread                │
+│            Managed by DeepgramClient.listen.v1.connect()         │
+│            Fires callbacks: _on_message, _on_close, _on_error    │
+│            Callbacks run on THIS thread -- must not block         │
+│            Use loop.call_soon_threadsafe() for asyncio work       │
+│                                                                    │
+│  Thread 4: PyAudio callback thread (playback)                    │
+│                                                                    │
+├──────────────────────────────────────────────────────────────────┤
+│                     SUBPROCESSES                                   │
+│                                                                    │
+│  Claude CLI (stdio IPC)                                           │
+│  Learner daemon (reads events.jsonl)                              │
+│  Clip factory (generates filler clips)                            │
+│  Input classifier (Unix socket, heuristic + model2vec)           │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Critical Threading Concern
+
+Deepgram SDK's `on_message` callback fires on the SDK's internal WebSocket thread, NOT on the asyncio event loop. The callback must be fast and non-blocking. It should NOT:
+- `await` anything
+- Call `asyncio.Queue.put()` (wrong thread)
+- Do heavy computation
+
+Instead, use `loop.call_soon_threadsafe()` to schedule work on the event loop:
+
+```python
+def _on_message(self, result):
+    # Parse on the WebSocket thread (fast)
+    transcript = result.channel.alternatives[0].transcript.strip()
+    is_final = result.is_final
+    speech_final = result.speech_final
+
+    # Schedule emission on the event loop
+    if is_final and speech_final and transcript:
+        self._loop.call_soon_threadsafe(
+            self._emit_transcript_threadsafe, transcript
+        )
+```
+
+Alternative: use `asyncio.run_coroutine_threadsafe()` if the emission needs to be async (e.g., to put on an asyncio.Queue).
+
+## What Gets Deleted
+
+### Files to Remove
+
+| File | Status | Replacement |
+|------|--------|-------------|
+| `continuous_stt.py` | DELETE entirely | `deepgram_stt.py` |
+
+### Code to Remove from live_session.py
+
+| Lines | What | Why |
+|-------|------|-----|
+| 32 | `from continuous_stt import ContinuousSTT` | Replaced by `from deepgram_stt import DeepgramSTT` |
+| 310 | `self._continuous_stt = None` | Replaced by `self._deepgram_stt = None` |
+| 1406-1457 | `_stt_whisper_fallback()` | Deepgram replaces Whisper |
+| 1459-1517 | `_whisper_transcribe()` | Deepgram replaces Whisper |
+| 2190-2394 | `_stt_stage()` (entire body) | Rewritten as thin Deepgram consumer |
+| 2930-2937 | ContinuousSTT initialization | Replaced by DeepgramSTT initialization |
+
+### Dependencies to Remove from requirements.txt
+
+| Package | Why Remove |
+|---------|-----------|
+| `faster-whisper` | No longer needed -- Deepgram replaces Whisper |
+
+Note: `onnxruntime` stays (used by Silero VAD). `deepgram-sdk>=3.0` already in requirements.txt.
+
+### Dependencies to Keep
+
+| Package | Why Keep |
+|---------|---------|
+| `deepgram-sdk>=3.0` | Already listed, needed for DeepgramSTT |
+| `onnxruntime>=1.18` | Silero VAD (local, used for cost gating) |
+| `pasimple` | Audio capture (PipeWire/PulseAudio) |
+| `numpy` | VAD audio processing |
 
 ## Suggested Build Order
 
-### Phase A: Continuous STT (independently testable)
+### Step 1: Create deepgram_stt.py (independently testable)
 
-Build `ContinuousSTT` class that reads from `audio_in_q` and produces `TranscriptSegment` objects into a `TranscriptBuffer`. This can be tested standalone -- feed it audio, verify transcript output.
+Write the `DeepgramSTT` class with:
+- Own audio capture thread (pasimple)
+- Silero VAD gating
+- Deepgram WebSocket connection
+- `on_message` callback with `is_final`/`speech_final` accumulation
+- `TranscriptSegment` emission to `TranscriptBuffer`
+- `_transcript_q` output for pipeline integration
+- KeepAlive management
+- Reconnection with exponential backoff
 
-**Deliverables:**
-- `continuous_stt.py` (new file)
-- `transcript_buffer.py` (new file)
-- Unit tests for both
+Test: Run standalone, pipe mic audio through it, verify transcripts appear.
+No changes to live_session.py needed yet.
 
-**Dependencies:** Existing audio capture, existing faster-whisper setup
-**Can test independently:** Yes -- pipe recorded audio through it
-**Risk:** Medium -- Whisper rolling-window approach needs tuning for segment boundaries
+### Step 2: Rewrite _stt_stage() to consume Deepgram output
 
-### Phase B: Monitor Loop (independently testable)
+Replace the Whisper-based `_stt_stage()` with the thin consumer that reads from `_deepgram_transcript_q`. Wire up `DeepgramSTT` in `__init__()` and `run()`.
 
-Build `MonitorLoop` with Ollama integration and `ResponseDecision` structured output. Can be tested with a mock transcript buffer pre-populated with test data.
+Test: Full pipeline with DeepgramSTT feeding LLM stage. Verify end-to-end voice conversation works.
 
-**Deliverables:**
-- `monitor_loop.py` (new file)
-- `ollama_client.py` (new file -- thin wrapper around Ollama HTTP API)
-- Unit tests with mock buffer
+### Step 3: Clean up old code
 
-**Dependencies:** TranscriptBuffer (from Phase A), Ollama running locally
-**Can test independently:** Yes -- mock the buffer, verify decisions
-**Risk:** Medium -- Ollama decision quality needs prompt tuning. Llama 3.2 3B may need structured output guidance.
+- Remove `_stt_whisper_fallback()` and `_whisper_transcribe()` from live_session.py
+- Delete `continuous_stt.py`
+- Remove `faster-whisper` from requirements.txt
+- Update imports
+- Update tests in `test_live_session.py`
 
-### Phase C: Response Router + Ollama Backend (partially independent)
+### Step 4: Decision model integration
 
-Build `ResponseRouter` that dispatches to Claude CLI (reuse existing code) or Ollama (new). The Ollama response path is new; the Claude CLI path wraps existing `_send_to_cli` / `_read_cli_response`.
+Wire the local decision model to read from `TranscriptBuffer` (populated by DeepgramSTT). This is a separate concern from STT integration and should be a separate phase.
 
-**Deliverables:**
-- `response_router.py` (new file)
-- Ollama chat response streaming in `ollama_client.py`
-- Integration with existing StreamComposer
+## Scalability Considerations
 
-**Dependencies:** Phase B (ResponseDecision), existing StreamComposer, existing Claude CLI
-**Can test independently:** Partially -- Ollama path yes, Claude path needs live CLI
-**Risk:** Low-Medium -- Ollama streaming is straightforward. Claude CLI integration is wrapping existing code.
-
-### Phase D: Pipeline Integration
-
-Wire Phase A/B/C into `live_session.py`. Replace `_stt_stage()` and `_llm_stage()` with the new components. Remove `_stt_gated` flag. Add name detection. Update `run()` method to launch new coroutines.
-
-**Deliverables:**
-- Modified `live_session.py`
-- Modified `pipeline_frames.py` (new frame types if needed)
-- End-to-end integration tests
-
-**Dependencies:** Phases A, B, C all complete
-**Risk:** High -- this is the big integration. Timing, concurrency, and edge cases (what happens when Ollama is slow, when Whisper produces garbage, when the user and AI talk simultaneously).
-
-### Phase E: Barge-In + Name Detection
-
-Add name-based interruption. Modify `_trigger_barge_in` to accept both VAD and name-based triggers. Test interruption scenarios.
-
-**Deliverables:**
-- Name detection in ContinuousSTT or TranscriptBuffer
-- Modified barge-in logic
-- Integration tests for interruption scenarios
-
-**Dependencies:** Phase D (pipeline must be working)
-**Risk:** Low -- name detection is string matching. Barge-in mechanism exists and works.
-
-### Phase F: Tuning + Polish
-
-Tune silence thresholds, Ollama prompt, backend selection heuristics. Add fallback behaviors (Ollama unavailable, GPU OOM, bad decisions). Harden edge cases.
-
-**Dependencies:** Phase D and E
-**Risk:** Medium -- tuning is iterative and requires real-world testing
-
-## Anti-Patterns to Avoid
-
-### Anti-Pattern 1: Running STT and Monitor on Every Audio Chunk
-
-**What:** Transcribing every 85ms audio chunk and evaluating every transcript.
-**Why bad:** Whisper inference on short audio is inaccurate and wasteful. Ollama at 200ms per call would be called 12x/second.
-**Instead:** Use VAD to gate STT (only transcribe when speech detected). Use silence detection to gate monitor (only evaluate when user stops talking).
-
-### Anti-Pattern 2: Sharing Whisper Model Between Continuous STT and Batch Operations
-
-**What:** Using the same `WhisperModel` instance for both continuous transcription and on-demand batch transcription (e.g., for dictation mode).
-**Why bad:** faster-whisper is not thread-safe for concurrent inference. Concurrent calls cause crashes or garbage output.
-**Instead:** The continuous STT owns its own model instance. If batch transcription is needed (dictation mode), either stop continuous STT or use a separate model instance.
-
-### Anti-Pattern 3: Making the Monitor Synchronous with the Input Stream
-
-**What:** Requiring the monitor to evaluate every transcript before the next one is produced.
-**Why bad:** If Ollama is slow (300ms+), transcript segments pile up. The monitor falls behind, decisions are stale.
-**Instead:** The monitor runs its own async loop at its own pace. It reads from the buffer, which is always up-to-date. If the monitor is slow, it simply evaluates a larger batch of segments on the next cycle.
-
-### Anti-Pattern 4: Trying to Make Ollama Do Tool Calls
-
-**What:** Adding MCP tool support to Ollama responses.
-**Why bad:** Ollama with Llama 3.2 3B has limited tool-calling reliability. The existing Claude CLI tool pipeline is battle-tested. Duplicating it for Ollama doubles complexity for minimal benefit.
-**Instead:** If the monitor decides tools are needed, it routes to Claude CLI. Ollama is for quick, tool-free responses only.
-
-### Anti-Pattern 5: Removing PTT Mode Entirely
-
-**What:** Deleting all PTT code and making always-on the only mode.
-**Why bad:** Users may want PTT in noisy environments, shared spaces, or when privacy matters. Always-on is a new mode, not a replacement.
-**Instead:** Add always-on as a new `ai_mode` option (alongside existing "claude", "interview", "conversation"). PTT mode remains available as-is. Config drives which mode is active.
-
-### Anti-Pattern 6: Blocking on Ollama Before Playing Filler
-
-**What:** Waiting for the monitor's Ollama decision before playing any audio feedback.
-**Why bad:** Adds 200-300ms of silence on top of the 2-second silence threshold. Total time from user-stops-speaking to any audio: ~2.5 seconds.
-**Instead:** The existing filler/response library should still fire on heuristic classification (fast path, <10ms). The monitor's decision gates the FULL response, not the filler. If the monitor decides "ignore," the filler may have already played -- that is acceptable (a brief "hmm" acknowledging the user is better than 2.5 seconds of silence followed by nothing).
-
-## Configuration Additions
-
-```json
-{
-  "ai_mode": "always_on",           // New mode alongside "claude", "interview", etc.
-  "monitor_model": "llama3.2:3b",   // Ollama model for monitoring
-  "response_model": "llama3.2:3b",  // Ollama model for quick responses
-  "wake_phrase": "russel",           // Name for interruption detection
-  "silence_threshold": 2.0,          // Seconds of silence before evaluating
-  "monitor_cooldown": 3.0,           // Seconds between monitor evaluations
-  "whisper_model": "distil-large-v3", // STT model (continuous mode)
-  "response_backend": "auto",        // "auto", "claude", "ollama"
-  "always_on_stt": true              // Enable continuous STT
-}
-```
-
-## Event Bus Additions
-
-New event types for v2.0 observability:
-
-| Event Type | Payload | Purpose |
-|------------|---------|---------|
-| `transcript_segment` | `{text, is_final, confidence, timestamp}` | Track continuous STT output |
-| `monitor_decision` | `{action, backend, confidence, reasoning}` | Track monitor decisions |
-| `response_routed` | `{backend, prompt_preview}` | Track which backend was selected |
-| `wake_phrase_detected` | `{phrase, timestamp}` | Track name-based interruptions |
-| `ollama_inference` | `{model, latency_ms, tokens}` | Track Ollama performance |
-
-## Open Questions
-
-1. **Whisper model choice needs empirical testing.** distil-large-v3 is recommended but VRAM usage with Ollama simultaneously loaded needs measurement. Might need to fall back to `small`.
-
-2. **Ollama decision quality at 3B.** Llama 3.2 3B may struggle with nuanced "respond vs ignore" decisions, especially distinguishing "user talking to AI" from "user talking to someone else." If this proves unreliable, a hybrid approach (heuristic fast path + Ollama only for ambiguous cases) should be tried.
-
-3. **Latency budget.** The 2-second silence threshold + 200ms Ollama decision = 2.2 seconds minimum from user-stops-speaking to response start. This is slower than PTT (~0.5s). LiveKit's research suggests transformer-based turn detection can reduce silence thresholds to 0.5-1.0 seconds, but that requires a specialized model. For v2.0, the 2-second threshold is the starting point.
-
-4. **GPU memory under sustained load.** Continuous Whisper + Ollama keep-alive both want GPU memory allocated permanently. Need to test whether CUDA allocator handles this gracefully or whether fragmentation causes OOM over long sessions.
-
-5. **Ollama Docker vs native.** Ollama is currently a Docker alias. Docker GPU passthrough may add latency. Worth testing native Ollama installation for comparison.
+| Concern | Current (1 user) | Future (multi-session) |
+|---------|-------------------|----------------------|
+| Deepgram connections | 1 WebSocket | 1 per session (Deepgram allows concurrent) |
+| Cost | ~$0.08/hr with VAD gating | Scales linearly |
+| Latency | ~150ms (Deepgram) | Same -- server-side, not affected by client count |
+| VRAM | Freed ~1.5GB (no Whisper) | More room for decision model |
+| Network dependency | NEW: requires internet | Whisper fallback possible but not planned |
 
 ## Sources
 
-- **Codebase analysis** (HIGH confidence): `live_session.py` (2900+ lines, read in full), `stream_composer.py`, `pipeline_frames.py`, `event_bus.py`, `input_classifier.py`, `learner.py`, `push-to-talk.py` (config), all read in full.
-- **WhisperLive / whisper_streaming** (MEDIUM confidence): [GitHub: collabora/WhisperLive](https://github.com/collabora/WhisperLive), [GitHub: ufal/whisper_streaming](https://github.com/ufal/whisper_streaming) -- rolling-window approach for continuous Whisper transcription.
-- **LiveKit turn detection** (MEDIUM confidence): [LiveKit blog: using a transformer for end-of-turn detection](https://blog.livekit.io/using-a-transformer-to-improve-end-of-turn-detection/) -- semantic endpointing with transformer model, <500MB RAM, runs on CPU. Potential future improvement for v2.1.
-- **Ollama structured outputs** (MEDIUM confidence): [Ollama docs: structured outputs](https://docs.ollama.com/capabilities/structured-outputs) -- JSON mode with Pydantic schema, confirmed for Llama 3.2.
-- **AssemblyAI voice agent stack** (LOW confidence): [AssemblyAI blog: voice AI stack](https://www.assemblyai.com/blog/the-voice-ai-stack-for-building-agents) -- streaming architecture patterns, immutable transcription concept.
-- **openWakeWord** (MEDIUM confidence): [GitHub: dscripka/openWakeWord](https://github.com/dscripka/openWakeWord) -- evaluated and rejected for v2.0 in favor of transcript-based name detection.
-- **GPU specs** (HIGH confidence): `nvidia-smi` on the development machine -- RTX 3070, 8192 MB VRAM.
-- **Ollama environment** (HIGH confidence): Ollama runs as Docker container via shell alias in user's `.zshrc`.
+- **Codebase analysis** (HIGH confidence): `live_session.py`, `continuous_stt.py`, `transcript_buffer.py`, `pipeline_frames.py`, `event_bus.py`, `openai_realtime.py` -- all read in full
+- **Deepgram streaming docs** (HIGH confidence): [Getting Started with Live Streaming](https://developers.deepgram.com/docs/live-streaming-audio), [Audio Keep Alive](https://developers.deepgram.com/docs/audio-keep-alive), [Recovering from Connection Errors](https://developers.deepgram.com/docs/recovering-from-connection-errors-and-timeouts-when-live-streaming-audio)
+- **Deepgram API reference** (HIGH confidence): [Live Audio API](https://developers.deepgram.com/reference/speech-to-text/listen-streaming) -- encoding, sample_rate, endpointing, interim_results, speech_final parameters
+- **Deepgram endpointing docs** (HIGH confidence): [Configure Endpointing and Interim Results](https://developers.deepgram.com/docs/understand-endpointing-interim-results) -- is_final vs speech_final semantics, 300ms default recommendation
+- **Deepgram Python SDK** (MEDIUM confidence): [GitHub repo](https://github.com/deepgram/deepgram-python-sdk), [PyPI deepgram-sdk](https://pypi.org/project/deepgram-sdk/) -- SDK v3+ API surface, EventType enum, sync vs async clients
+- **Deepgram SDK API docs** (MEDIUM confidence): [Live client API](https://deepgram.github.io/deepgram-python-sdk/docs/v3/deepgram/clients/live/v1/client.html) -- LiveOptions, response types, event handler signatures
+- **Existing test patterns** (HIGH confidence): `test_live_session.py` lines 132-185 already test Deepgram `on_message` callback patterns with `is_final`/`speech_final` accumulation

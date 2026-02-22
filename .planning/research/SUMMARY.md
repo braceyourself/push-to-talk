@@ -1,229 +1,200 @@
 # Project Research Summary
 
-**Project:** Push-to-Talk v2.0 — Always-On Observer
-**Domain:** Always-on desktop voice assistant with local LLM monitoring layer
-**Researched:** 2026-02-21
-**Confidence:** MEDIUM-HIGH overall (stack HIGH, architecture HIGH, pitfalls HIGH, features MEDIUM on LLM decision quality)
+**Project:** Push-to-Talk v2.0 -- Deepgram Streaming STT + Local Decision Model
+**Domain:** Desktop always-on voice assistant (cloud STT, local LLM, Linux/PipeWire)
+**Researched:** 2026-02-22
+**Confidence:** HIGH (Deepgram SDK/API docs verified, codebase fully inspected, existing test patterns mapped)
+**Supersedes:** Previous SUMMARY.md (2026-02-21, local Whisper-based architecture)
 
 ## Executive Summary
 
-The v2.0 milestone transforms Russel from a push-to-talk assistant into an ambient participant: the microphone stays open permanently, a local Llama 3.2 3B model (via Ollama) continuously monitors transcripts and decides when to respond, and responses route to either Claude CLI (deep/tool-using) or Ollama (fast/conversational) based on query complexity. The codebase is well-positioned for this transformation — audio capture already runs in a daemon thread, Silero VAD is already loaded for barge-in, and the StreamComposer/TTS/playback stack requires zero changes. The primary structural surgery is replacing the gated `_stt_stage` + `_llm_stage` pair with three new independently-testable components: a continuous STT layer, a transcript buffer, and a monitor loop.
+This project pivots the push-to-talk voice assistant from local batch-mode Whisper STT to Deepgram Nova-3 streaming STT, while adding a local Ollama-based decision model that monitors conversation and decides when the AI should respond. The pivot trades free local inference for cloud-billed streaming ($0.0077/min of audio sent) but gains transformative latency improvements: end-to-end STT drops from 1.3-2.8s (Whisper batch with silence detection) to ~450ms (Deepgram streaming with endpointing), and removing Whisper from GPU frees ~2GB VRAM, enabling an upgrade from Llama 3.2 3B to Llama 3.1 8B for significantly better classification quality. The existing codebase is well-prepared: the Deepgram SDK is already a dependency, tests already validate the `is_final`/`speech_final` accumulation pattern, the TranscriptBuffer ring buffer requires no changes, and the `CircuitBreaker` class already supports STT fallback.
 
-The recommended approach is to build and validate each new component in isolation before integration. The continuous STT (decoupled from the monitor) and the monitor loop (decoupled from the response router) can each be tested against recorded audio and mock buffers respectively, before wiring them into the live pipeline. This isolates the two highest-risk areas — Whisper rolling-window transcription accuracy and Llama 3.2 3B decision quality — from each other and from the existing proven pipeline. The existing PTT mode must remain intact throughout all phases; always-on should be added as a new `ai_mode` value, not a replacement.
+The recommended approach is a drop-in replacement architecture. A new `DeepgramSTT` class replicates the `ContinuousSTT` interface (same `start()`/`stop()`/`set_playing_audio()` methods, same `TranscriptSegment` output). The `_stt_stage()` in `live_session.py` becomes a thin consumer of Deepgram transcript output instead of running Whisper internally. Everything downstream of STT (LLM stage, StreamComposer, TTS, playback) is unchanged. Whisper stays installed as an offline fallback but is not loaded by default (0 VRAM when idle).
 
-The dominant risks cluster around three areas that must all be resolved in Phase 1 before any monitoring intelligence is built: the audio feedback loop (the AI hearing its own TTS output and responding to it), GPU VRAM pressure from running Whisper and Ollama simultaneously on an RTX 3070 (8GB), and Whisper hallucinations exploding when exposed to continuous ambient audio rather than clean PTT segments. Starting with name-based activation only — respond only when "Russel" is explicitly said — and gradually unlocking proactive participation after the system is validated is the right UX strategy. One false positive that interrupts a phone call will cause users to disable the feature permanently.
+The single most critical risk is VAD gating architecture. The original plan uses Silero VAD to filter silence before sending audio to Deepgram, but Deepgram's engineering team explicitly recommends against per-chunk VAD gating -- it breaks server-side endpointing and degrades accuracy because silence is context for the STT model. The correct approach is to stream audio continuously during active conversation, use KeepAlive during extended idle (free), and disconnect during sleep periods. The second major risk is echo cancellation: with cloud STT, PipeWire AEC residual echo gets transcribed by Deepgram and can create feedback loops. Defense-in-depth is required: AEC + transcript fingerprinting against recent AI speech + playback-aware suppression with extended post-playback cooldown to account for network latency.
 
 ## Key Findings
 
 ### Recommended Stack
 
-The stack additions for v2.0 are minimal and deliberately lean. Ollama server (system-level install) with Llama 3.2 3B (2.0GB model, Q4_K_M quantization, ~2-2.5GB VRAM) provides the local monitoring and quick-response LLM. The `ollama` Python package (0.6.1) adds zero new transitive dependencies — it requires only `httpx` and `pydantic`, both already installed. No other new dependencies are needed. The wake word question is resolved: Whisper transcript string-matching replaces a dedicated wake word engine because Whisper is already running continuously and checking `if "russel" in transcript.lower()` is trivial.
-
-The critical hardware constraint is VRAM. The recommended configuration uses `distil-large-v3` (not `large-v3`) for continuous STT — it delivers near-large-v3 accuracy at ~1.5GB VRAM versus ~3.5GB, leaving comfortable headroom for Ollama. The fallback chain is: distil-large-v3 → small (0.5GB) → Whisper on CPU. Ollama must be configured with `OLLAMA_KEEP_ALIVE=-1` to prevent model eviction after idle periods, plus a 2-minute heartbeat keepalive to guard against the documented `keep_alive` GPU loading bug (Ollama issue #9410).
+The stack adds one new dependency (`deepgram-sdk` 5.3.2) and upgrades the decision model from Llama 3.2 3B to Llama 3.1 8B. Total new disk usage is ~4.8GB (SDK + 8B model download). The VRAM budget on the RTX 3070 (8GB) goes from ~5-6GB used (Whisper 2GB + 3B 2.5GB) to ~6.5GB (8B model 5GB + overhead 1.5GB), with ~1.7GB headroom. Whisper is removed from the GPU entirely -- Deepgram handles STT in the cloud.
 
 **Core technologies:**
-- Ollama server + Llama 3.2 3B: local monitoring LLM and quick-response backend — zero network dependency, ~200ms inference, fits 8GB VRAM alongside Whisper
-- `ollama` 0.6.1 Python client: async Ollama integration with structured JSON output via `format` parameter — zero new transitive deps
-- Whisper distil-large-v3: continuous STT replacement for large-v3 — 51% smaller, 6x faster, within 1% WER
-- Silero VAD (already loaded): repurposed from barge-in-only to always-on speech gate — prevents Whisper running on silence/noise
-- PipeWire echo cancel module: WebRTC AEC via `libpipewire-module-echo-cancel` — primary defense against AI-hears-itself feedback loop
+- **Deepgram Nova-3** (cloud streaming STT): ~150ms first-word latency, ~6.84% WER, $0.0077/min of audio sent. KeepAlive and idle WebSocket connections cost nothing. $200 free credit covers 870+ days of light use.
+- **deepgram-sdk 5.3.2**: Official Python SDK. Pin `>=5.3,<6.0` -- v6.0.0-rc.2 has breaking API changes. Synchronous client recommended (manages its own WebSocket thread, avoids async event loop conflicts with existing pipeline).
+- **Llama 3.1 8B** (Q4_K_M via Ollama, ~5GB VRAM): Replaces 3.2 3B. Meaningfully better reasoning for nuanced "should I respond?" classification (+8 MMLU points). Cap `num_ctx` at 4096 to bound KV cache growth. Fallback to 3B if VRAM pressure occurs.
+- **Silero VAD** (ONNX, CPU): Repurposed from barge-in detection to connection lifecycle management. Controls when to stream audio vs send KeepAlive vs disconnect WebSocket entirely. NOT to be used as a per-chunk audio filter before Deepgram.
+- **faster-whisper** (kept as offline fallback): Not loaded by default. 0 VRAM when idle. Activates via CircuitBreaker when Deepgram is unreachable.
 
-See STACK.md for full installation commands, VRAM budget table, Ollama API quick reference, and performance budget.
+**Critical version requirements:**
+- `deepgram-sdk>=5.3,<6.0` (avoid v6 breaking changes)
+- Ollama `num_ctx` capped at 4096 tokens (32K context would exhaust all 8GB VRAM for KV cache alone)
+- `OLLAMA_KEEP_ALIVE=-1` to prevent model eviction during idle
 
 ### Expected Features
 
-The feature set splits cleanly into table stakes (required for always-on to work at all) and differentiators (what makes this better than Alexa/Siri). The critical path through table stakes is: TS-1 → TS-2 → TS-3 → TS-5. Everything else builds on top of this chain.
+The feature set splits into table stakes (required for always-on to work) and differentiators (what makes this better than existing assistants). The critical path is: TS-1 (WebSocket) -> TS-2 (transcript accumulation) -> TS-3 (cost management) -> TS-8 (echo suppression) -> TS-4 (buffer integration) -> TS-5 (decision engine) -> TS-9 (response backend).
 
 **Must have (table stakes):**
-- TS-1: Continuous audio capture with VAD gating — prerequisite for everything; Silero VAD already present in codebase
-- TS-2: Rolling transcript buffer (ring buffer, 5-min window, ~2000 tokens max) — the monitoring LLM's working memory
-- TS-3: Response decision engine (Ollama + Llama 3.2 3B, structured JSON output: action/backend/confidence/reasoning) — "should I respond?" classifier; this is the hardest and riskiest feature
-- TS-4: Name-based activation ("hey Russel" via transcript string matching with fuzzy variants) — deterministic activation path, required for user trust
-- TS-5: Configurable response backend (Claude CLI for deep/tool queries, Ollama for fast conversational) — routes decisions to appropriate LLM
-- TS-6: Resource management (bounded buffers, VRAM monitoring, per-inference memory checks) — cross-cutting concern, must be built in from day one
-- TS-7: Graceful degradation (Ollama down → Claude only; network down → Ollama only; GPU pressure → smaller Whisper model)
+- TS-1: Deepgram WebSocket streaming connection -- foundation for all STT
+- TS-2: Interim/final/speech_final transcript accumulation -- core data flow (pattern already tested in test_live_session.py)
+- TS-3: VAD-gated cost optimization -- must be connection-lifecycle gating (active/idle/sleep), NOT per-chunk audio filtering
+- TS-5: Decision engine via Ollama -- classifies each utterance for respond/don't-respond with structured JSON output
+- TS-6: Name-based activation -- deterministic "Hey Russel" trigger via transcript string matching (check both interim and final results)
+- TS-7: WebSocket lifecycle management -- KeepAlive (text frame, every 5s), reconnection with exponential backoff, timestamp realignment
+- TS-8: Echo suppression -- PipeWire AEC + transcript fingerprinting + playback-aware tagging with extended cooldown
+- TS-9: Response backend routing -- Ollama for quick responses, Claude CLI for complex/tool-using queries
+- TS-10: Resource management for continuous operation -- bounded buffers, connection health monitoring
 
-**Should have (differentiators, Phase 4+):**
-- D-1: Proactive conversation participation (Inner Thoughts CHI 2025 framework — 8 heuristics: relevance, information gap, urgency, balance, dynamics, etc.) — the core differentiator vs every existing assistant
-- D-2: Conversation-aware response calibration (Ollama decision includes `tone` field: casual/focused/supportive/excited, passed to response backend as system prompt overlay)
-- D-3: Non-speech event awareness (cough/laughter/sigh response categories using existing Whisper rejection metadata — already partially implemented, just currently discarded)
-- D-6: Attention signals before proactive responses (brief verbal cue or audio chime before interjecting, using existing StreamComposer + response library)
-- D-7: Interruptibility detection (time-based: raise threshold if silent >10min; explicit: "quiet mode" command; OS: fullscreen app check)
+**Should have (differentiators):**
+- D-1: Real-time transcript display from interim results -- "glass box" feedback showing system is listening
+- D-4: Proactive conversation participation -- AI speaks up when relevant, not just when addressed
+- D-5: Attention signals before proactive responses -- prevents startling the user
+- D-6: Interruptibility detection -- suppress proactive responses during focus time
 
-**Defer to post-v2.0:**
-- D-4: Post-session library growth curator — clip_factory.py infrastructure exists; needs usage analysis logic
-- D-5: Multi-speaker diarization — add only if false activations from TV/others become a confirmed real problem
-- Hardware wake word engine — revisit only if Whisper-based name detection proves too slow
-- Schedule-based proactivity (Alexa Hunches pattern) — different product, out of scope
-- Cloud-based monitoring LLM — privacy violation; local-first is a core value
-
-See FEATURES.md for the full dependency graph, feature complexity ratings, and key risks table.
+**Defer to post-MVP:**
+- D-2: Word-level timestamp analysis for response timing -- optimization, not core
+- D-3: Speaker diarization via Deepgram -- streaming diarization quality unverified, historical issues exist
+- D-7: Non-speech event awareness -- interaction with VAD gating and Deepgram is unclear
+- D-8: Library growth curator -- independent track, operates on session logs post-session
 
 ### Architecture Approach
 
-The v2.0 architecture restructures the sequential 5-stage pipeline (capture → STT → LLM → TTS → playback) into three independent loops connected by the transcript buffer: an always-on input stream (audio capture + continuous Whisper + VAD gating), a monitor loop (Ollama polling the transcript buffer, emitting ResponseDecision objects), and a response layer (ResponseRouter dispatching to Claude CLI or Ollama, feeding the existing StreamComposer). The output stack (StreamComposer, TTS, PyAudio playback) is entirely unchanged. The support layer (event bus, filler manager, learner daemon, task manager, SSE dashboard) is also unchanged — new event types are additive, not breaking.
-
-The single biggest coupling point to break is `_stt_gated` (live_session.py line 211): the flag that suppresses STT during AI playback. Removing this flag — and replacing it with PipeWire AEC + transcript fingerprinting — is what makes continuous STT possible. The monitor loop batches transcripts rather than calling Ollama on every chunk: accumulate segments, wait for 2-second silence gap, check minimum 5-word count, then evaluate. This means ~1-2 Ollama calls per user utterance, not per 85ms audio chunk.
+The integration is a surgical replacement with minimal blast radius. `DeepgramSTT` replaces `ContinuousSTT` with the same external interface. It owns its own pasimple audio capture thread (proven pattern from the class it replaces), runs Silero VAD locally for connection lifecycle decisions, and manages the Deepgram WebSocket connection. The Deepgram SDK's synchronous client manages its own internal WebSocket thread; `on_message` callbacks fire on that thread and must bridge to the asyncio event loop via `loop.call_soon_threadsafe()`. Deepgram's `speech_final` flag maps directly to the existing `END_OF_UTTERANCE` frame type -- the LLM stage does not know or care that transcripts came from Deepgram instead of Whisper.
 
 **Major components:**
-1. `ContinuousSTT` (new file) — rolling-window Whisper transcription producing `TranscriptSegment` objects; owns its own thread executor; VAD-gated; handles interim-to-final segment replacement
-2. `TranscriptBuffer` (new file) — thread-safe asyncio ring buffer with `wait_for_new()`, `get_context()`, `get_since()` API; 5-min max age, 2048-token budget
-3. `MonitorLoop` (new file) — asyncio coroutine polling TranscriptBuffer; calls Ollama with structured JSON output; silence threshold + cooldown + minimum-word-count gates before invoking Ollama; emits `ResponseDecision(action, backend, confidence, prompt, reasoning)`
-4. `ResponseRouter` (new file) — dispatches ResponseDecision to Claude CLI (reusing existing `_send_to_cli`/`_read_cli_response`) or Ollama streaming; sentence-boundary detection feeds existing StreamComposer
-5. `OllamaClient` (new file) — thin async wrapper around `ollama` library; handles keepalive heartbeat, error handling, structured output, and streaming
+1. **DeepgramSTT** (new `deepgram_stt.py`) -- audio capture thread, Silero VAD for lifecycle management, Deepgram WebSocket connection, `is_final`/`speech_final` accumulation, KeepAlive timer, exponential backoff reconnection, `TranscriptSegment` emission
+2. **Rewritten `_stt_stage()`** (in `live_session.py`) -- thin consumer of `_deepgram_transcript_q`, applies gating/mute checks, emits `END_OF_UTTERANCE` + `TRANSCRIPT` pipeline frames
+3. **Decision Engine** (future phase) -- Ollama + Llama 3.1 8B reading TranscriptBuffer context on each `speech_final`, structured JSON classification, confidence-gated response routing
+4. **Unchanged:** TranscriptBuffer, StreamComposer, LLM stage (Claude CLI), TTS/playback pipeline, event bus, dashboard
 
-Build order (each independently testable before pipeline integration): Phase A (ContinuousSTT + TranscriptBuffer) → Phase B (MonitorLoop with mock buffer) → Phase C (ResponseRouter + Ollama backend) → Phase D (pipeline integration in live_session.py) → Phase E (barge-in + name detection) → Phase F (tuning).
-
-See ARCHITECTURE.md for complete ASCII diagrams, full data flow lifecycle examples (normal turn, barge-in, name interrupt, ignored background conversation), anti-patterns to avoid, and configuration additions.
+**Build order:** Step 1 (DeepgramSTT standalone, independently testable) -> Step 2 (rewrite `_stt_stage` to consume Deepgram output) -> Step 3 (clean up old Whisper code) -> Step 4 (decision model integration, separate phase)
 
 ### Critical Pitfalls
 
-All five critical pitfalls must be solved in Phase 1 before the monitoring intelligence is built. There is no point building a sophisticated decision engine on top of a system that feeds itself hallucinated transcripts of its own voice or crashes after 30 minutes due to GPU OOM.
+All five critical pitfalls must be addressed in Phase 1 before building monitoring intelligence.
 
-1. **Audio feedback loop** (CRITICAL, Phase 1) — The AI hears its own TTS output through the always-on mic and responds to itself; well-documented in OpenAI Realtime API community reports. Prevention: PipeWire `libpipewire-module-echo-cancel` (WebRTC AEC) as primary; transcript fingerprinting against `_spoken_sentences` ring buffer as secondary; `during_ai_speech=True` tagging as tertiary. Must be set up before any continuous listening code runs.
+1. **VAD gating breaks Deepgram endpointing** (CRITICAL) -- Deepgram team explicitly recommends against pre-filtering silence. `speech_final` never fires because Deepgram never sees the silence gap. Stream continuously during active periods; use KeepAlive during idle; disconnect during sleep. This is the foundational architectural decision.
 
-2. **GPU VRAM exhaustion** (CRITICAL, Phase 1) — Whisper large-v3 (~3.5GB) + Ollama 3B (~2-2.5GB) + overhead leaves <2GB headroom on 8GB RTX 3070; temporary activation spikes during simultaneous inference can OOM. Prevention: switch continuous STT to distil-large-v3 (~1.5GB); cap Ollama `num_ctx` at 2048 (`options={"num_ctx": 2048}`); real-time VRAM monitoring; validate empirically before Phase 2.
+2. **Audio format silent failure** (CRITICAL) -- Deepgram silently returns empty transcripts if `encoding=linear16` and `sample_rate=24000` are not explicitly set. No error message. Must validate on first connection that transcripts arrive within 10 seconds of streaming speech audio.
 
-3. **Whisper hallucinations explode in continuous mode** (CRITICAL, Phase 1) — Whisper has a 40.3% hallucination rate on non-speech audio (keyboard, HVAC, TV); the existing 18-phrase filter was tuned for PTT where audio is almost always genuine speech. Prevention: more aggressive VAD parameters (`min_speech_duration_ms: 250`, `threshold: 0.7`); expanded hallucination phrase list (~30 well-documented phrases + single-word fillers); confidence gating (>3 words, logprob threshold, energy check); rate-limit STT during long quiet periods.
+3. **WebSocket disconnection drops mid-utterance transcript** (CRITICAL) -- Network blips kill the connection mid-speech, losing partial transcripts. Buffer audio locally during reconnection (maxsize=200 chunks, ~17s). Exponential backoff with jitter. Finalize message before intentional disconnect. Timestamp realignment after reconnection.
 
-4. **Monitoring LLM context grows unboundedly** (CRITICAL, Phase 2) — Naive implementation appends all transcripts; 30 minutes of ambient audio fills the Ollama context window, causing truncation or VRAM growth. Prevention: two-tier context (rolling summary ~100-200 tokens + recent raw buffer ~500 tokens); event-driven triggering rather than continuous polling; explicit context reset on topic change or long silence (>5 min).
+4. **Cost runaway without lifecycle management** (CRITICAL) -- $332/month if streaming 24/7. Activity-based lifecycle: active mode (streaming audio) -> idle mode (KeepAlive, free) -> sleep mode (disconnected, zero cost). Daily budget cap with Whisper fallback. Cost tracking counter in dashboard.
 
-5. **False positive responses** (CRITICAL, Phase 2 and ongoing) — The AI speaks when it shouldn't (phone call, TV dialogue, self-talk); one bad interjection during a phone call causes users to disable the feature permanently. Prevention: default to NOT responding; name-based activation only for v2.0 initial launch; confidence threshold >0.8; 60-second cooldown after proactive responses; track suppression rate (user interrupts within 2s = likely false positive).
+5. **Echo cancellation feedback loop** (CRITICAL) -- PipeWire AEC residual echo gets transcribed by Deepgram, decision model sees AI's own words. Defense-in-depth: AEC primary + transcript fingerprinting against `_spoken_sentences` secondary + extended post-playback cooldown (200-500ms beyond playback end for network latency) tertiary.
 
-See PITFALLS.md for 13 additional major/moderate pitfalls with detailed prevention strategies, phase-to-pitfall mapping table, and warning sign indicators.
+Additional major pitfalls: `speech_final` fails in noisy environments (dual-trigger: endpointing + `utterance_end_ms`); decision model false positives from TV/music (name-activation only at launch); name detection failures (fuzzy matching + Deepgram keyterm prompting + check interim results); interim result mishandling (three-tier strategy: interims for name only, finals for accumulation, speech_final for processing).
 
 ## Implications for Roadmap
 
-All four research files independently converged on the same phase breakdown, giving high confidence in this structure. The FEATURES.md phasing recommendation, ARCHITECTURE.md build order, and PITFALLS.md phase warnings all align.
+Based on combined research, the implementation splits into 5 phases with clear dependency chains. All four research files independently converged on this structure.
 
-### Phase 1: Infrastructure and Safety Net
+### Phase 1: Deepgram Streaming Infrastructure
+**Rationale:** Everything depends on working, reliable STT. This phase builds and validates the audio pipeline before adding any intelligence. The five critical pitfalls (VAD architecture, audio format, disconnection, cost, echo) must all be resolved here.
+**Delivers:** Continuous Deepgram streaming with proper lifecycle management (active/idle/sleep). System transcribes speech reliably but makes no autonomous decisions. Existing PTT mode still works unchanged.
+**Addresses:** TS-1 (WebSocket), TS-2 (transcript accumulation), TS-3 (cost optimization), TS-7 (lifecycle), TS-8 (echo suppression), TS-10 (resource management)
+**Avoids:** Pitfall 1 (VAD architecture), Pitfall 2 (audio format), Pitfall 3 (disconnection), Pitfall 4 (cost runaway), Pitfall 5 (echo loop), Pitfall 6 (noisy environments)
+**Key decision:** VAD role is connection-lifecycle (active/idle/sleep), NOT per-chunk audio filtering. This contradicts the original plan and must be settled before writing code.
 
-**Rationale:** The five critical pitfalls all belong here. No monitoring intelligence is useful without a clean audio stream, a stable VRAM budget, and robust hallucination filtering. This phase produces no visible AI behavior change — always-on audio capture runs but makes no autonomous decisions. PTT mode continues working unchanged. The foundation must be proven solid before building intelligence on it.
+### Phase 2: Decision Engine + Name Activation
+**Rationale:** With reliable transcripts flowing, add the intelligence layer. Name activation provides a deterministic path while the decision model is being tuned. Initially conservative: high confidence threshold, name-only activation.
+**Delivers:** Ollama integration with Llama 3.1 8B, structured JSON classification on each `speech_final`, name detection via fuzzy matching on both interim and final results, transcript buffer context window feeding decisions.
+**Addresses:** TS-5 (decision engine), TS-6 (name activation), TS-4 (transcript buffer)
+**Avoids:** Pitfall 7 (false positives -- name-only at launch), Pitfall 8 (name detection failures -- fuzzy matching + keyterm prompting)
+**Uses:** Ollama + Llama 3.1 8B (STACK.md), `TranscriptBuffer.get_context()`, Deepgram `keyterm` parameter for name boosting
 
-**Delivers:** Continuous VAD-gated audio capture decoupled from LLM; `ContinuousSTT` producing `TranscriptSegment` objects with rolling-window Whisper; `TranscriptBuffer` with bounded ring buffer; PipeWire AEC configured and validated; VRAM measured empirically with both models loaded simultaneously; expanded hallucination filter (30+ phrases, VAD parameter tuning, confidence gating); profile-based config schema (`"mode": "always_on"` vs `"mode": "ptt"` with sensible defaults); startup validation (AEC configured? Ollama running? VRAM sufficient?); persistent system tray indicator showing always-on state; JSONL rotation policy (24-hour auto-purge).
-
-**Addresses:** TS-1 (partial), TS-6, TS-7 (partial), Pitfalls 1, 2, 3, 9, 10, 16, 17
-
-**Avoids:** Building monitoring intelligence before the audio stream is clean, VRAM budget is validated, and hallucination rate is under control.
-
-**Research flag:** PipeWire echo cancellation device selection — the module is documented, but the exact `pasimple` device name (`echo-cancel-capture`) and routing in this specific PipeWire version needs verification on this machine. Targeted 30-minute spike recommended before implementation.
-
-### Phase 2: Monitoring Decision Engine
-
-**Rationale:** With a clean, bounded, low-hallucination transcript stream in place, the monitoring LLM can be built and tuned in isolation using mock buffers. This phase adds Ollama integration, name-based activation (the deterministic path), and the monitor loop — but keeps the response threshold maximally conservative (respond only on explicit name mention). This validates the Ollama pipeline and decision quality before any proactive logic is added.
-
-**Delivers:** `OllamaClient` with structured JSON output, keepalive configuration (`OLLAMA_KEEP_ALIVE=-1` in systemd + 2-min heartbeat ping), pre-load on session start, error handling (`ResponseError` catch, 404 = pull model); `MonitorLoop` with silence threshold (2.0s), minimum-word-count gate (5 words), cooldown (3.0s), and `_responding` flag; name-based activation ("russel", "russell", "rusel", "russ" fuzzy variants + `initial_prompt` Whisper bias for better name transcription); two-tier context management (rolling summary + recent buffer); event bus additions (`transcript_segment`, `monitor_decision`, `wake_phrase_detected`, `ollama_inference`).
-
-**Addresses:** TS-2 (full), TS-3, TS-4, Pitfalls 4, 5, 6, 7, 15, 18
-
-**Uses:** `ollama` 0.6.1 Python client, Llama 3.2 3B structured output with JSON schema `format` parameter, `options={"temperature": 0, "num_predict": 100, "num_ctx": 2048}`
-
-**Research flag:** Monitoring LLM decision quality is LOW confidence — Llama 3.2 3B's accuracy on respond/wait/ignore/acknowledge classification against realistic ambient conversation transcripts is unknown. Create a benchmark dataset (20-30 examples: phone call, TV dialogue, direct question, self-talk, multi-person chat) and evaluate before building Phase 2 fully. If accuracy is inadequate (<80% correct classification), fall back to heuristic pre-filter (existing input classifier fast path) + Ollama only for ambiguous cases.
-
-### Phase 3: Response Backend and Pipeline Integration
-
-**Rationale:** With the monitor producing validated decisions, the response layer can be wired in. This is the highest-risk integration phase (replacing `_stt_stage` and `_llm_stage` in `live_session.py`) but each new component has been independently tested by this point. Two backends are integrated behind a `ResponseRouter` with circuit-breaker fallback. Use the simple initial routing rule: name-triggered → Claude CLI, ambient/proactive → Ollama.
-
-**Delivers:** `ResponseRouter` dispatching to Claude CLI (reusing `_send_to_cli`/`_read_cli_response`) or Ollama streaming (sentence-boundary detection matching existing pattern); pipeline integration in `live_session.py` (replace `_stt_stage`/`_llm_stage` with new coroutines, update `run()`, remove `_stt_gated` flag); barge-in extended with name-detection path alongside VAD path; quick-response filler bridge (filler plays immediately on "should respond" decision while response LLM generates, using existing `_filler_manager` + StreamComposer); backend circuit breaker extending existing `CircuitBreaker` class (line 148); regression test run against full test suite after every change.
-
-**Addresses:** TS-1 (full, pipeline wired), TS-5, TS-7 (full), Pitfalls 8, 13, 14, 17 (ongoing)
-
-**Research flag:** Standard patterns apply. ResponseRouter Ollama streaming → StreamComposer integration is fully specified in ARCHITECTURE.md. The pipeline integration (Phase D in architecture) is high implementation risk but the approach is clear — no deeper research needed, just careful execution and regression testing.
+### Phase 3: Response Backend + Full Pipeline Integration
+**Rationale:** Decision engine can now say "respond" -- wire the actual response delivery. Full end-to-end loop: STT -> Decision -> Response -> TTS -> Playback.
+**Delivers:** Ollama quick responses (~700ms end-to-end), Claude CLI for complex queries, backend routing logic, Whisper fallback for degraded network.
+**Addresses:** TS-9 (response backend)
+**Avoids:** Pitfall 10 (latency spikes -- Whisper fallback), Pitfall 14 (state management -- pluggable STT interface)
 
 ### Phase 4: Proactive Participation
+**Rationale:** Core loop proven reliable. Lower decision thresholds to enable AI contributions without being addressed. This is the differentiating feature.
+**Delivers:** Proactive participation with attention signals, interruptibility detection, conversation state machine with cooldown after ignored interjections.
+**Addresses:** D-4 (proactive participation), D-5 (attention signals), D-6 (interruptibility)
+**Avoids:** Pitfall 7 (false positives -- conversation state machine, 5-minute cooldown after unengaged proactive responses)
 
-**Rationale:** Phases 1-3 deliver a working always-on system that responds when explicitly addressed by name. Phase 4 adds the core differentiator: proactive participation in conversations without being addressed. This must come after the name-only system is validated in production — the worst outcome is loosening thresholds on an untested monitoring pipeline. The Inner Thoughts CHI 2025 framework provides the theoretical model for this phase.
-
-**Delivers:** Proactive response threshold configuration (Ollama prompt encoding of Inner Thoughts 8 heuristics: relevance, information gap, urgency, balance, dynamics; configurable `proactivity_level: 0-5` mapping to `imThreshold` parameter); attention signals (brief verbal cue "hey" / "actually" or audio chime played before proactive interjection via StreamComposer + response library new category); conversation-aware tone calibration (Ollama decision includes `tone` field passed to response backend system prompt modifier); interruptibility detection (time-based: raise threshold if no speech >10min; explicit: "quiet mode" voice command or key shortcut; OS: check for fullscreen app); non-speech event awareness (cough → "bless you", laughter → reaction, sigh → "rough day?" — using existing Whisper rejection metadata, requires high confidence ≥0.85).
-
-**Addresses:** D-1, D-2, D-3, D-6, D-7
-
-**Research flag:** Proactive participation prompt engineering is inherently experimental. Plan for 2-3 iteration cycles on the Ollama monitoring prompt. The research (Inner Thoughts framework) provides the conceptual model, but the encoding for a 3B model and the right default aggressiveness level are unknown. Budget explicit tuning time here — do not treat this as a one-shot implementation.
-
-### Phase 5: Reliability and Library Growth
-
-**Rationale:** D-4 (library growth curator) and multi-speaker diarization (D-5) are independent tracks that don't block the core always-on experience. Library growth reuses existing clip_factory.py infrastructure. Multi-speaker diarization should only be added if false activations from other people/TV become a confirmed problem in Phase 4 production use — do not add preemptively.
-
-**Delivers:** Curator daemon (post-session, reviews JSONL logs, identifies missing response phrases, generates via Piper TTS, quality-evaluates, adds to response library); extended reliability (faster-whisper memory leak monitoring — RSS every 5 minutes, alert on >20% growth; periodic model reload every 2 hours to release leaked tensors; 4-hour soak test before shipping); event bus rate limiting for continuous events (only log state changes, not every evaluation); always-on observability panel in SSE dashboard (VRAM usage, hallucination rate, monitoring decision per minute, response latency histogram).
-
-**Addresses:** D-4, D-5 (conditional), Pitfalls 11, 12, 18
-
-**Research flag:** Standard patterns. Library growth curator follows the existing `learner.py` daemon pattern. Reliability work is standard engineering discipline. No deeper research needed.
+### Phase 5: Polish + Enrichment
+**Rationale:** Core system working. Add observability, analytics, and experimental features.
+**Delivers:** Real-time transcript display, word-level timing analysis, optional diarization, non-speech event detection, library growth curator.
+**Addresses:** D-1 (display), D-2 (timing), D-3 (diarization), D-7 (non-speech), D-8 (curator)
 
 ### Phase Ordering Rationale
 
-- Phases 1-3 follow the hard dependency chain: clean audio → monitoring intelligence → response routing. These cannot be reordered.
-- Phase 3 (integration) comes before Phase 4 (proactive) because tuning thresholds on an unintegrated system is wasted work. The end-to-end pipeline must be operational before restrictions are loosened.
-- Phase 4 (proactive) is explicitly gated behind Phase 3 production validation. The research is unambiguous: false positives are more damaging than missed responses. Conservative first, looser after evidence of reliability.
-- Phase 5 is decoupled and can be started in parallel with Phase 4 tuning.
-- PTT mode preservation is a continuous requirement across all phases — run the full test suite after every always-on change.
+- **Phase 1 first** because every other phase depends on working Deepgram streaming. The VAD gating architecture decision cascades through the entire system. Getting this wrong means reworking the audio pipeline.
+- **Phase 2 before Phase 3** because the decision engine defines routing logic. Response backends cannot be wired without knowing what triggered them and what kind of response is needed.
+- **Phase 3 before Phase 4** because proactive participation requires proven response delivery. Lowering thresholds on an unreliable pipeline creates chaos.
+- **Phase 4 before Phase 5** because proactive participation is the core differentiator that defines the product. Polish features are valuable but don't change what the product is.
+- **Diarization deferred to Phase 5** despite being a single config parameter, because streaming diarization has historical reliability issues and false positives from TV/music are better solved by name-activation + conversation state machine first.
 
 ### Research Flags
 
-Phases needing deeper research during planning:
-- **Phase 1:** PipeWire echo cancellation device selection — `libpipewire-module-echo-cancel` documentation covers configuration, but the `pasimple` virtual device name and routing specific to this machine's PipeWire version needs a targeted spike before implementation begins.
-- **Phase 2:** Llama 3.2 3B monitoring decision quality — benchmark against 20-30 realistic transcript scenarios before committing to the architecture. If accuracy is below 80%, the fallback (heuristic pre-filter + Ollama for ambiguous only) must be built instead of the pure-LLM approach.
+Phases likely needing deeper research during planning:
+- **Phase 1:** Must reconcile VAD gating architecture -- STACK/FEATURES research assumes per-chunk filtering, PITFALLS research found Deepgram recommends against it. The lifecycle-management approach (active/idle/sleep) needs validation during implementation. Also: PipeWire AEC effectiveness with cloud STT latency is unverified.
+- **Phase 2:** Decision model prompt engineering is inherently experimental. Llama 3.1 8B's classification accuracy on realistic ambient conversation needs benchmarking before committing. Budget time for prompt tuning iterations.
+- **Phase 4:** Proactive participation thresholds have no precedent data for this system. The CHI 2025 "Inner Thoughts" framework provides heuristics but they need calibration. Plan for 2-3 iteration cycles.
 
 Phases with standard patterns (skip research-phase):
-- **Phase 3:** Architecture fully specified in ARCHITECTURE.md with working code examples. Careful implementation work, not novel research.
-- **Phase 4:** Inner Thoughts framework is the research. Encoding it in prompts requires iteration, not more literature review.
-- **Phase 5:** Curator follows `learner.py` pattern. Reliability is standard engineering practice.
+- **Phase 3:** Response backend routing is well-understood. Ollama and Claude CLI are battle-tested in the existing codebase. Architecture is fully specified.
+- **Phase 5:** All features have clear implementations. Real-time display is a new data source for the existing overlay. Diarization is a single Deepgram parameter. Curator follows existing `learner.py` daemon pattern.
 
 ## Confidence Assessment
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | Ollama + Llama 3.2 3B verified against official library docs, PyPI, model registry. Python client dependencies confirmed present in venv. VRAM estimates are MEDIUM — community benchmarks, not empirically verified on this specific hardware with both models loaded simultaneously. |
-| Features | MEDIUM-HIGH | Table stakes features are well-understood with clear implementation paths. Differentiator D-1 (proactive participation) is MEDIUM — Inner Thoughts CHI 2025 framework validates the concept, Gemini Proactive Audio validates the commercial viability, but Llama 3.2 3B's ability to implement the 8-heuristic decision reliably is LOW confidence until benchmarked. |
-| Architecture | HIGH | Codebase fully read (live_session.py 2900+ lines, all other modules). Existing coupling points identified with exact line references. New component APIs designed with working code examples. Build order validated against component dependencies. Anti-patterns explicitly identified. |
-| Pitfalls | HIGH | 18 pitfalls documented, verified against codebase line references, hardware specs, official documentation, and academic research. Critical pitfalls have 2-3 independent sources. Phase-to-pitfall mapping is explicit and actionable. |
+| Stack | HIGH | Deepgram SDK verified on PyPI (v5.3.2, 2026-01-29), pricing confirmed by Deepgram staff on GitHub Discussion #1423, VRAM estimates from community benchmarks (MEDIUM sub-confidence -- not empirically verified on RTX 3070 with 8B model loaded) |
+| Features | HIGH | Deepgram API docs verified, existing test suite validates transcript accumulation patterns (lines 132-178), latency numbers from official Deepgram benchmarks, billing model confirmed by staff |
+| Architecture | HIGH | Full codebase inspection with exact line references, drop-in replacement design with minimal blast radius (only `_stt_stage` rewritten, stages 3-5 unchanged), thread/async model mapped precisely including SDK internal thread behavior |
+| Pitfalls | HIGH | 19 pitfalls documented from Deepgram official docs + SDK issue tracker + community discussions + codebase analysis. VAD gating pitfall (#1) sourced directly from Deepgram team member recommendation. Echo cancellation path analyzed with network latency implications. |
 
-**Overall confidence:** MEDIUM-HIGH
+**Overall confidence:** HIGH
 
 ### Gaps to Address
 
-- **VRAM empirical validation (Phase 1 blocker):** Distil-large-v3 + Ollama Llama 3.2 3B VRAM under concurrent inference load has not been measured on the actual RTX 3070. This must be the first thing validated in Phase 1 — install both, run simultaneously, stress with `nvidia-smi dmon`. If peak VRAM exceeds 7GB, switch to Whisper `small` model before building anything else.
+- **VAD gating vs continuous streaming reconciliation:** STACK and FEATURES research assume per-chunk VAD gating for cost savings. PITFALLS research found Deepgram's team recommends against this. The reconciled approach (lifecycle-level gating: active/idle/sleep) needs implementation validation during Phase 1. This is the most consequential gap.
 
-- **Llama 3.2 3B monitoring accuracy (Phase 2 blocker):** The model's respond/wait/ignore/acknowledge classification accuracy on real ambient conversation transcripts is unknown. Create a benchmark dataset before building Phase 2 fully. If results are inadequate, the monitoring architecture changes significantly (heuristic primary path, LLM secondary).
+- **Llama 3.1 8B VRAM under load:** The ~5GB estimate is from community benchmarks. With KV cache growth at `num_ctx=4096`, actual usage may approach the 8GB limit on the RTX 3070. Must empirically validate in Phase 2 setup. Fallback to 3B must remain viable.
 
-- **PipeWire AEC device selection (Phase 1):** The exact virtual source device name exposed by `libpipewire-module-echo-cancel` and how to select it in `pasimple.PaSimple()` needs verification on this specific PipeWire setup. 30-minute investigation spike recommended.
+- **Streaming diarization quality:** Deepgram has a historical GitHub issue (#108) where speaker IDs always returned 0 in streaming mode. May be resolved in Nova-3 but needs verification before relying on it (deferred to Phase 5).
 
-- **Ollama Docker vs native latency (Phase 1):** Ollama runs as a Docker container alias on this machine. Docker GPU passthrough adds overhead. The architecture research recommends evaluating native Ollama installation for lower inference latency. Worth measuring before committing to the deployment approach.
+- **Deepgram SDK sync client reconnection behavior:** Architecture recommends sync client to avoid async conflicts, but behavior under repeated reconnection (exponential backoff + buffered audio replay) needs empirical testing during Phase 1.
 
-- **Silence threshold tuning (Phase 3):** The 2-second silence threshold in MonitorLoop is the single most important UX parameter — it determines how long after the user stops speaking before the AI responds. Too short = premature evaluation while user is mid-thought. Too long = conversational sluggishness. Starting value of 2.0s is research-informed but requires tuning with real usage.
+- **PipeWire AEC effectiveness with cloud STT:** Echo cancellation is configured but untested in the cloud STT path. Network latency widens the timing window for residual echo compared to local Whisper processing. Must validate during Phase 1 before connecting Deepgram output to the decision model.
+
+- **Endpointing in noisy environments:** `speech_final` may never fire with background noise (HVAC, fan). The dual-trigger pattern (`speech_final` OR `UtteranceEnd` OR local timeout) is designed but untested. Must verify during Phase 1 integration testing.
 
 ## Sources
 
 ### Primary (HIGH confidence)
-- Existing codebase: `live_session.py` (2900+ lines, fully read with line references), `stream_composer.py`, `pipeline_frames.py`, `event_bus.py`, `input_classifier.py`, `learner.py`, `push-to-talk.py` — direct code inspection
-- [Ollama Python library GitHub](https://github.com/ollama/ollama-python) — AsyncClient API, streaming, structured output
-- [Ollama /api/chat docs](https://docs.ollama.com/api/chat) — format, options, keep_alive parameters
-- [Ollama structured outputs docs](https://docs.ollama.com/capabilities/structured-outputs) — JSON schema via format parameter, verified for Llama 3.2
-- [Ollama FAQ](https://docs.ollama.com/faq) — keep_alive, OLLAMA_MAX_LOADED_MODELS, GPU memory management
-- [Llama 3.2 model page](https://ollama.com/library/llama3.2) — 3B size, 2.0GB on disk, 128K context window
-- [PipeWire: Echo Cancel Module](https://docs.pipewire.org/page_module_echo_cancel.html) — official WebRTC AEC configuration
-- `nvidia-smi` on development machine — RTX 3070, 8192 MB VRAM confirmed
-- pip venv inspection — httpx 0.28.1, pydantic 2.12.5, faster-whisper 1.2.1, ollama (not yet installed) confirmed present/absent
+- [Deepgram Streaming API Reference](https://developers.deepgram.com/reference/speech-to-text/listen-streaming) -- parameters, response format, message types
+- [Deepgram Endpointing + Interim Results](https://developers.deepgram.com/docs/understand-endpointing-interim-results) -- `is_final`/`speech_final` lifecycle, configuration
+- [Deepgram Audio Keep Alive](https://developers.deepgram.com/docs/audio-keep-alive) -- KeepAlive format, 10s timeout, text frame requirement
+- [Deepgram Connection Recovery](https://developers.deepgram.com/docs/recovering-from-connection-errors-and-timeouts-when-live-streaming-audio) -- reconnection, audio buffering, timestamp realignment
+- [Deepgram Billing Discussion #1423](https://github.com/orgs/deepgram/discussions/1423) -- per-audio-second billing confirmed by staff, KeepAlive costs $0
+- [Deepgram VAD Discussion #1216](https://github.com/orgs/deepgram/discussions/1216) -- team member recommends against pre-filtering silence
+- [Deepgram Pricing](https://deepgram.com/pricing) -- $0.0077/min Nova-3 streaming, $200 free credit no expiry
+- [Deepgram Python SDK (PyPI)](https://pypi.org/project/deepgram-sdk/) -- v5.3.2 stable, v6.0.0-rc.2 pre-release
+- [Deepgram Nova-3 Benchmarks](https://deepgram.com/learn/speech-to-text-benchmarks) -- WER ~6.84% streaming
+- Codebase: `live_session.py`, `continuous_stt.py`, `transcript_buffer.py`, `test_live_session.py`, `pipeline_frames.py`, `event_bus.py`
 
 ### Secondary (MEDIUM confidence)
-- [Inner Thoughts: Proactive Conversational Agents (CHI 2025)](https://arxiv.org/html/2501.00383v2) — 8-heuristic proactive participation framework, overt/covert/tonal proactivity parameters
-- [Better to Ask Than Assume (CHI 2024)](https://dl.acm.org/doi/10.1145/3613904.3642193) — attention signal pattern ("utterance starter") before proactive VA responses
-- [Proactivity Dilemma (CUI 2022)](https://dl.acm.org/doi/10.1145/3543829.3543834) — interruptibility as primary factor in proactive VA acceptance; personal context matters more than content quality
-- [Gemini Proactive Audio (Google Cloud)](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/live-api/proactive-audio) — validates "model decides when to respond" as a production pattern
-- [WhisperLive](https://github.com/collabora/WhisperLive) / [whisper_streaming](https://github.com/ufal/whisper_streaming) — rolling-window approach for continuous Whisper transcription
-- [distil-whisper HuggingFace](https://huggingface.co/distil-whisper/distil-large-v3) — 6.3x faster, 51% smaller, within 1% WER vs large-v3
-- [arXiv 2501.11378: Whisper ASR Hallucinations](https://arxiv.org/abs/2501.11378) — 40.3% hallucination rate on non-speech audio, top hallucinated phrases documented
-- [Ollama VRAM guide](https://localllm.in/blog/ollama-vram-requirements-for-local-llms) — 3B model ~2-3GB VRAM with Q4 quantization
-- [Silero VAD GitHub](https://github.com/snakers4/silero-vad) — <1ms per chunk CPU, MIT license, 2MB model, verified performance
-- [OpenAI Community: Realtime API feedback loop](https://community.openai.com/t/realtime-api-starts-to-answer-itself-with-mic-speaker-setup/977801) — AI-hears-itself feedback loop documented in production deployments
-- [faster-whisper memory leak issue #249](https://github.com/guillaumekln/faster-whisper/issues/249) — memory growth in long transcription sessions
-- [GitHub: ollama/ollama Issue #9410](https://github.com/ollama/ollama/issues/9410) — keep_alive GPU loading bug documentation
+- [Ollama VRAM Requirements](https://localllm.in/blog/ollama-vram-requirements-for-local-llms) -- 8B Q4 ~5-6GB community benchmarks
+- [Llama 3.1 8B vs 3.2 3B Comparison](https://medium.com/@marketing_novita.ai/llama-3-1-8b-vs-llama-3-2-3b) -- MMLU benchmark comparison
+- [Ollama Performance on 8GB GPUs](https://aimuse.blog/article/2025/06/08/ollama-performance-tuning-on-8gb-gpus) -- KV cache growth, 7.6GB cliff on RTX 3070
+- [Deepgram SDK Issue #493](https://github.com/deepgram/deepgram-python-sdk/issues/493) -- API key passing regression, still present in v5.3.2
+- [Deepgram SDK Issue #279](https://github.com/deepgram/deepgram-python-sdk/issues/279) -- SDK 3.1.1 broke WebSocket connections
+- [Twilio Voice Agent Latency Guide](https://www.twilio.com/en-us/blog/developers/best-practices/guide-core-latency-ai-voice-agents) -- STT 100-300ms, LLM 375ms, TTS 100ms typical
+- [Tavus Turn-Taking Guide](https://www.tavus.io/post/ai-turn-taking) -- 200ms natural response gap
 
 ### Tertiary (LOW confidence)
-- VRAM estimates for simultaneous Whisper distil-large-v3 + Ollama Llama 3.2 3B under concurrent inference load — not empirically verified on RTX 3070; community benchmarks only; must measure in Phase 1
-- Llama 3.2 3B respond/ignore decision accuracy for ambient monitoring task — estimated from general model capability benchmarks; not tested against this specific classification task
-- Ollama Docker GPU passthrough vs native latency — community reports suggest overhead exists; not measured on this hardware
+- Streaming diarization quality (historical issue #108, may be resolved in Nova-3) -- needs empirical validation
+- Llama 3.1 8B VRAM with KV cache at `num_ctx=4096` on RTX 3070 -- community estimates only, needs hardware testing
+- Deepgram SDK sync client behavior under repeated reconnection -- undocumented edge cases possible
 
 ---
-*Research completed: 2026-02-21*
+*Research completed: 2026-02-22*
+*Supersedes: Previous SUMMARY.md (2026-02-21, local Whisper-based architecture)*
 *Ready for roadmap: yes*

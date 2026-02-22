@@ -1,275 +1,221 @@
-# Domain Pitfalls: Always-On Listening + Local LLM Observer
+# Domain Pitfalls: Deepgram Streaming STT + Local Decision Model
 
-**Domain:** Converting PTT-gated voice assistant to always-on listening with local LLM monitoring layer
-**Researched:** 2026-02-21
-**Confidence:** HIGH (verified against existing codebase, hardware specs, official docs, community reports)
+**Domain:** Adding streaming cloud STT and local decision model to existing PTT voice assistant
+**Researched:** 2026-02-22
+**Confidence:** HIGH (Deepgram official docs, SDK issues, community discussions, codebase inspection)
 
-**Hardware context:** NVIDIA RTX 3070 (8GB VRAM), currently running faster-whisper large-v3 int8_float16 (~3.1GB VRAM). Adding Ollama Llama 3.2 3B (~2-3GB VRAM) means ~6GB of 8GB occupied. PipeWire audio, Linux X11.
+**System context:** Existing push-to-talk voice assistant with:
+- RTX 3070 8GB VRAM (Whisper being removed, freeing ~3GB)
+- PipeWire echo cancellation already configured
+- TranscriptBuffer ring buffer already built
+- Silero VAD already running for barge-in detection
+- Existing PTT mode must still work alongside always-on
+- Single user, single room, Linux desktop
+- Audio capture at 24kHz 16-bit mono via pasimple/PipeWire
 
 ---
 
 ## Critical Pitfalls
 
-Mistakes that cause rewrites, make the feature unusable, or create runaway resource consumption.
+Mistakes that cause the feature to not work, create runaway costs, or require architectural rework.
 
 ---
 
-### Pitfall 1: Audio Feedback Loop -- AI Hears Itself and Responds to Its Own Speech
+### Pitfall 1: VAD Gating Breaks Deepgram Endpointing and Reduces Accuracy
 
 **What goes wrong:**
-With always-on listening, the microphone captures everything continuously -- including the AI's own TTS output from the speakers. The AI speaks, Whisper transcribes that speech, the monitoring LLM sees the transcript, decides it should respond, generates more speech, which gets transcribed again. Within 2-3 cycles the system is talking to itself in an infinite loop, consuming GPU resources and producing nonsensical audio.
+The v2.0 architecture plans to use Silero VAD as a "cost gate" -- only streaming speech segments to Deepgram. This sounds logical (why pay to transcribe silence?) but Deepgram's own engineering team explicitly recommends against it. In a GitHub discussion (#1216), a Deepgram team member stated: "I would not recommend that approach for the vast majority of use cases."
 
-This is the single most reported problem in always-on voice assistant development. OpenAI's Realtime API users documented this exact issue: "When the bot gives a response from the speaker, it listens to itself and takes that response as input, giving a response to what it said, creating a loop." The problem is worse with desktop speakers than headsets because acoustic echo cancellation (AEC) is less effective with open-air speaker/mic arrangements.
+The problems are threefold:
+1. **Endpointing breaks.** Deepgram's endpointing feature (`speech_final: true`) uses audio-based VAD to detect when speech transitions to silence. If you pre-filter silence out with your own VAD, Deepgram never sees the silence gap, so `speech_final` never fires. Your downstream logic that waits for `speech_final: true` to process a complete utterance hangs indefinitely.
+2. **Accuracy degrades.** Silence is context for the STT model. Removing it changes the acoustic properties of the audio stream, reducing Word Error Rate performance. The Deepgram team stated: "Silence is critical context for the model."
+3. **Latency increases.** Pre-filtering introduces "finalization latency" because the model receives choppy audio fragments instead of a continuous stream.
 
-**Why it happens:**
-The current system avoids this via `_stt_gated`: during playback, STT is suppressed (line 2262 of `live_session.py`). The mic stays physically live only for VAD-based barge-in detection. But in always-on mode, there is no gating -- STT must run continuously. The AI's speech output goes through PyAudio at 24kHz on the same device whose mic PipeWire is capturing at 24kHz. Without echo cancellation, the mic picks up the speaker output with ~5-50ms delay and slight acoustic distortion -- enough for Whisper to transcribe it as coherent speech.
-
-**Why it happens in THIS codebase specifically:**
-The existing `_stt_gated` mechanism (lines 2262-2288) was designed as a binary on/off. It clears the audio buffer entirely when gated. Converting to always-on requires replacing this binary gate with a smarter approach that can distinguish between AI speech and user speech in a continuous stream.
+**Why it matters for THIS project:**
+The PROJECT.md states: "Local VAD cost gate (Silero) -- only stream speech segments to Deepgram (saves API cost)." This is the planned architecture, and it directly contradicts Deepgram's official recommendation.
 
 **How to avoid:**
 
-1. **PipeWire echo cancellation module (primary defense).** PipeWire has a built-in `libpipewire-module-echo-cancel` that creates virtual source/sink nodes using WebRTC AEC. Configure it in `~/.config/pipewire/pipewire.conf.d/`:
-   ```
-   context.modules = [
-       {   name = libpipewire-module-echo-cancel
-           args = {
-               library.name = aec/libspa-aec-webrtc
-               capture.props = { node.name = "echo-cancel-capture" }
-               playback.props = { node.name = "echo-cancel-playback" }
-           }
-       }
-   ]
-   ```
-   Then change the PaSimple capture in `_audio_capture_stage` to record from the `echo-cancel-capture` virtual source instead of the default. Similarly, route playback through the `echo-cancel-playback` sink. This correlates the playback signal with the mic capture and subtracts it. **Confidence: HIGH** -- this is official PipeWire functionality with WebRTC AEC.
+1. **Stream continuously, use KeepAlive for true silence.** When there is genuinely no audio activity (room is empty, user left), send KeepAlive messages instead of audio. KeepAlive messages are free -- they don't count toward billing. Send them every 3-5 seconds to prevent the 10-second timeout (NET-0001 error). When speech resumes, switch back to streaming audio. This gives Deepgram the silence context it needs while not paying for extended idle periods.
 
-2. **Software-level transcript fingerprinting (secondary defense).** Keep a ring buffer of the last N sentences the AI spoke (already tracked in `_spoken_sentences`). When STT produces a transcript, compare it against recent AI speech using fuzzy matching (Levenshtein ratio > 0.7 = echo). Reject echo-matched transcripts before they reach the monitoring LLM. This catches cases where AEC is imperfect.
+2. **Use Silero VAD for connection lifecycle, not audio filtering.** VAD detects "room is active" vs "room is dead quiet." When VAD shows no speech for 30+ seconds, stop streaming audio and switch to KeepAlive. When VAD detects any activity, resume streaming audio (including the silence between words). This preserves Deepgram's endpointing while avoiding billing for extended idle.
 
-3. **Playback-aware STT suppression (tertiary defense).** Even in always-on mode, apply a "soft gate" during AI speech: continue STT but tag transcripts as `during_ai_speech=True`. The monitoring LLM receives these tagged transcripts and knows to ignore content that's likely echo vs. genuine barge-in. A genuine barge-in has different acoustic characteristics (overlapping speakers) that Whisper handles poorly anyway -- so the existing VAD-based barge-in mechanism is still the right tool for interruption detection.
+3. **Accept the cost of continuous streaming during active periods.** At $0.0077/min ($0.462/hr), 8 hours of continuous streaming is ~$3.70/day. But you won't be speaking for 8 hours straight. Realistic usage: 2-4 hours of active audio per day = $0.92-$1.85/day. With the KeepAlive approach during idle, actual costs will be lower.
+
+4. **If cost is unacceptable, consider a hybrid approach.** Stream audio continuously during active conversation (preserving endpointing), but disconnect the WebSocket entirely during extended idle (> 5 minutes of silence). Reconnect when VAD detects speech. Accept the 1-2 second reconnection latency as a tradeoff for cost savings during idle hours.
 
 **Warning signs:**
-- AI produces transcripts that match its own recent speech
-- System enters rapid-fire response cycles with no user input
-- CPU/GPU usage spikes with no user activity
-- Conversation logs show the AI talking to itself
+- `speech_final: true` never fires
+- Transcripts arrive but endpointing doesn't work -- you have to manually detect silence
+- Transcript accuracy is noticeably worse than Deepgram demos
+- Endpointing latency is erratic or extremely high
 
-**Detection:** Log a metric `echo_match_ratio` for every STT transcript against recent AI speech. If > 5% of transcripts match, echo cancellation is insufficient.
+**Detection:** Compare WER and endpointing behavior with VAD-gated vs continuous streaming using the same audio. If endpointing fails with VAD gating, the architecture must change.
 
-**Phase to address:** Phase 1 (first thing to solve -- nothing else works without this). PipeWire AEC should be set up before any continuous listening code runs.
+**Phase to address:** Phase 1 (Deepgram integration). This is an architectural decision that must be made before writing the streaming code. Getting this wrong means reworking the entire audio pipeline.
 
 **Severity:** CRITICAL
 
 ---
 
-### Pitfall 2: GPU Memory Exhaustion -- Whisper + Ollama + Existing Workloads Don't Fit
+### Pitfall 2: Audio Format Mismatch -- 24kHz Capture vs Deepgram Expectations
 
 **What goes wrong:**
-The RTX 3070 has 8GB VRAM. Current usage:
-- faster-whisper large-v3 int8_float16: ~3.1GB VRAM
-- Ollama Llama 3.2 3B (Q4_K_M): ~2-3GB VRAM (varies with context window size)
-- CUDA runtime overhead: ~300-500MB
-- Total: ~5.4-6.6GB baseline
+The existing codebase captures audio at 24000 Hz, 16-bit mono PCM via pasimple (`SAMPLE_RATE = 24000` in both `live_session.py` and `continuous_stt.py`). Deepgram's documentation and examples overwhelmingly use 16000 Hz. While Deepgram supports 24kHz (their docs list 8000, 16000, 24000, 44100, 48000 Hz), the format parameters MUST be explicitly declared when streaming raw audio: `encoding=linear16` and `sample_rate=24000`. If you omit these or set them wrong, Deepgram receives raw bytes it can't decode and returns empty transcripts with zero error messages.
 
-This leaves only 1.4-2.6GB headroom. With continuous Whisper transcription (model stays loaded, inference runs every silence-detected segment) and continuous Ollama monitoring (model stays loaded, inference runs every few seconds on new transcript chunks), both models compete for VRAM. If context windows grow (Ollama default 4096 tokens, but transcript monitoring might push larger), memory can exceed 8GB. CUDA will either OOM-kill one process or fall back to CPU, which for Ollama means 5-20x slower inference (3-6 tokens/s CPU vs 50 tokens/s GPU for 3B).
+The failure mode is silent: Deepgram accepts the connection, receives the audio, but produces no transcripts. No error, no warning, just silence. This is documented in their troubleshooting: "Deepgram will be unable to decode the audio and will fail to return a transcript."
 
-The danger is that this works fine in testing (short sessions, small context) but fails in production (2-hour session, growing context window, multiple Whisper transcriptions queued up).
-
-**Why it happens:**
-faster-whisper and Ollama manage their own CUDA contexts independently. They don't coordinate memory allocation. Ollama uses llama.cpp which pre-allocates VRAM for the full context window at load time. faster-whisper/CTranslate2 allocates per-inference. During a Whisper inference, temporary activations spike VRAM usage by 0.5-1GB briefly. If this spike overlaps with an Ollama inference that's also spiking, total VRAM exceeds 8GB.
+**Why it matters for THIS project:**
+The Silero VAD in `continuous_stt.py` resamples from 24kHz to 16kHz internally (lines 183-186: "take 2 of every 3 samples"). If someone assumes Deepgram also needs 16kHz and resamples the audio, or forgets to specify 24kHz in the connection parameters, the audio format becomes garbled. Additionally, the existing Whisper pipeline uses 24kHz directly -- switching to Deepgram might tempt a developer to "normalize" to 16kHz thinking it's required.
 
 **How to avoid:**
 
-1. **Use Whisper `small` or `medium` model for continuous monitoring, not `large-v3`.** The current system uses `large-v3` because accuracy matters when every transcript becomes an LLM prompt. But in always-on mode, most transcripts are ambient monitoring -- the monitoring LLM decides relevance. A smaller Whisper model with lower accuracy is acceptable because:
-   - False negatives (missed speech) are caught on the next segment
-   - False positives (hallucinations) are filtered by the monitoring LLM
-   - The `small` model uses ~1GB VRAM in int8 vs ~3.1GB for `large-v3`
-
-   Keep `large-v3` available for re-transcription when the monitoring LLM decides the user is addressing the AI. On "hey Russel" detection, re-transcribe the recent audio buffer with `large-v3` for maximum accuracy.
-
-2. **Set explicit Ollama context window size.** Default is 4096 tokens. For monitoring, limit to 2048 or even 1024 tokens with `num_ctx` parameter. The monitoring LLM only needs recent transcript context (last ~30 seconds of conversation), not a full conversation history. Smaller context = less VRAM.
+1. **Explicitly set encoding and sample_rate in every Deepgram connection.**
    ```python
-   response = ollama.chat(
-       model="llama3.2:3b",
-       messages=messages,
-       options={"num_ctx": 2048}
+   options = LiveOptions(
+       model="nova-3",
+       encoding="linear16",
+       sample_rate=24000,
+       channels=1,
+       language="en",
    )
    ```
+   Never rely on Deepgram auto-detecting format for raw audio streams.
 
-3. **Monitor VRAM in real-time.** Add a periodic VRAM check (every 30s) using `nvidia-smi` or `pynvml`. If free VRAM drops below 500MB, reduce Ollama context size or defer non-critical Whisper transcriptions. Log VRAM usage to the event bus for dashboard visibility.
+2. **Keep the existing 24kHz capture rate.** Don't resample. Deepgram supports 24kHz natively. Resampling adds latency, complexity, and potential artifacts. The only component that needs resampling is Silero VAD (which already handles its own 24kHz->16kHz conversion).
 
-4. **Test with realistic session lengths.** The test suite runs short clips. Add a stress test that runs continuous audio for 30+ minutes to catch memory leaks and accumulation.
+3. **Add a startup validation.** When connecting to Deepgram, send a known test phrase within the first few seconds and verify you receive a transcript. If no transcript arrives within 5 seconds of clearly spoken audio, the format parameters are probably wrong.
+
+4. **Watch for the "container vs raw" distinction.** If you ever wrap audio in a WAV container before sending, do NOT set encoding/sample_rate -- Deepgram reads the WAV header. But if sending raw PCM bytes (which is what pasimple produces), you MUST set both parameters. Mixing these up is a common source of empty transcripts.
 
 **Warning signs:**
-- CUDA OOM errors in logs after extended sessions
-- Ollama responses suddenly becoming very slow (fell back to CPU)
-- System lag/stuttering during simultaneous Whisper + Ollama inference
-- VRAM usage creeping up over time without decreasing
+- Connection opens successfully but no transcripts arrive
+- Transcripts arrive but are garbled or nonsensical
+- The same audio works fine with Whisper but produces nothing from Deepgram
 
-**Detection:** Log VRAM usage at each Whisper inference and each Ollama call. Plot over session duration. Any upward trend indicates a leak or unbounded growth.
+**Detection:** Log the first transcript received after connection. If no transcript arrives within 10 seconds of streaming audio that contains speech, check format parameters immediately.
 
-**Phase to address:** Phase 1 (resource budgeting must be established before building the pipeline). Validate with the actual hardware before committing to model sizes.
+**Phase to address:** Phase 1 (Deepgram integration). This is literally the first thing to get right -- nothing else works without correct audio format.
 
 **Severity:** CRITICAL
 
 ---
 
-### Pitfall 3: Whisper Hallucinations Explode With Continuous Ambient Audio
+### Pitfall 3: WebSocket Disconnection Drops Mid-Utterance Transcript
 
 **What goes wrong:**
-The current system only transcribes audio after the user presses PTT and speaks. Whisper receives clean, speech-containing audio segments. In always-on mode, Whisper receives everything: keyboard typing, chair creaking, HVAC noise, music playing, phone notifications, other people in the room, TV/podcast audio, eating/drinking sounds. Research shows Whisper has a 40.3% hallucination rate on non-speech audio segments, producing phantom transcripts like "Thank you for watching," "Please subscribe," "I'm sorry," and other training-data artifacts.
+Deepgram uses a persistent WebSocket connection. Network blips, Deepgram server maintenance, WiFi momentary drops, or the 10-second inactivity timeout can kill the connection. If a disconnection happens mid-utterance (user is speaking), the partial transcript from that utterance is lost entirely. Each new WebSocket connection starts a fresh transcription session with no memory of the previous one. Timestamps reset to 00:00:00.
 
-The existing hallucination filter (lines 2193-2199) catches 18 known phrases. But continuous ambient audio produces much more diverse hallucinations. The monitoring LLM receives a steady stream of phantom transcripts, treats them as conversation, and the AI starts responding to non-existent speech. The user hears the AI say "You're welcome!" when nobody said anything.
+For a push-to-talk system, this is annoying but tolerable (user can re-speak). For an always-on system, it's worse: the user doesn't know the system disconnected, continues speaking, and their words vanish into the void. The decision model never sees the transcript, so the AI never responds to what was said.
 
-**Why it happens:**
-Whisper was trained on 680,000 hours of web audio, much of it YouTube content with "thank you for watching" outros. When Whisper encounters non-speech audio with any energy, its decoder generates the most likely text conditioned on acoustic features that vaguely resemble speech patterns. The existing multi-layer filter (no_speech_prob >= 0.6, avg_logprob < -1.0, compression_ratio > 2.4) was tuned for PTT audio where most segments contain actual speech. With continuous audio, the ratio inverts: most segments are non-speech, and the filters need to be much more aggressive.
+**Why it matters for THIS project:**
+The existing system has Whisper running locally -- there's no network dependency for STT. Moving to Deepgram introduces a cloud dependency in the critical path. The `CircuitBreaker` class (line 154 in `live_session.py`) already exists for service fallback, but it's designed for per-request failures, not persistent WebSocket lifecycle management.
 
 **How to avoid:**
 
-1. **Use Whisper's built-in VAD filter more aggressively.** The current config has `vad_filter=True` (line 1464). In continuous mode, increase the VAD threshold. faster-whisper supports `vad_parameters` dict:
-   ```python
-   segments_gen, info = self.whisper_model.transcribe(
-       samples, language="en",
-       vad_filter=True,
-       vad_parameters={
-           "threshold": 0.5,           # Default 0.5, increase to 0.6-0.7
-           "min_speech_duration_ms": 250,  # Reject <250ms "speech"
-           "min_silence_duration_ms": 300, # Merge nearby segments
-       },
-   )
-   ```
+1. **Buffer audio locally during disconnection.** When the WebSocket drops, continue capturing audio into a local ring buffer (the existing `bytearray` pattern from `_stt_stage`). When the connection is re-established, replay the buffered audio before resuming live streaming. Caveat: Deepgram processes audio at max 1.25x realtime, so a 30-second buffer takes 24 seconds to replay. Keep the buffer short (10-15 seconds max) and accept some data loss for longer outages.
 
-2. **Expand the hallucination phrase list significantly.** The top 30 Whisper hallucinations are well-documented. Add all of them:
-   ```python
-   HALLUCINATION_PHRASES = {
-       "thank you", "thanks for watching", "thanks for listening",
-       "thank you for watching", "thanks for your time",
-       "goodbye", "bye", "you", "the end", "to", "so",
-       "please subscribe", "like and subscribe", "i'm sorry",
-       "hmm", "uh", "um", "oh",
-       # Additional documented hallucinations:
-       "subtitles by the amara org community",
-       "thank you very much", "see you next time",
-       "please like and subscribe", "don't forget to subscribe",
-       "thanks for tuning in", "until next time",
-       "the following is a transcript",
-       "this video is sponsored by", "link in the description",
-       "leave a comment below", "hit the bell icon",
-       # Single-word filler hallucinations common with noise:
-       "the", "a", "i", "it", "and", "is",
-   }
-   ```
+2. **Implement exponential backoff with jitter for reconnection.** Start at 1 second, double up to 30 seconds max. Add random jitter (0-500ms) to prevent reconnection storms if multiple clients are affected by a Deepgram outage. The SDK v3+ has built-in reconnection support, but verify it uses backoff -- naive immediate reconnection can hit rate limits.
 
-3. **Add a transcript confidence gate before the monitoring LLM.** Don't send every transcript to Ollama. Only forward transcripts where:
-   - Whisper's overall confidence (average logprob across all kept segments) exceeds a threshold
-   - The transcript is longer than 3 words (very short transcripts from ambient noise are almost always hallucinations)
-   - The transcript doesn't repeat the previous transcript (ambient noise produces identical hallucinations repeatedly)
+3. **Track connection state explicitly.** Maintain a state machine: CONNECTED, CONNECTING, DISCONNECTED, RECONNECTING. The decision model should know the STT state: if disconnected, it should not penalize the "silence" (the AI isn't hearing anything, not that no one is speaking). Update the dashboard/event bus with connection state changes.
 
-4. **Rate-limit STT in low-activity periods.** If no speech energy above `SPEECH_ENERGY_MIN` (200 RMS) has been detected for 30+ seconds, reduce transcription frequency. Don't transcribe every silence-detected segment -- skip segments where peak RMS never exceeded a low threshold.
+4. **Use the Finalize message before intentional disconnection.** When gracefully closing the WebSocket (session end, mode switch), send a `{"type": "Finalize"}` message and wait for the last transcript before closing. Skipping this drops the final words of the last utterance.
+
+5. **Realign timestamps after reconnection.** Each reconnection resets Deepgram timestamps to 00:00:00. Maintain a local timestamp offset that gets updated on each reconnection. Add the offset to all Deepgram-returned timestamps so the TranscriptBuffer maintains chronological ordering.
 
 **Warning signs:**
-- Conversation logs show repeated identical phrases from STT
-- AI responds when the room is empty
-- Monitoring LLM receives dozens of short (1-3 word) transcripts per minute
-- STT rejection rate exceeds 50% in always-on mode
+- Gaps in the transcript timeline (missing segments between disconnect and reconnect)
+- User says something and AI doesn't respond, but moments later a similar statement gets a response
+- Dashboard shows connection state toggling rapidly (reconnection storm)
+- TranscriptBuffer timestamps have discontinuities or jumps backward
 
-**Detection:** Log transcript acceptance/rejection ratio. In always-on mode with no active conversation, acceptance rate should be < 5%. If higher, hallucination filtering is insufficient.
+**Detection:** Log every WebSocket open/close event with timestamp. Count disconnections per hour. Healthy: 0-1 disconnections per 8 hours. Concerning: > 3 per hour. Critical: > 1 per minute (indicates a systemic issue).
 
-**Phase to address:** Phase 1 (continuous STT architecture). Must be solved before connecting STT output to the monitoring LLM.
+**Phase to address:** Phase 1 (Deepgram integration). Reconnection logic is not optional for a production streaming client.
 
 **Severity:** CRITICAL
 
 ---
 
-### Pitfall 4: Monitoring LLM Context Window Grows Unboundedly
+### Pitfall 4: Cost Runaway -- Streaming 24/7 Without Lifecycle Management
 
 **What goes wrong:**
-The monitoring LLM (Ollama Llama 3.2 3B) observes a continuous transcript stream and decides when the AI should respond. The naive implementation appends every transcript to a conversation history and sends the full history on each inference. After 30 minutes of ambient conversation, the context contains thousands of tokens. At 2048 token context, this overflows and truncates from the beginning -- losing the conversation topic. At 4096 tokens, VRAM usage grows (see Pitfall 2). Either way, the monitoring LLM's decisions degrade: it either lacks context (truncated) or the system runs out of memory (too large).
+Deepgram bills per second of audio processed. At $0.0077/min, continuous 24/7 streaming costs:
+- 1 hour: $0.46
+- 8 hours (workday): $3.70
+- 24 hours: $11.09
+- 30 days: $332.64
 
-Even with a sliding window, the monitoring LLM loses track of the overall conversation arc. It sees the last 30 seconds but doesn't know that 5 minutes ago the user said "Let me think about the architecture for a bit" -- which explains why they've been quiet.
+If the user starts the always-on session in the morning and forgets to stop it before bed, it streams (and bills) all night. If KeepAlive is misconfigured and the system streams silence instead, the full audio duration is billed. If the reconnection logic creates multiple overlapping connections, each connection bills independently.
 
-**Why it happens:**
-Continuous monitoring produces a fundamentally different context management challenge than request/response conversation. In the current system, each user utterance produces one LLM turn -- context grows linearly with turns. In always-on mode, ambient audio produces continuous text even when nobody is actively conversing. A 2-hour session with background conversation or TV audio could produce 50,000+ tokens of transcript.
+The $200 free credit goes quickly. At 8 hours/day, it lasts ~54 days. At 24/7 continuous, ~18 days.
+
+**Why it matters for THIS project:**
+The project philosophy is "always-on" -- the session is designed to run indefinitely (`idle_timeout=0`). There's no natural stopping point that would limit costs. The user might leave the system running while sleeping, on vacation, or during extended periods away from the desk.
 
 **How to avoid:**
 
-1. **Two-tier context: rolling summary + recent buffer.** Maintain two data structures:
-   - `recent_buffer`: Last 60 seconds of raw transcript (verbatim, ~200-500 tokens)
-   - `conversation_summary`: Periodically summarized context (updated every 2-3 minutes by the monitoring LLM itself, ~100-200 tokens)
+1. **Implement an activity-based connection lifecycle.** Don't keep the Deepgram WebSocket open 24/7. Use Silero VAD (which runs locally, for free) to detect room activity. Strategy:
+   - **Active mode:** VAD detects speech in the last 60 seconds -> WebSocket open, streaming audio
+   - **Idle mode:** No speech for 60+ seconds -> Send KeepAlive every 5 seconds (free)
+   - **Sleep mode:** No speech for 10+ minutes -> Close WebSocket entirely (zero cost)
+   - **Wake:** VAD detects speech -> Open new WebSocket, buffer and replay
 
-   Each monitoring inference receives: system prompt + conversation_summary + recent_buffer. Total stays under 1024 tokens consistently.
+   This turns "$332/month always-on" into "$15-30/month active hours only."
 
-2. **Event-driven monitoring, not continuous polling.** Don't call the monitoring LLM on every transcript. Instead:
-   - Queue transcripts into a buffer
-   - Trigger monitoring inference only on "events": new speech after silence, topic change detected, name mention, direct question pattern
-   - Use cheap heuristics (keyword matching, question mark detection, name detection) as pre-filters before invoking the LLM
+2. **Add a cost tracking counter.** Track cumulative seconds of audio streamed per day/week/month. Display in the dashboard. Alert the user when approaching budget thresholds (e.g., 50% of $200 credit, $5/day, etc.).
 
-3. **Distinguish conversation from ambient audio in context.** Tag transcripts with metadata: `{text: "...", speaker: "unknown", energy_level: "high", during_ai_speech: false}`. The monitoring LLM can use these signals to weight relevance. Low-energy, unknown-speaker transcript during ambient periods gets lower context priority.
+3. **Configurable daily budget cap.** Add a config option `deepgram_daily_budget_cents: 200` (default $2/day). When the daily budget is hit, fall back to local Whisper (or disable STT and show a notification). The user can override but must do so consciously.
 
-4. **Explicit context reset signals.** When the monitoring LLM detects a topic change or long silence (> 5 minutes), it should emit a summary of the previous conversation segment and reset the recent buffer. This prevents context accumulation across unrelated conversations.
+4. **Prevent connection leaks.** Every WebSocket open must have a corresponding close. Use try/finally or context managers. If the process crashes, orphaned WebSocket connections on Deepgram's side will timeout after 10 seconds (the KeepAlive timeout), but if the process is somehow sending data from a zombie thread, it could bill indefinitely. Use the `CircuitBreaker` pattern to detect and kill connections that aren't producing transcripts.
+
+5. **Log billing events.** Every time audio is sent to Deepgram, log the duration. Every time KeepAlive is sent, log it distinctly. This makes it easy to audit "why was my bill $X?"
 
 **Warning signs:**
-- Monitoring LLM inference latency increasing over session duration
-- Ollama responses becoming slower (context window growing)
-- AI responds to topics from 10+ minutes ago that are no longer relevant
-- VRAM usage creeping up (context window expansion)
+- Deepgram dashboard shows hours of usage you don't remember
+- Free credit depleting faster than expected
+- Multiple WebSocket connections open simultaneously (check with connection state tracking)
+- Audio streaming during periods when user is clearly away (late night, weekends)
 
-**Detection:** Log monitoring LLM prompt token count at each inference. It should stay roughly constant (within the budget). Any upward trend indicates unbounded growth.
+**Detection:** Compare daily audio-sent duration to expected active hours. If streamed hours >> active hours, the lifecycle management is broken.
 
-**Phase to address:** Phase 2 (monitoring LLM architecture). The context strategy must be designed before building the monitoring pipeline.
+**Phase to address:** Phase 1 (connection lifecycle). Cost management must be designed into the architecture, not added as an afterthought.
 
 **Severity:** CRITICAL
 
 ---
 
-### Pitfall 5: False Positive Responses -- AI Speaks When It Shouldn't
+### Pitfall 5: Echo Cancellation Path -- AI Speech Reaches Deepgram and Creates Feedback Loop
 
 **What goes wrong:**
-The monitoring LLM decides to respond when it shouldn't. Common false positive scenarios:
-- User is on a phone call; AI answers a question directed at someone else
-- User is watching a video; AI responds to dialogue in the video
-- User mutters to themselves; AI takes it as a request
-- User is having a conversation with another person in the room; AI interjects inappropriately
-- Background TV/podcast says something question-like; AI answers it
+PipeWire echo cancellation is already configured (`~/.config/pipewire/pipewire.conf.d/echo-cancel.conf`). But the echo cancellation path changes when switching from local Whisper to cloud Deepgram:
 
-This is the core UX challenge of proactive AI. Every false positive response is deeply annoying -- more so than a missed response. Users will disable the feature after 2-3 false positives in a session.
+- **Before (Whisper):** Mic -> PipeWire AEC -> pasimple capture -> local Whisper -> transcript. AEC removes AI speech from the mic signal before Whisper processes it. Everything is local, latency is minimal.
+- **After (Deepgram):** Mic -> PipeWire AEC -> pasimple capture -> WebSocket -> Deepgram cloud -> transcript. The AEC-processed audio goes to the cloud. But AEC is never perfect -- residual echo (attenuated AI speech) still exists in the signal. Locally, Whisper's hallucination filter could catch "echo-like" transcripts. Deepgram processes whatever it receives and returns transcripts for it.
 
-**Why it happens:**
-The monitoring LLM receives transcript text without reliable speaker identification. It can't distinguish between:
-- "Hey Russel, what time is it?" (directed at AI)
-- "What time is it?" (directed at another person in the room)
-- "What time is it?" (said by a character in a video)
+If AEC lets through even partial AI speech, Deepgram transcribes it. The decision model sees the AI's own words in the transcript stream. If the decision model isn't aware that these words are echo, it may trigger a response -- creating the exact feedback loop documented in the original PITFALLS.md (Pitfall 1).
 
-Without speaker diarization or explicit addressing (wake word), the LLM must guess intent from text alone. Even a well-tuned LLM will get this wrong frequently in multi-person environments.
+The additional wrinkle: with cloud STT, there's network latency between the AI speaking and the echo transcript arriving. The existing `_stt_gated` mechanism (which suppresses STT during playback) relies on tight timing between playback start/stop and STT processing. With 100-200ms network latency, the timing windows are wider and harder to manage.
 
 **How to avoid:**
 
-1. **Default to NOT responding.** The monitoring LLM's default output should be "no response needed." It should only trigger a response when it's highly confident the user is addressing the AI. Design the system prompt to be conservative:
-   ```
-   You are a passive observer. ONLY recommend responding when:
-   1. The user explicitly says "Russel" or "hey Russel"
-   2. The user asks a direct question AND no other person is present in the conversation
-   3. The user explicitly asks for help ("can you help me", "look this up")
+1. **Keep the transcript fingerprinting defense.** The original PITFALLS.md recommended comparing STT output against recent AI speech. This is even more important with cloud STT because you can't rely on AEC being perfect over a network path. Maintain a ring buffer of the last N sentences the AI spoke and fuzzy-match incoming Deepgram transcripts against it.
 
-   When in doubt, DO NOT respond. A missed response is far better than an unwanted one.
-   ```
+2. **Tag transcripts with timing metadata.** When the AI is speaking, tag any incoming Deepgram transcripts with `during_ai_playback=True`. The decision model should heavily discount or ignore these transcripts. Use the existing `_playing_audio` / `_playback_end_time` state from `continuous_stt.py` (lines 67-69) but account for network latency: extend the "during playback" window by 200-500ms after playback ends.
 
-2. **Require name-based activation for proactive responses.** For v2.0 initial launch, only respond proactively when the user says the AI's name. This is effectively a software wake word. Over time, as confidence in the monitoring LLM improves, gradually expand the activation criteria.
+3. **Don't rely solely on PipeWire AEC.** PipeWire's WebRTC AEC works well for near-field microphone/speaker setups but degrades with room reflections, speaker distance, and volume. Test with actual speaker output at normal conversation volume. If echo transcripts appear, increase the post-playback cooldown window.
 
-3. **Implement a response confidence threshold.** The monitoring LLM should output a confidence score (0-1) alongside its response decision. Only trigger a response above 0.8. Log all decisions (including suppressed ones) for tuning.
-
-4. **Add a "recently active" context signal.** If the user was actively conversing with the AI in the last 2 minutes (a back-and-forth exchange), lower the activation threshold. If the AI hasn't been addressed in 10+ minutes, raise it. This prevents the AI from randomly interjecting after long silence.
-
-5. **Cooldown after unprompted responses.** After each proactive (non-name-triggered) response, enforce a 60-second cooldown before the next proactive response can fire. This prevents rapid-fire false positives.
+4. **Consider using Deepgram's own endpointing behavior as an echo signal.** If `speech_final: true` fires during AI playback, it's almost certainly echo (the user is unlikely to be speaking a complete sentence while the AI is talking). Only treat barge-in-style interruptions (detected via Silero VAD) as genuine user speech during playback.
 
 **Warning signs:**
-- Users saying "I wasn't talking to you" or "stop"
-- AI responding during phone calls or video watching
-- AI interjecting into multi-person conversations inappropriately
-- User disabling always-on mode frequently
+- Transcript stream contains text matching what the AI just said
+- Decision model triggers responses during AI speech
+- Rapid back-and-forth conversation where the AI appears to be talking to itself
+- `during_ai_playback` tagged transcripts are non-empty
 
-**Detection:** Track `proactive_response_suppressed_by_user` (user interrupts AI within 2 seconds of proactive response = likely unwanted). If suppression rate exceeds 20%, the monitoring LLM is too aggressive.
+**Detection:** Log all transcripts received during AI playback. Calculate echo_match_ratio = fuzzy matches against recent AI speech / total transcripts during playback. Target: < 5%. If higher, AEC is insufficient.
 
-**Phase to address:** Phase 2 (monitoring LLM prompt engineering) and Phase 3 (tuning). Start extremely conservative; it's much easier to loosen restrictions than to recover user trust after false positives.
+**Phase to address:** Phase 1 (audio pipeline). Must be validated before connecting Deepgram output to the decision model.
 
 **Severity:** CRITICAL
 
@@ -277,255 +223,217 @@ Without speaker diarization or explicit addressing (wake word), the LLM must gue
 
 ## Major Pitfalls
 
-Mistakes that cause significant rework or degrade UX.
+Mistakes that cause significant UX degradation or rework.
 
 ---
 
-### Pitfall 6: Name Detection Accuracy -- "Hey Russel" Has No Dedicated Wake Word Engine
+### Pitfall 6: Endpointing Fails in Noisy Environments -- `speech_final` Never Fires
 
 **What goes wrong:**
-The project explicitly chose "software-based name recognition instead" of a dedicated wake word engine (PROJECT.md, "Out of Scope"). This means name detection relies on Whisper transcribing "hey Russel" accurately. But:
-- Whisper may transcribe it as "hey Russell", "hey Rusel", "hey wrestle", "hey rustle"
-- In noisy environments, Whisper may miss it entirely
-- Short utterances like "Russel" (just the name) may get filtered as too short or hallucination
-- Whisper processes audio in segments after silence detection, meaning there's a 0.8s silence delay + Whisper inference time before the name is even recognized -- total latency of 1-2 seconds after saying "hey Russel"
+Deepgram's endpointing feature uses audio-based VAD to detect when speech transitions to silence. In environments with background noise (HVAC, fan, music, typing, etc.), the background noise prevents the VAD from detecting silence. The `speech_final: true` flag never fires. Deepgram's documentation explicitly warns: "Background noise may prevent the `speech_final=true` flag from being sent."
 
-Benchmark data: dedicated wake word engines (Picovoice Porcupine, openWakeWord) achieve <5% false rejection at 1 false acceptance per 10 hours. STT-based name detection through Whisper will have significantly worse accuracy because Whisper was not trained for this task.
+Without `speech_final`, the downstream logic never knows when the user finished speaking. Transcripts accumulate but are never processed as complete utterances. The decision model either processes every interim result (too chatty, high latency) or waits forever for a finalization that never comes.
 
-**Why it happens:**
-Wake word detection and speech-to-text are fundamentally different tasks. Wake word engines run on streaming audio in real-time (~10ms latency), using lightweight models specifically trained to recognize one phrase. Whisper processes audio in batches after silence detection, using a general-purpose model trained on diverse speech. Using Whisper for wake word detection is like using a dictionary to detect Morse code -- it works sometimes, but it's the wrong tool.
+This is NOT a Deepgram bug -- it's the inherent limitation of audio-based endpoint detection in noisy environments. The existing Whisper pipeline avoids this because it uses local RMS-based silence detection (`SILENCE_THRESHOLD = 150`) which is calibrated to the specific room's ambient noise level.
 
 **How to avoid:**
 
-1. **Fuzzy match the name in transcripts.** Don't require exact string match "hey Russel". Match against variants:
-   ```python
-   NAME_VARIANTS = {"russel", "russell", "rusel", "russ", "hey russel", "hey russell"}
+1. **Use `utterance_end_ms` alongside endpointing.** Deepgram's UtteranceEnd feature analyzes word timing gaps in transcription results rather than raw audio. It fires when no new words appear for N milliseconds, regardless of background noise. Configure: `utterance_end_ms=1000` (1 second gap between words). This requires `interim_results=true` to be enabled.
 
-   def _detect_name(self, transcript: str) -> bool:
-       words = transcript.lower().split()
-       for i, word in enumerate(words):
-           if word in NAME_VARIANTS:
+2. **Implement dual-trigger end-of-speech detection.** Process a complete utterance when EITHER:
+   - `speech_final: true` is received (endpointing detected silence), OR
+   - `UtteranceEnd` message is received with no preceding `speech_final: true`
+
+   This is Deepgram's officially recommended pattern for noisy environments.
+
+3. **Add a local safety timeout.** If neither `speech_final` nor `UtteranceEnd` fires within 15 seconds of the last `is_final: true` transcript, force-process the accumulated transcript. This prevents indefinite waiting in edge cases where both Deepgram mechanisms fail.
+
+4. **Configure endpointing for conversational use.** The default endpointing timeout is 10ms, which is extremely aggressive (designed for chatbots expecting short utterances). For a conversational always-on assistant, use `endpointing=300` (300ms) to allow natural pauses within sentences without premature finalization.
+
+**Warning signs:**
+- Transcripts arrive (interim and final) but `speech_final: true` never appears
+- The system seems to "buffer" everything but never acts on it
+- Works perfectly in a quiet room, fails when music/TV/fan is on
+
+**Detection:** Log every `speech_final` and `UtteranceEnd` event. If `speech_final` count is zero over a 10-minute active conversation, endpointing is broken by noise.
+
+**Phase to address:** Phase 1 (Deepgram integration). End-of-speech detection must work reliably before connecting to the decision model.
+
+**Severity:** MAJOR
+
+---
+
+### Pitfall 7: Decision Model False Positives -- AI Responds to TV, Music, Phone Calls
+
+**What goes wrong:**
+With Deepgram's superior accuracy (Nova-3: 5-7% WER vs Whisper's 10%+), the transcript stream will be more accurate but also more comprehensive. It faithfully transcribes everything: TV dialogue, podcast audio, phone calls on speaker, other people in the room, music with lyrics. The decision model receives a stream of perfectly transcribed speech from multiple sources and must decide which is the user addressing the AI.
+
+Without speaker identification, every question in a TV show becomes a potential trigger. "What time does the flight leave?" from a movie dialogue looks identical to the user asking "What time does the flight leave?" in the transcript. The decision model has no acoustic features to distinguish them -- only text.
+
+**Why it's worse with cloud STT:**
+Whisper's lower accuracy actually provided a crude filter: garbled or partial transcripts from TV audio were often rejected by the hallucination filter. Deepgram's higher accuracy means TV dialogue comes through clean and clear, making false positives MORE likely, not less.
+
+**How to avoid:**
+
+1. **Default to name-activation only for v2.0 launch.** Only respond when "Russel" (or variants) appears in the transcript. This eliminates virtually all false positives from TV/music/phone. Expand to proactive participation only after the name-activation path is proven reliable.
+
+2. **Use Deepgram's keyterm prompting for name recognition.** Nova-3 supports `keyterm=["Russel", "Russell", "Hey Russel"]` which boosts recognition of these specific terms. This improves name detection accuracy significantly -- Deepgram claims up to 90% Keyword Recall Rate improvement with keyterm prompting.
+
+3. **Use energy/proximity heuristics from the local audio stream.** The audio captured by pasimple includes energy information. Speech from speakers (TV, laptop, phone) typically has different energy profiles than speech from a person sitting at the desk:
+   - Direct speech: higher RMS, more dynamic range
+   - Speaker playback: more compressed, flatter RMS profile
+   - This is a rough heuristic but can provide a signal to the decision model
+
+4. **Implement a "conversation mode" state machine.** After the user addresses the AI by name, enter a "conversation active" state with a lower response threshold for 2-3 minutes. After the conversation ends (no user-directed speech for 3 minutes), return to "passive monitoring" with name-only activation. This avoids the AI randomly interjecting after long idle periods.
+
+5. **Cooldown after proactive responses.** If the AI responds proactively (not name-triggered) and the user doesn't engage within 5 seconds, suppress proactive responses for 5 minutes. This prevents repeated false positives from ongoing TV/music.
+
+**Warning signs:**
+- AI responds during movie watching or podcast listening
+- AI interjects into phone calls on speaker
+- User frequently says "I wasn't talking to you" or hits mute
+- Response rate during passive mode exceeds 2 per hour without name triggers
+
+**Detection:** Track response triggers: name-activated vs proactive vs ambient. If proactive/ambient responses have a > 30% "user didn't engage" rate, the threshold is too aggressive.
+
+**Phase to address:** Phase 2 (decision model). Conservative defaults first, loosen with data.
+
+**Severity:** MAJOR
+
+---
+
+### Pitfall 8: Decision Model False Negatives -- Name Detection Failures
+
+**What goes wrong:**
+The user says "Hey Russel, what's the weather?" and nothing happens. Name detection fails because:
+1. Deepgram transcribes "Russel" as "Russell", "Wrestle", "Rustle", "Brussel", "Muscle"
+2. The name appears in an interim result that gets superseded before the final result arrives
+3. Background noise garbles the name while the rest of the sentence is clear
+4. The user says just "Russel" (no sentence context) and it's too short for reliable transcription
+5. The name is at the beginning of an utterance where STT accuracy is lowest
+
+Unlike Whisper (where you can bias transcription with `initial_prompt`), Deepgram uses a different mechanism: keyterm prompting. But keyterms only work with Nova-3 and Flux models, and they boost probability -- they don't guarantee recognition.
+
+**How to avoid:**
+
+1. **Use Deepgram keyterm prompting.** Add `keyterm=["Russel", "Russell", "Hey Russel"]` to the connection options. This significantly boosts the probability of correct transcription for these specific terms.
+
+2. **Fuzzy match the name in transcripts.** Don't require exact string match. Use a variant list and Levenshtein distance:
+   ```python
+   NAME_VARIANTS = {"russel", "russell", "rusel", "russ", "hey russel",
+                     "hey russell", "wrestle", "rustle"}  # Common misrecognitions
+
+   def detect_name(transcript: str) -> bool:
+       lower = transcript.lower()
+       for variant in NAME_VARIANTS:
+           if variant in lower:
                return True
-           # Check bigrams for "hey russel" as one fuzzy match
-           if i > 0:
-               bigram = f"{words[i-1]} {word}"
-               for variant in NAME_VARIANTS:
-                   if variant in bigram or fuzz.ratio(bigram, variant) > 80:
-                       return True
+       # Phonetic fallback: check for words starting with "russ" or "rus"
+       for word in lower.split():
+           if word.startswith("russ") or word.startswith("rus"):
+               return True
        return False
    ```
 
-2. **Consider adding openWakeWord as a parallel lightweight detector.** openWakeWord is a Python library that can run a custom wake word model on streaming audio with ~10ms latency, consuming minimal CPU. It can run in parallel with the main STT pipeline on the raw audio stream, providing instant name detection without waiting for Whisper. This doesn't replace Whisper-based detection (which catches names mentioned mid-sentence) but provides fast activation for the explicit "hey Russel" case. **Confidence: MEDIUM** -- this is adding a dependency to avoid, per the "Out of Scope" decision. But the latency difference (10ms vs 1-2s) may be worth revisiting.
+3. **Check BOTH interim and final results for name detection.** The name might appear in an interim result but get corrected away in the final. For name detection specifically, treat interim results as valid triggers -- even if the final transcript changes the word, the user probably said the name. Don't wait for `is_final: true` for name checking.
 
-3. **Shorten the path from name to response.** Even with STT-based detection, optimize the pipeline: when "Russel" is detected in a transcript, skip the normal monitoring LLM decision path and immediately activate response mode. Don't wait for the monitoring LLM to decide -- the name IS the decision.
+4. **Keep Silero VAD as a parallel always-running name detector.** If the local decision model can run on the raw audio features (not just text), it can detect "someone said something that sounded like the wake word" independently of Deepgram's transcription. This provides a fast (<100ms) local signal that can be cross-referenced with the slower (~200ms) Deepgram transcript.
 
-4. **Add the name to Whisper's initial prompt.** faster-whisper supports an `initial_prompt` parameter that biases transcription:
-   ```python
-   segments_gen, info = self.whisper_model.transcribe(
-       samples, language="en",
-       initial_prompt="Russel is an AI assistant.",
-       ...
-   )
-   ```
-   This makes Whisper more likely to transcribe the name correctly rather than as a similar-sounding word.
+5. **Acknowledge immediately on name detection.** When the name is detected (even in interim results), play a brief acknowledgment sound or say "yes?" immediately. This gives the user feedback that the system heard them, even before the full transcript is processed. This dramatically reduces the perceived "AI didn't hear me" frustration.
 
 **Warning signs:**
-- User says "hey Russel" multiple times before getting a response
-- AI activates on words that sound like "Russel" but aren't (false positives)
-- Noticeable delay (>2s) between saying the name and AI acknowledging
-- Name detection works in quiet room but fails with background noise
+- User says "Russel" multiple times before getting a response
+- Transcript logs show the name consistently misrecognized as another word
+- Name detection works in quiet rooms but fails with background noise
+- Users start over-enunciating the name (compensating for poor detection)
 
-**Detection:** Log every name detection event with the raw transcript and confidence. Compare true positive rate (user said name, detected) vs false negative rate (user said name, not detected). Target: >90% true positive, <1 false positive per hour.
+**Detection:** Log every transcript containing words phonetically similar to "Russel." Compare true positive rate (name said and detected) vs false negative rate (name said but not detected). Target: > 95% true positive rate.
 
-**Phase to address:** Phase 2 (name detection implementation). Should be one of the first features tested with real users because it's the primary activation mechanism.
+**Phase to address:** Phase 2 (name detection). One of the first features to test with real speech.
 
 **Severity:** MAJOR
 
 ---
 
-### Pitfall 7: Ollama Cold Start and Model Eviction Delays Response
+### Pitfall 9: Interim Result Handling -- Processing Too Early or Too Late
 
 **What goes wrong:**
-Ollama unloads models from memory after 5 minutes of inactivity by default. In always-on mode, if no interesting conversation happens for 5+ minutes, the monitoring model gets unloaded. The next transcript triggers a cold load: model reads from disk, allocates VRAM, initializes -- taking 2-5 seconds on an SSD with GPU, or 10-30 seconds if falling back to CPU. The user says "hey Russel, what time is it?" and waits 5 seconds for the monitoring LLM to even start processing, then another 200ms for inference. Total: 5+ seconds of dead silence.
+Deepgram streaming returns three types of results:
+1. **Interim results** (`is_final: false`): Preliminary, will change as more audio arrives
+2. **Final results** (`is_final: true`): Text is stable for this segment, but utterance may continue
+3. **Speech final** (`speech_final: true`): The speaker has paused, utterance is complete
 
-Even with `OLLAMA_KEEP_ALIVE=-1` (keep forever), there are documented bugs where models get evicted unexpectedly (GitHub issue #9410). And if the system is also used for other Ollama tasks (coding, chat), those tasks may trigger `OLLAMA_MAX_LOADED_MODELS` eviction of the monitoring model.
+The naive approach -- processing every interim result -- causes the decision model to evaluate incomplete, constantly-changing text. The model might decide "should respond" based on an interim result that later changes to mean something completely different. Example: interim "what time" -> model decides question -> final "what time did you say the meeting was" -> model should have waited.
 
-**Why it happens:**
-Ollama was designed for interactive use (human types a query, waits for response), not for always-on monitoring where the model must be instantly available. The default 5-minute keep_alive assumes periods of inactivity between queries. For a monitoring task, "inactivity" of 5 minutes is normal (user goes to the kitchen, comes back, starts talking).
+The opposite mistake -- waiting only for `speech_final` -- adds latency. The whole point of streaming STT is near-real-time results. Waiting for `speech_final` (which requires a silence gap) adds 300ms-1s of waiting after the user finishes speaking.
 
 **How to avoid:**
 
-1. **Set `OLLAMA_KEEP_ALIVE=-1` in the systemd service.** Configure Ollama to keep models loaded indefinitely:
-   ```ini
-   [Service]
-   Environment="OLLAMA_KEEP_ALIVE=-1"
-   ```
-   This prevents the default 5-minute eviction.
+1. **Use a three-tier processing strategy:**
+   - **Interim results:** Check for name detection only (fast path, no model inference)
+   - **Final results (`is_final: true`):** Accumulate into an utterance buffer
+   - **Speech final or UtteranceEnd:** Send the complete accumulated utterance to the decision model
 
-2. **Heartbeat keepalive.** Send a lightweight inference request to Ollama every 2 minutes with `keep_alive: -1` to ensure the model stays loaded, even if the `OLLAMA_KEEP_ALIVE` environment variable has bugs:
-   ```python
-   async def _ollama_keepalive(self):
-       while self.running:
-           await asyncio.sleep(120)
-           try:
-               ollama.chat(
-                   model="llama3.2:3b",
-                   messages=[{"role": "user", "content": "ping"}],
-                   options={"num_predict": 1},  # Generate just 1 token
-                   keep_alive=-1,
-               )
-           except Exception:
-               pass
-   ```
+2. **Display interim results in the dashboard for responsiveness.** Show the user that the system is "hearing" them by displaying interim text in the overlay. This provides instant feedback without triggering the decision model on unstable text.
 
-3. **Pre-load on session start.** When the always-on session starts, immediately trigger a dummy Ollama inference to load the model into VRAM. Log the load time. If it exceeds 3 seconds, warn that the system may have performance issues.
+3. **Consider a "speculative decision" pattern.** When a `is_final: true` segment looks like a question or contains the AI's name, start preparing a response speculatively. If `speech_final` confirms the utterance is complete, the response is already partially ready. If more speech follows, cancel the speculative work. This reduces perceived latency without acting on unstable interim text.
 
-4. **Measure and log cold start vs warm inference latency.** Every Ollama call should log wall-clock time. If inference suddenly jumps from ~200ms to 3000ms+, the model was evicted and reloaded. Alert on this pattern.
+4. **Never act on interim results for response generation.** Interim text is explicitly unstable. Only name detection (which is a simple string check, not an expensive model call) should use interim results.
 
 **Warning signs:**
-- First response after idle period takes 3-5x longer than normal
-- VRAM usage drops and then spikes (model unloaded/reloaded)
-- Ollama logs show "loading model" entries during a session
-- Monitoring decisions arrive too late to be useful
+- AI responds to half-finished sentences
+- AI starts responding, then the user continues speaking, creating an interruption
+- Same utterance triggers multiple decision model evaluations
+- Transcript buffer contains duplicate or contradictory entries
 
-**Phase to address:** Phase 2 (Ollama integration). Configure keepalive before building the monitoring pipeline.
+**Detection:** Log how many decision model evaluations fire per user utterance. Target: exactly 1 per utterance. If > 1, interim results are leaking into the decision pipeline.
+
+**Phase to address:** Phase 1 (Deepgram integration) and Phase 2 (decision model). The transcript accumulation logic must be correct before the decision model can process utterances.
 
 **Severity:** MAJOR
 
 ---
 
-### Pitfall 8: Latency Between "Should Respond" and Actual Response
+### Pitfall 10: Latency Spikes -- Network Jitter Destroys Conversational Flow
 
 **What goes wrong:**
-The monitoring LLM decides the AI should respond. But the response isn't instant -- it must traverse a multi-step pipeline:
-1. Audio buffer fills (0.5-0.8s silence detection)
-2. Whisper transcribes (0.5-2s for large-v3 on 3-10s audio)
-3. Monitoring LLM decides (0.2-0.5s Ollama inference)
-4. Response LLM generates text (Claude CLI: 2-5s first token; Ollama: 0.2-1s)
-5. TTS generates audio (Piper: 0.1-0.3s per sentence)
-6. Playback begins
+Cloud STT introduces network dependency where none existed before. The expected path:
+- Audio chunk sent over WebSocket: ~5ms
+- Deepgram processing: ~50-150ms
+- Transcript returned over WebSocket: ~5ms
+- Total: ~60-160ms
 
-Total latency from user finishing their sentence to AI starting to speak: **3-9 seconds**. For a proactive "I know the answer to that" response, 3-9 seconds is an eternity. The conversation has moved on. The user may have already answered their own question or started a new topic.
+But real-world network conditions add variability:
+- WiFi congestion: +50-200ms jitter
+- ISP routing issues: +100-500ms spikes
+- Deepgram server load: +50-200ms at peak
+- WebSocket frame reassembly: +10-50ms
+- DNS resolution on reconnect: +50-200ms
 
-**Why it happens:**
-The current pipeline was designed for PTT where latency is acceptable (user pressed the button, they expect to wait). Always-on expects ambient responsiveness -- the AI should feel like a participant, not someone joining a Zoom call with bad latency. Every pipeline stage adds latency, and the stages are sequential.
+A 500ms latency spike means the user's speech is transcribed 500ms later than expected. Combined with decision model inference (~200ms) and TTS latency, the total response time can spike from 1s to 2s+, which crosses the threshold where conversation feels unnatural.
 
 **How to avoid:**
 
-1. **Speculative pre-processing.** When the monitoring LLM detects a likely-addressable question (confidence > 0.5 but below the response threshold), start preparing a response speculatively. If confidence crosses the threshold before the response is ready, the response pipeline is already partway done. If confidence drops, discard the speculative work.
+1. **Monitor and log Deepgram latency continuously.** Track time from audio-send to transcript-receive for every result. Maintain a rolling average and P99. Alert when P99 exceeds 500ms.
 
-2. **Parallel pipeline stages.** Overlap monitoring LLM decision with response generation. Instead of: transcribe -> decide -> generate -> speak, do:
-   - Transcribe -> simultaneously: (a) send to monitoring LLM for decision, (b) send to response LLM optimistically
-   - If monitoring LLM says "respond": the response LLM is already working, so latency is reduced
-   - If monitoring LLM says "don't respond": cancel the response LLM work
+2. **Implement a latency budget.** If Deepgram latency exceeds 500ms consistently (P90 over 5 minutes), consider:
+   - Showing a "slow network" indicator to the user
+   - Switching endpointing to more aggressive settings (shorter timeout)
+   - Playing faster acknowledgment clips to fill the gap
 
-   Cost: wasted Claude CLI / Ollama computation on false starts. Benefit: latency reduced by the monitoring LLM decision time (~200-500ms).
+3. **Consider a local Whisper fallback for degraded network.** The `CircuitBreaker` class already exists. If Deepgram latency exceeds 1s consistently or the WebSocket drops repeatedly, fall back to local Whisper (which is still installed, just not loaded). Accept the higher latency of batch transcription vs no transcription at all. Load Whisper on demand -- it takes 2-3 seconds to load but then works offline.
 
-3. **Use quick response library for immediate acknowledgment.** When the monitoring LLM decides to respond, immediately play a contextual quick response clip ("Let me think about that", "Good question") from the existing response library. This fills the silence while the response LLM generates the real answer. The infrastructure for this already exists in `_filler_manager` and `StreamComposer`.
-
-4. **Response backend selection should factor in latency.** For time-sensitive proactive responses (answering a quick factual question), use Ollama (~0.2-1s first token). For complex responses that benefit from Claude's depth, accept the higher latency but play an acknowledgment first.
+4. **Pre-buffer audio for jitter smoothing.** Don't send audio chunks one-at-a-time as they arrive from pasimple. Batch 2-3 chunks (170-255ms of audio) into a single WebSocket send. This reduces the number of network round-trips and smooths jitter at the cost of 85-170ms added latency (which is acceptable).
 
 **Warning signs:**
-- Users repeat their question because they think the AI didn't hear
-- AI responses feel disconnected from the conversation flow
-- Response latency exceeds 3 seconds regularly
-- Quick responses (fillers) play but the actual response takes 5+ more seconds
+- Occasional 1-2 second gaps where the system seems unresponsive
+- Transcript timestamps have irregular spacing
+- Dashboard latency metric shows high variance (std dev > mean)
+- Works perfectly on wired ethernet, degrades on WiFi
 
-**Detection:** Log end-to-end latency from "silence detected" to "first audio byte played" for every response. Target: <3s for Ollama backend, <5s for Claude CLI backend (with filler).
+**Detection:** Plot Deepgram latency over time. Healthy: tight distribution around 100-200ms. Unhealthy: long tail extending to 500ms+. Critical: bimodal distribution (indicating intermittent connectivity issues).
 
-**Phase to address:** Phase 3 (pipeline optimization). Get basic functionality working first, then optimize latency.
-
-**Severity:** MAJOR
-
----
-
-### Pitfall 9: Privacy -- Always-On Mic Crosses a Trust Boundary
-
-**What goes wrong:**
-The current PTT system has implicit user consent: you press a button, you know the mic is active, you release the button, the mic stops listening. Always-on fundamentally changes this contract. The mic is always active, recording everything -- private conversations, phone calls, sensitive discussions, family moments. Users (and other people in the room who didn't consent) may not realize audio is being continuously processed.
-
-Even though processing is local (Whisper on-device, Ollama on-device), the transcript data is potentially stored in conversation logs (JSONL) and sent to Claude CLI for response generation (which goes to Anthropic's API). A continuous transcript of ambient room audio being sent to a cloud API is a privacy concern even if the audio itself stays local.
-
-**Why it happens:**
-Developers building for themselves often don't think about privacy because they consented implicitly by building the feature. But other people in the room didn't. And even the developer may forget the mic is on during sensitive phone calls.
-
-**How to avoid:**
-
-1. **Persistent visual indicator.** The system tray indicator must clearly show always-on mode is active. Use a distinct color (red/orange pulsing dot) that's impossible to confuse with "inactive." This is non-negotiable for any always-on mic feature.
-
-2. **Audio never leaves the device in raw form.** The architecture should guarantee:
-   - Raw audio stays in memory only (never written to disk in always-on monitoring mode)
-   - Only STT transcripts (text) are stored or transmitted
-   - Transcripts sent to Claude CLI are the filtered/summarized version, not raw continuous STT output
-
-3. **Mute zones.** Allow the user to set time-based or trigger-based mute rules:
-   - "Mute when screen is locked"
-   - "Mute during phone calls" (detect PipeWire phone call streams)
-   - Physical mute button always available (already exists -- Escape key interrupt)
-
-4. **Clear local data retention policy.** Conversation JSONL logs from always-on mode should be auto-purged after a configurable period (default: 24 hours). Don't accumulate months of ambient conversation transcripts.
-
-5. **Only send relevant context to Claude CLI.** When the monitoring LLM decides to respond and routes to Claude CLI, send only the relevant conversation snippet (the user's question + recent context), not the entire ambient transcript history. The monitoring LLM acts as a privacy filter.
-
-**Warning signs:**
-- Users forget the mic is on during sensitive calls
-- Other people in the room are surprised to learn the mic is active
-- Conversation logs contain unintended private content
-- Large volumes of ambient transcript data accumulating on disk
-
-**Phase to address:** Phase 1 (indicator/visibility) and Phase 2 (data flow architecture). Privacy must be designed in, not bolted on.
-
-**Severity:** MAJOR
-
----
-
-### Pitfall 10: Existing Pipeline Architecture Assumes PTT Gating
-
-**What goes wrong:**
-The current pipeline is deeply designed around PTT-triggered discrete turns:
-- `_stt_stage` buffers audio until silence, transcribes, produces one `TRANSCRIPT` frame per utterance
-- `_llm_stage` waits for a `TRANSCRIPT` frame, sends to CLI, reads response
-- `_filler_manager` spawns per-transcript to fill silence during LLM thinking
-- `generation_id` increments on barge-in/interrupt to discard stale frames
-- `_stt_gated` flag suppresses STT during AI speech
-
-Converting to always-on requires changing the data flow fundamentally: STT produces continuous transcript fragments (not discrete turns), a new monitoring stage sits between STT and LLM, the LLM stage is triggered by monitoring decisions (not by every transcript), and multiple "generations" may be active simultaneously (monitoring inference + response inference).
-
-Attempting to bolt always-on behavior onto the existing pipeline without restructuring leads to state management nightmares: `generation_id` conflicts between monitoring and response tasks, `_stt_gated` no longer meaningful, filler manager firing on monitoring transcripts that aren't meant for LLM processing.
-
-**Why it happens:**
-The 5-stage pipeline (capture -> STT -> LLM -> TTS -> playback) is a clean sequential architecture for PTT. Adding a monitoring layer turns it into a branching pipeline: capture -> STT -> monitoring -> (maybe) LLM -> TTS -> playback. The "maybe" branch is the hard part -- the monitoring decision affects whether subsequent stages activate.
-
-**How to avoid:**
-
-1. **Introduce a transcript dispatcher between STT and LLM.** Instead of STT feeding directly to `_stt_out_q` which feeds `_llm_stage`, add a new stage:
-   ```
-   STT -> transcript_dispatcher -> [monitoring LLM, name detector, question detector]
-                                 -> (on trigger) -> LLM -> TTS -> playback
-   ```
-   The dispatcher is the central routing point. It accumulates transcripts, runs cheap pre-filters, and decides when to invoke the monitoring LLM vs. when to directly route to the response LLM.
-
-2. **Separate generation_ids for monitoring vs response.** The monitoring LLM runs continuously and shouldn't be affected by response generation interrupts. Give monitoring its own lifecycle:
-   ```python
-   self._monitoring_active = True  # Independent of generation_id
-   self._response_gen_id = 0      # For response pipeline (existing generation_id)
-   ```
-
-3. **Keep the existing pipeline working for PTT mode.** Don't break the existing flow. The transcript dispatcher should support both modes:
-   - PTT mode: transcript goes directly to LLM (current behavior)
-   - Always-on mode: transcript goes to monitoring first
-
-   Feature flag in config: `"listening_mode": "ptt"` vs `"always_on"`.
-
-4. **Implement as a parallel pipeline, not a replacement.** The always-on monitoring runs alongside the existing pipeline, not instead of it. The monitoring pipeline observes STT output and emits "respond" events. These events trigger the existing LLM -> TTS -> playback pipeline. This minimizes changes to proven code.
-
-**Warning signs:**
-- State management bugs (wrong generation_id, stale frames)
-- PTT mode broken after always-on changes
-- Barge-in detection confused by monitoring LLM activity
-- Filler manager playing clips during ambient monitoring (not during active response)
-
-**Phase to address:** Phase 1 (architecture refactor). This is the foundational change that enables everything else.
+**Phase to address:** Phase 1 (monitoring) and Phase 3 (fallback). Basic latency tracking in Phase 1; fallback to Whisper in Phase 3.
 
 **Severity:** MAJOR
 
@@ -537,96 +445,149 @@ Mistakes that cause delays, confusion, or technical debt.
 
 ---
 
-### Pitfall 11: Continuous Whisper Inference Blocks the Event Loop
+### Pitfall 11: Deepgram SDK Version Instability
 
 **What goes wrong:**
-The current STT stage runs Whisper in a thread executor (`run_in_executor`, line 2359) to avoid blocking the asyncio event loop. This works fine for occasional transcriptions (one every 2-10 seconds during active conversation). In always-on mode, Whisper may need to transcribe every 1-3 seconds (continuous speech from TV, podcast, or multi-person conversation). If `large-v3` takes 0.5-2s per transcription, and transcriptions are requested every 1-3 seconds, the executor thread is saturated. Subsequent transcription requests queue up, introducing latency that grows over time.
+The Deepgram Python SDK has a history of breaking changes between versions. Documented issues include:
+- SDK 3.0 to 3.1.1 broke WebSocket connections (Issue #279)
+- API key passing via `DeepgramClientOptions` stopped working, requiring direct parameter passing (Issue #493)
+- `UtteranceEnd` event handler registration was easy to miss (Issue #385)
+- The HTTP 401 error from incorrect API key passing persists in some configurations even in v5.3.2 (Feb 2026 comment on Issue #493)
 
-The default executor is `ThreadPoolExecutor` with a limited number of workers. If all workers are busy with Whisper inference, other executor-based operations (file I/O, subprocess communication) also stall.
+The `requirements.txt` currently specifies `deepgram-sdk>=3.0` which allows any version from 3.0 to latest. An `pip install --upgrade` or fresh install could pull a version with different behavior.
 
 **Prevention:**
-- Use a dedicated `ThreadPoolExecutor(max_workers=1)` for Whisper inference, separate from the default executor. This prevents Whisper from blocking other executor tasks.
-- Implement a "skip if busy" pattern: if a Whisper inference is already running, buffer the new audio segment instead of queuing another inference. Transcribe the combined buffer when the current inference completes.
-- For continuous monitoring mode, use the `small` model (~4x faster inference) instead of `large-v3`.
+- Pin the exact SDK version in requirements.txt: `deepgram-sdk==3.9.0` (or whatever version you test with). Don't use `>=3.0`.
+- Write integration tests that verify: connection opens, audio is received, transcript is returned, `speech_final` fires, `UtteranceEnd` fires, reconnection works. Run these tests before any SDK upgrade.
+- Subscribe to Deepgram SDK release notes. Breaking changes happen silently without deprecation warnings.
+- Keep the Whisper fallback path working so you can survive an SDK regression.
 
-**Phase to address:** Phase 1 (STT architecture).
+**Phase to address:** Phase 1 (dependency management).
 
 **Severity:** MODERATE
 
 ---
 
-### Pitfall 12: Faster-Whisper Memory Leak on Long-Running Processes
+### Pitfall 12: KeepAlive Message Format and Timing
 
 **What goes wrong:**
-A documented issue with faster-whisper shows memory utilization gradually growing during long transcription sessions, eventually hitting OOM. The issue was reported for a 5.5-hour audio file where memory grew from ~10% to 100% over 2 hours. In always-on mode, the process runs for hours or days. Even a small per-inference leak (e.g., unreleased tensor buffers, accumulating log data) compounds into a crash.
+The KeepAlive message must be sent as a TEXT WebSocket frame containing `{"type": "KeepAlive"}`. Sending it as a BINARY frame (which is how audio data is sent) may cause "incorrect handling and potential connection issues" per Deepgram's documentation. If the KeepAlive interval exceeds 10 seconds, the connection closes with a NET-0001 error.
+
+The subtle trap: if your code uses a single "send" function for both audio (binary) and KeepAlive (text), and that function always sends binary frames, KeepAlive silently fails to keep the connection alive.
 
 **Prevention:**
-- Monitor process RSS memory every 5 minutes. Log it to the event bus. Alert if memory grows by more than 20% from session start.
-- Consider periodic Whisper model reload: every 2 hours, unload and reload the model to release any accumulated memory. This adds a 2-3 second gap in STT coverage but prevents OOM.
-- Test with extended sessions (4+ hours) before shipping. The existing test suite runs short clips -- add a soak test.
-- Set Python garbage collection to be more aggressive during idle periods: `gc.collect()` after each transcription completes.
+- Use the SDK's built-in KeepAlive mechanism if available (SDK v3+ has native keep-alive support).
+- If sending KeepAlive manually, explicitly verify the WebSocket frame type: `ws.send(json.dumps({"type": "KeepAlive"}))` (text frame) vs `ws.send(audio_bytes)` (binary frame).
+- Set KeepAlive interval to 5 seconds (well within the 10-second timeout).
+- Log every KeepAlive sent and every connection close. If a close happens within seconds of a KeepAlive, the format is probably wrong.
 
-**Phase to address:** Phase 3 (reliability/long-running). Not a launch blocker but must be addressed before production use.
+**Phase to address:** Phase 1 (Deepgram integration).
 
 **Severity:** MODERATE
 
 ---
 
-### Pitfall 13: Response Backend Selection Heuristic Is Hard to Get Right
+### Pitfall 13: Transcript Quality Differences Between Whisper and Deepgram
 
 **What goes wrong:**
-The system must choose between Claude CLI (deep, slow, costs API calls) and Ollama (fast, shallow, free) for each response. The naive approach: "use Ollama for simple questions, Claude for complex ones" requires classifying question complexity, which is itself an LLM task. If the monitoring LLM (Ollama 3B) misclassifies a complex question as simple, Ollama generates a shallow/wrong answer. If it misclassifies a simple question as complex, the user waits 5 seconds for Claude to say "It's 3pm."
+The existing system is tuned around Whisper's behavior: its hallucination patterns, its punctuation style, its handling of filler words. Deepgram Nova-3 has different characteristics:
+- **Better:** Lower WER (5-7% vs 10%+), fewer hallucinations on silence, faster
+- **Different:** Different punctuation patterns, different handling of "um"/"uh", different capitalization
+- **Potentially worse:** Different handling of technical terms, code-related speech, unique names
 
-The backend selection must also handle failure modes: Claude CLI is offline (no network), Ollama is overloaded (another model loaded), or one backend is consistently producing bad results.
+The existing hallucination filter (`HALLUCINATION_PHRASES` in `transcript_buffer.py`) is tuned for Whisper's specific hallucination patterns ("thank you for watching", "subtitles by", etc.). Deepgram doesn't produce these same hallucinations but may produce different artifacts.
+
+The input classifier (`input_classifier.py`) uses regex patterns and semantic matching calibrated to Whisper's output style. Deepgram's different punctuation and capitalization could affect classification accuracy.
 
 **Prevention:**
-- Start with a simple rule: **name-triggered responses use Claude CLI, ambient/proactive responses use Ollama.** If the user explicitly addresses the AI, they expect a good answer and will tolerate latency. If the AI is interjecting proactively, speed matters more than depth.
-- The existing `CircuitBreaker` class (line 148) handles failure cascading. Extend it to cover both backends: if Claude CLI fails 3 times, fall back to Ollama; if Ollama fails 3 times, fall back to Claude CLI.
-- Don't try to auto-detect "complexity" initially. Let the user set a preference in config, and auto-fallback handles the rest.
-- Log which backend was selected for each response, along with user satisfaction signals (did the user ask a follow-up? did they interrupt? did they say "that's wrong"?). Use this data to refine selection heuristics over time.
+- Retune the hallucination filter for Deepgram. Remove Whisper-specific patterns and add any Deepgram-specific artifacts discovered during testing. Deepgram is less prone to hallucination on silence, but verify.
+- Test the input classifier with Deepgram-produced transcripts. The classifier should be robust to punctuation differences, but verify with real speech.
+- Keep the hallucination filter as a safety net even if Deepgram hallucinations are rare. The cost of a false hallucination detection (rejecting valid speech) is lower than the cost of a missed hallucination (sending garbage to the decision model).
+- Document the behavioral differences between Whisper and Deepgram output for future reference.
 
-**Phase to address:** Phase 3 (backend routing). Get one backend working end-to-end first, then add the second with routing.
+**Phase to address:** Phase 1 (integration testing). Run existing speech test cases through Deepgram and compare output.
 
 **Severity:** MODERATE
 
 ---
 
-### Pitfall 14: Barge-In System Breaks Under Always-On Semantics
+### Pitfall 14: State Management During Mode Transitions
 
 **What goes wrong:**
-The current barge-in system (lines 2699-2809) assumes a clean turn-taking model: AI speaks, user interrupts, AI stops and listens. In always-on mode, "interruption" is ambiguous:
-- User coughs while AI is speaking -- is this a barge-in or throat clearing?
-- Another person in the room speaks -- barge-in or ambient noise?
-- User says "Russel, stop" -- barge-in (should stop) or name mention (should listen)?
-- User laughs at something on TV while AI is explaining -- barge-in or reaction?
+The system must support both PTT mode (existing, works well) and always-on mode (new, uses Deepgram). Transitions between modes create state management complexity:
+- User starts in always-on mode, switches to PTT mid-session: must close Deepgram WebSocket, start local Whisper STT
+- User is in PTT mode, switches to always-on: must stop Whisper, open Deepgram WebSocket, start streaming
+- Deepgram connection drops, system falls back to Whisper: must load Whisper model (2-3 second cold start)
+- User starts interview/conversation mode while always-on is running: which STT takes priority?
 
-The VAD-based barge-in (6 consecutive speech chunks, line 2281) will fire on any sustained audio during AI speech. In a room with ambient noise or other people, this creates frequent false barge-ins, constantly interrupting the AI mid-sentence.
+Each transition has cleanup requirements (close connections, flush buffers, reset state machines) and initialization requirements (open connections, load models, calibrate thresholds).
 
 **Prevention:**
-- Increase barge-in sensitivity during always-on mode. Require higher sustained speech threshold (10+ chunks instead of 6) or higher VAD probability threshold (0.7 instead of 0.5).
-- Use PipeWire AEC output for barge-in detection. After echo cancellation, the residual audio should only contain non-AI speech. If the AEC-processed audio has speech energy, it's genuinely someone else speaking.
-- Add a "confidence cooldown" -- if barge-in fired but the subsequent STT produced no meaningful transcript (hallucination or very short), increase the barge-in threshold temporarily. This adapts to noisy environments.
-- Consider: in always-on mode, "barge-in" during proactive AI speech should be easier (lower threshold) than during user-requested AI speech. If the user asked a question, they probably want to hear the answer. If the AI interjected proactively, the user should be able to shut it up easily.
+- Implement STT as a pluggable interface with `start()`, `stop()`, `send_audio()`, and callback-based `on_transcript()`. Both Deepgram and Whisper implement this interface. The pipeline doesn't know which STT is active -- it just calls the interface.
+- Mode transitions go through a single `switch_stt(provider)` method that handles cleanup and initialization atomically. No partial state transitions.
+- Design the TranscriptBuffer to be STT-agnostic. It receives `TranscriptSegment` objects regardless of whether they came from Deepgram or Whisper. Tag segments with `source="deepgram"` or `source="whisper"` for debugging.
+- Test mode transitions explicitly: always-on -> PTT -> always-on in a single session. Verify no orphaned connections, no leaked threads, no state corruption.
 
-**Phase to address:** Phase 3 (barge-in refinement). The existing system works for PTT mode; always-on refinements come after basic always-on is working.
+**Phase to address:** Phase 1 (architecture) and Phase 3 (fallback). Design the interface in Phase 1; implement Whisper fallback in Phase 3.
 
 **Severity:** MODERATE
 
 ---
 
-### Pitfall 15: Ollama Concurrency -- Monitoring and Response Can't Run Simultaneously
+### Pitfall 15: Testing a Streaming WebSocket Integration Without Real Audio
 
 **What goes wrong:**
-Ollama's default `OLLAMA_NUM_PARALLEL=1` means it processes one request at a time. If the monitoring LLM is running inference (deciding whether to respond) and simultaneously a response is being generated via Ollama, the second request queues. In the worst case: monitoring decides "respond now" but the response request waits for the monitoring inference to finish -- adding the monitoring LLM's full inference time to the response latency.
+The existing test suite (`test_live_session.py`) tests the Whisper pipeline with synthetic audio buffers and mocked models. Testing Deepgram streaming requires:
+1. A real or mock WebSocket server that accepts audio and returns transcript events
+2. Realistic timing (interim results, final results, speech_final, UtteranceEnd arrive asynchronously)
+3. Error simulation (disconnections, timeouts, rate limits)
+4. Cost awareness (every test that hits real Deepgram burns credit)
 
-If both monitoring and response use the same model (Llama 3.2 3B), this is a single-model concurrency issue. If they use different models, Ollama may need to swap models (evicting one to load the other), which is even slower.
+Without proper testing infrastructure, the Deepgram integration is only tested manually by speaking into a microphone. Manual testing misses edge cases: What happens when KeepAlive fails? When the connection drops mid-word? When Deepgram returns empty results? When network latency spikes?
 
 **Prevention:**
-- Use the same model for both monitoring and response via Ollama. Set `OLLAMA_NUM_PARALLEL=2` to allow concurrent requests to the same model. This doubles the context memory requirement (2x 2048 = 4096 tokens extra VRAM) but enables parallelism.
-- Better: make monitoring and response sequential by design. The monitoring LLM decides first (fast, ~200ms), then the response pipeline starts. Don't run them concurrently. This is simpler and avoids the concurrency issue entirely.
-- If using different backends for monitoring (Ollama) and response (Claude CLI), there's no Ollama concurrency issue -- they're different processes.
+- **Use Deepgram's mock server for integration tests.** Deepgram provides a streaming test suite with a mock server that accepts WebSocket connections and raw audio but doesn't transcribe. It confirms audio format and data receipt. Use this for format validation tests.
+- **Build a mock WebSocket server for unit tests.** Create a local asyncio WebSocket server that:
+  - Accepts connections with expected parameters
+  - Accepts audio data (validates format)
+  - Returns pre-recorded transcript sequences (loaded from JSON fixtures)
+  - Can simulate disconnections, delays, and errors on demand
+- **Record real Deepgram interactions as test fixtures.** During manual testing, record the exact sequence of events (open, audio sent, interim received, final received, speech_final, close) with timestamps. Replay these sequences in the mock server for deterministic testing.
+- **Keep the test costs low.** Only hit real Deepgram in a dedicated "integration test" suite that runs manually (not in CI). Use the mock server for all automated tests.
+- **Test the reconnection path explicitly.** The mock server should support: `mock.disconnect_after(5_seconds)` to verify that reconnection logic works correctly.
 
-**Phase to address:** Phase 2 (monitoring architecture).
+**Phase to address:** Phase 1 (test infrastructure). Build the mock before building the integration.
+
+**Severity:** MODERATE
+
+---
+
+### Pitfall 16: Existing Pipeline Architecture Assumes Synchronous Batch STT
+
+**What goes wrong:**
+The current `_stt_stage` in `live_session.py` is designed around batch-mode Whisper: accumulate audio in a buffer, detect silence, transcribe the entire buffer at once, emit one TRANSCRIPT frame. This is fundamentally different from Deepgram streaming where:
+- Results arrive asynchronously via WebSocket callbacks while audio is still being sent
+- Multiple result types arrive (interim, final, speech_final, UtteranceEnd)
+- The "transcription" isn't a single blocking call but a continuous stream of events
+- Audio sending and transcript receiving happen concurrently, not sequentially
+
+Trying to shoehorn Deepgram's event-driven streaming model into the existing `while self.running: frame = queue.get(); ... transcribe(buffer)` pattern will create an impedance mismatch. The STT stage needs to be restructured from "pull audio, process, emit" to "push audio continuously, handle async callbacks."
+
+**Prevention:**
+- Design the Deepgram STT stage as an event-driven component, not a polling loop:
+  ```
+  DeepgramSTT:
+    - Thread/task: read from audio queue, send to WebSocket
+    - Callback: on_transcript -> accumulate, check for speech_final
+    - Callback: on_utterance_end -> emit complete utterance
+    - Callback: on_error -> log, reconnect
+    - Callback: on_close -> reconnect or fallback
+  ```
+- Keep the existing `_stt_stage` as the Whisper fallback path. Don't modify it.
+- Create a new `_stt_deepgram_stage` that consumes from the same `_audio_in_q` but uses the Deepgram event-driven model internally.
+- The output interface remains the same: emit `PipelineFrame(type=FrameType.TRANSCRIPT)` to `_stt_out_q`. This way the LLM stage doesn't know or care which STT backend produced the transcript.
+
+**Phase to address:** Phase 1 (Deepgram integration). The STT stage architecture must be redesigned for streaming before any features can be built on top.
 
 **Severity:** MODERATE
 
@@ -634,53 +595,55 @@ If both monitoring and response use the same model (Llama 3.2 3B), this is a sin
 
 ## Minor Pitfalls
 
-Mistakes that cause annoyance but are fixable.
+Mistakes that cause annoyance but are easily fixable.
 
 ---
 
-### Pitfall 16: Configuration Complexity Explosion
+### Pitfall 17: Free Credit Exhaustion Without Warning
 
 **What goes wrong:**
-Always-on mode introduces many new configuration options: listening mode (PTT vs always-on), monitoring model, response backend, name variants, confidence thresholds, echo cancellation settings, VRAM budget, context window size, keepalive duration, barge-in sensitivity, privacy retention period, etc. The current `config.json` has 16 keys. Adding 10-15 more makes configuration overwhelming and error-prone. Users misconfigure one setting and the whole system behaves unexpectedly with no clear error message.
+Deepgram's free tier provides $200 of credit. At $0.0077/min, that's ~433 hours of streaming. With active development (starting/stopping sessions, running tests against real Deepgram), credit burns faster than expected. There's no notification when credit is about to run out. One day the WebSocket connections just start failing with auth errors, and the developer spends time debugging a "connection issue" that's actually a billing issue.
 
 **Prevention:**
-- Use a "profile" system: `"mode": "ptt"` (current behavior, all existing defaults) vs `"mode": "always_on"` (new defaults tuned for always-on). Individual settings can still be overridden, but the profile provides sensible defaults.
-- Validate configuration at startup. If `mode: always_on` but PipeWire AEC is not configured, warn. If Ollama is not running, warn. If VRAM is insufficient, warn.
-- Keep the Settings UI (in `indicator.py`) focused on the most important options. Advanced settings stay config.json-only.
+- Check credit balance via Deepgram API periodically: `GET https://api.deepgram.com/v1/billing/balance`
+- Add a startup check that logs remaining credit and warns if below a threshold (e.g., $20 remaining)
+- Consider upgrading to Pay-as-You-Go ($0.0077/min with no free credit) early if development is active, to avoid the surprise cutoff
 
-**Phase to address:** Phase 1 (config structure). Design the config schema before building features.
+**Phase to address:** Phase 1 (setup).
 
 **Severity:** MINOR
 
 ---
 
-### Pitfall 17: Conversation and Interview Modes Break Under Always-On Refactoring
+### Pitfall 18: Dashboard and Event Bus Need New Event Types
 
 **What goes wrong:**
-The codebase supports multiple modes: live, dictate, conversation, interview. The pipeline refactoring for always-on mode changes fundamental assumptions (continuous STT, monitoring layer, response routing). If these changes aren't properly isolated behind the `listening_mode` flag, they leak into other modes -- breaking dictation accuracy, interview flow, or conversation session management.
+The dashboard (`dashboard.py`) and event bus (`event_bus.py`) were designed for the Whisper pipeline's event model: `stt_start`, `stt_complete`, single discrete transcription events. Deepgram streaming produces a different event model: continuous interim results, periodic final results, speech_final markers, UtteranceEnd messages, connection state changes, KeepAlive sent/received. If the event bus isn't updated, the dashboard shows nothing during Deepgram operation (no events mapped) or shows a flood of unmapped events.
 
 **Prevention:**
-- All always-on behavior must be gated on a clear `listening_mode == "always_on"` check. The existing modes use the same pipeline entry points -- changes to `_stt_stage` or `_llm_stage` must preserve existing behavior when always-on is disabled.
-- Run the full existing test suite after every always-on change. The 96KB `test_live_session.py` covers the existing pipeline extensively -- any regression will be caught if tests are run.
-- Consider: the `InterviewSession` and `ConversationSession` classes (referenced in CLAUDE.md) have their own lifecycle management. Always-on should be a separate session type, not a modification of existing session types.
+- Add new EventType values: `deepgram_connected`, `deepgram_disconnected`, `deepgram_interim`, `deepgram_final`, `deepgram_speech_final`, `deepgram_utterance_end`, `deepgram_keepalive`, `deepgram_latency`
+- Rate-limit interim result events (emit at most 1 per 200ms to the event bus, even if Deepgram sends more)
+- Update the dashboard to show Deepgram connection state and latency metrics
+- Keep the existing Whisper event types for fallback mode
 
-**Phase to address:** Every phase (continuous regression testing).
+**Phase to address:** Phase 1 (integration) or Phase 2 (dashboard update).
 
 **Severity:** MINOR
 
 ---
 
-### Pitfall 18: Dashboard and Event Bus Overwhelmed by Continuous Events
+### Pitfall 19: API Key Management for Deepgram
 
 **What goes wrong:**
-The event bus (JSONL file) and SSE dashboard currently log discrete events: STT start/complete, LLM send/receive, barge-in, etc. In always-on mode, STT events fire continuously (every 1-3 seconds even during silence due to hallucination filter rejections). Audio RMS events already fire per-chunk (~12 per second). Adding monitoring LLM decision events (every few seconds), the JSONL file grows rapidly and the SSE dashboard receives a firehose of events that's impossible to read.
+The Deepgram API key is loaded from config and passed to LiveSession (`deepgram_api_key` parameter, line 190). The key must never appear in logs, event bus entries, or error messages. The existing codebase has security guards (`_is_sensitive_path`, `_is_sensitive_command`) for local files but no API key sanitization for error messages from the Deepgram SDK. If the SDK includes the API key in error messages or stack traces, it could leak to conversation logs.
 
 **Prevention:**
-- Rate-limit event bus writes for continuous monitoring events. Log monitoring decisions only when they change state (from "don't respond" to "respond"), not every evaluation.
-- Add an event type category: "ephemeral" events (RMS, per-chunk status) vs "significant" events (STT complete, monitoring decision, response start). Dashboard shows significant events by default.
-- Rotate JSONL files by size or time (every hour or every 10MB). Don't let a single session file grow to gigabytes.
+- Store the API key in `~/.config/push-to-talk/secrets` or source from `.env`, never in `config.json` (which may be committed)
+- Wrap all Deepgram SDK calls with error handlers that sanitize the API key from exception messages before logging
+- The existing `CLAUDE.md` security rules about never reading `.env` files apply -- ensure the deployment script handles this correctly
+- Test that the API key doesn't appear in `events.jsonl` or any log output
 
-**Phase to address:** Phase 2 (event bus extension).
+**Phase to address:** Phase 1 (setup and security).
 
 **Severity:** MINOR
 
@@ -690,40 +653,63 @@ The event bus (JSONL file) and SSE dashboard currently log discrete events: STT 
 
 | Phase Topic | Likely Pitfall | Mitigation |
 |-------------|---------------|------------|
-| Audio architecture (Phase 1) | Feedback loop (#1) | PipeWire AEC + transcript fingerprinting. Must be first thing built. |
-| Audio architecture (Phase 1) | Hallucination explosion (#3) | Aggressive VAD, expanded filter list, confidence gating. |
-| Resource budgeting (Phase 1) | GPU memory exhaustion (#2) | Measure actual VRAM with both models loaded. Consider smaller Whisper model. |
-| Pipeline refactor (Phase 1) | PTT architecture assumptions (#10) | Transcript dispatcher pattern. Don't break existing modes. |
-| Config/privacy (Phase 1) | Privacy boundary (#9) | Persistent indicator, data retention policy, mute zones. |
-| Config/privacy (Phase 1) | Config explosion (#16) | Profile-based defaults (PTT vs always-on). |
-| Monitoring LLM (Phase 2) | Context window growth (#4) | Two-tier context: rolling summary + recent buffer. |
-| Monitoring LLM (Phase 2) | False positive responses (#5) | Default to NOT responding. Name-based activation first. |
-| Monitoring LLM (Phase 2) | Ollama cold start (#7) | keep_alive=-1, heartbeat keepalive, pre-load on start. |
-| Name detection (Phase 2) | STT-based name detection accuracy (#6) | Fuzzy matching, initial_prompt bias, consider openWakeWord. |
-| Latency optimization (Phase 3) | End-to-end response latency (#8) | Quick response bridge, speculative pre-processing, parallel stages. |
-| Backend routing (Phase 3) | Selection heuristic (#13) | Simple rule first (name=Claude, ambient=Ollama). Refine with data. |
-| Barge-in refinement (Phase 3) | Always-on barge-in semantics (#14) | Use AEC output, increase threshold, context-aware sensitivity. |
-| Reliability (Phase 3) | Memory leak (#12) | Monitor RSS, periodic model reload, soak testing. |
-| Integration (All phases) | Regression in existing modes (#17) | Run full test suite on every change. |
+| Deepgram connection (Phase 1) | VAD gating breaks endpointing (#1) | Stream continuously during active periods, KeepAlive during idle, disconnect during sleep |
+| Audio format (Phase 1) | 24kHz format mismatch (#2) | Explicitly set encoding=linear16, sample_rate=24000, channels=1 |
+| Connection resilience (Phase 1) | Mid-utterance disconnect (#3) | Local audio buffer, exponential backoff, timestamp realignment |
+| Cost management (Phase 1) | Runaway streaming costs (#4) | Activity-based lifecycle, daily budget cap, cost tracking |
+| Echo cancellation (Phase 1) | AI hears itself through Deepgram (#5) | Transcript fingerprinting, playback-aware tagging, extended cooldown window |
+| End-of-speech (Phase 1) | `speech_final` fails in noise (#6) | Dual trigger: endpointing + utterance_end_ms |
+| Interim results (Phase 1) | Processing too early/late (#9) | Three-tier strategy: interim for name, final for accumulation, speech_final for processing |
+| SDK stability (Phase 1) | Breaking changes (#11) | Pin exact version, integration tests before upgrade |
+| Architecture (Phase 1) | Batch STT assumption (#16) | Event-driven Deepgram stage, keep Whisper stage as fallback |
+| Testing (Phase 1) | No mock infrastructure (#15) | Build mock WebSocket server before integration |
+| Decision model (Phase 2) | False positives from TV/music (#7) | Name-activation only at launch, keyterm prompting, conversation state machine |
+| Name detection (Phase 2) | Name not recognized (#8) | Fuzzy matching, keyterm boosting, check interim results, immediate acknowledgment |
+| Network reliability (Phase 3) | Latency spikes (#10) | Latency monitoring, local Whisper fallback, audio pre-buffering |
+| Mode transitions (Phase 3) | State corruption (#14) | Pluggable STT interface, atomic switch, agnostic TranscriptBuffer |
+| Transcript quality (All phases) | Whisper vs Deepgram differences (#13) | Retune hallucination filter, test classifier with Deepgram output |
 
 ---
 
 ## Sources
 
-- [OpenAI Community: Realtime API starts to answer itself](https://community.openai.com/t/realtime-api-starts-to-answer-itself-with-mic-speaker-setup/977801) -- feedback loop documentation
-- [PipeWire: Echo Cancel Module](https://docs.pipewire.org/page_module_echo_cancel.html) -- official AEC configuration
-- [arXiv 2501.11378: Whisper ASR Hallucinations Induced by Non-Speech Audio](https://arxiv.org/abs/2501.11378) -- 40.3% hallucination rate on non-speech
-- [arXiv 2505.12969: Calm-Whisper](https://arxiv.org/html/2505.12969v1) -- Whisper hallucination analysis
-- [GitHub: openai/whisper Discussion #679](https://github.com/openai/whisper/discussions/679) -- hallucination mitigations
-- [faster-whisper: High Memory Use Issue #249](https://github.com/guillaumekln/faster-whisper/issues/249) -- memory leak in long sessions
-- [Ollama FAQ](https://docs.ollama.com/faq) -- keep_alive, context window, parallel requests
-- [Ollama VRAM Requirements Guide](https://localllm.in/blog/ollama-vram-requirements-for-local-llms) -- model memory sizing
-- [GitHub: ollama/ollama Issue #9410](https://github.com/ollama/ollama/issues/9410) -- keep_alive GPU loading bug
-- [RTX2060 Ollama Benchmark](https://www.databasemart.com/blog/ollama-gpu-benchmark-rtx2060) -- Llama 3.2 3B at 50 tokens/s
-- [Stanford HAI: Teaching a Voice Assistant When to Speak](https://hai.stanford.edu/news/it-my-turn-yet-teaching-voice-assistant-when-speak) -- turn-taking research
-- [Proactive behavior in voice assistants (ScienceDirect)](https://www.sciencedirect.com/science/article/pii/S2451958824000447) -- proactive response research
-- [Picovoice: Benchmarking Wake Word Detection](https://picovoice.ai/blog/benchmarking-a-wake-word-detection-engine/) -- <5% FRR at 1 FAR/10h
-- [openWakeWord](https://github.com/dscripka/openWakeWord) -- open-source wake word framework
-- [Context Window Management Strategies (getmaxim.ai)](https://www.getmaxim.ai/articles/context-window-management-strategies-for-long-context-ai-agents-and-chatbots/) -- sliding window + summary patterns
-- [Deepgram: Voice Agent Echo Cancellation](https://developers.deepgram.com/docs/voice-agent-echo-cancellation) -- AEC approaches
-- Existing codebase: `live_session.py`, `push-to-talk.py`, `event_bus.py`, `stream_composer.py` (line references throughout)
+**Official Deepgram Documentation (HIGH confidence):**
+- [Recovering From Connection Errors & Timeouts](https://developers.deepgram.com/docs/recovering-from-connection-errors-and-timeouts-when-live-streaming-audio) -- reconnection, audio buffering, timestamp realignment
+- [Audio Keep Alive](https://developers.deepgram.com/docs/audio-keep-alive) -- KeepAlive format, 10-second timeout, billing implications
+- [Determining Your Audio Format](https://developers.deepgram.com/docs/determining-your-audio-format-for-live-streaming-audio) -- encoding requirements, container vs raw audio
+- [Configure Endpointing and Interim Results](https://developers.deepgram.com/docs/understand-endpointing-interim-results) -- is_final vs speech_final, default values, configuration
+- [End of Speech Detection](https://developers.deepgram.com/docs/understanding-end-of-speech-detection) -- endpointing vs UtteranceEnd, noise limitations
+- [Encoding](https://developers.deepgram.com/docs/encoding) -- supported encodings list, linear16 specification
+- [Keyterm Prompting](https://developers.deepgram.com/docs/keyterm) -- Nova-3 keyterm boosting, 90% KRR improvement
+- [API Rate Limits](https://developers.deepgram.com/reference/api-rate-limits) -- 150 concurrent connections (PAYG), project-scoped
+- [Voice Agent Echo Cancellation](https://developers.deepgram.com/docs/voice-agent-echo-cancellation) -- AEC approaches, browser-level config
+- [Pricing](https://deepgram.com/pricing) -- $0.0077/min Nova-3 streaming, $200 free credit
+
+**Deepgram SDK Issues (HIGH confidence):**
+- [Issue #279: WebSocket issue in SDK 3.1.1](https://github.com/deepgram/deepgram-python-sdk/issues/279) -- version upgrade breaks connections
+- [Issue #385: UtteranceEnd never triggers](https://github.com/deepgram/deepgram-python-sdk/issues/385) -- event handler registration gotcha
+- [Issue #493: ListenWebSocketClient.start failed](https://github.com/deepgram/deepgram-python-sdk/issues/493) -- API key passing regression
+- [Discussion #1216: VAD before Deepgram STT](https://github.com/orgs/deepgram/discussions/1216) -- official recommendation against VAD gating
+
+**Deepgram Community (MEDIUM confidence):**
+- [Discussion #409: speech_final never returns True](https://github.com/orgs/deepgram/discussions/409) -- background noise breaks endpointing
+- [Discussion #565: Twilio->Deepgram disconnecting](https://github.com/orgs/deepgram/discussions/565) -- reconnection patterns
+- [Deepgram Blog: Holding Streams Open with KeepAlive](https://deepgram.com/learn/holding-streams-open-with-stream-keepalive) -- KeepAlive patterns
+
+**Accuracy Comparisons (MEDIUM confidence):**
+- [Deepgram: Whisper vs Deepgram](https://deepgram.com/learn/whisper-vs-deepgram) -- Nova-3 5-7% WER vs Whisper 10%+
+- [Modal: Whisper vs Deepgram](https://modal.com/blog/whisper-vs-deepgram) -- independent comparison
+- [Deepgram: Whisper-v3 Results](https://deepgram.com/learn/whisper-v3-results) -- Whisper-v3 4x more hallucinations than v2
+
+**Codebase (HIGH confidence):**
+- `live_session.py` -- existing STT stage, CircuitBreaker, barge-in, echo gating
+- `continuous_stt.py` -- ContinuousSTT module (being replaced), VAD resampling, audio capture
+- `transcript_buffer.py` -- TranscriptBuffer, hallucination filter, TranscriptSegment
+- `input_classifier.py` -- classification patterns, semantic fallback
+- `pipeline_frames.py` -- frame types, generation IDs
+- `requirements.txt` -- current `deepgram-sdk>=3.0` specification
+
+---
+*Pitfalls research for: v2.0 Always-On Observer (Deepgram streaming + local decision model)*
+*Researched: 2026-02-22*
+*Supersedes: Previous PITFALLS.md (2026-02-21, local Whisper + Ollama focused)*
