@@ -29,7 +29,7 @@ from response_library import ResponseLibrary
 from stream_composer import StreamComposer, AudioSegment, SegmentType
 from task_manager import TaskManager, ClaudeTask, TaskStatus
 from event_bus import EventBus, EventBusWriter, BusEvent, EventType, build_llm_context
-from continuous_stt import ContinuousSTT
+from deepgram_stt import DeepgramSTT
 from transcript_buffer import TranscriptBuffer, TranscriptSegment
 try:
     from vram_monitor import VRAMMonitor
@@ -307,7 +307,8 @@ class LiveSession:
         # Continuous STT (Phase 12) — always-on speech capture + transcription
         self._transcript_buffer = None  # Created in run()
         self._vram_monitor = None       # Created in run()
-        self._continuous_stt = None     # Created in run()
+        self._deepgram_stt = None       # Created in run()
+        self._deepgram_transcript_q = None  # DeepgramSTT -> STT stage
 
         # Claude CLI subprocess and IPC
         self._cli_process = None
@@ -1951,6 +1952,8 @@ class LiveSession:
                                                     data=clean
                                                 ))
                                             self._spoken_sentences.append(clean)
+                                            if self._deepgram_stt and hasattr(self._deepgram_stt, 'set_recent_ai_speech'):
+                                                self._deepgram_stt.set_recent_ai_speech(list(self._spoken_sentences))
 
                 elif event_type == "result":
                     # CLI finished processing this message (including any tool use rounds)
@@ -1987,6 +1990,8 @@ class LiveSession:
                                 data=sent
                             ))
                         self._spoken_sentences.append(sent)
+                        if self._deepgram_stt and hasattr(self._deepgram_stt, 'set_recent_ai_speech'):
+                            self._deepgram_stt.set_recent_ai_speech(list(self._spoken_sentences))
 
         # Flush remaining text (non-tool-use path, use pysbd for final flush)
         if not saw_tool_use and sentence_buffer.strip() and self.generation_id == gen_id:
@@ -2007,6 +2012,8 @@ class LiveSession:
                                 data=sent
                             ))
                         self._spoken_sentences.append(sent)
+                        if self._deepgram_stt and hasattr(self._deepgram_stt, 'set_recent_ai_speech'):
+                            self._deepgram_stt.set_recent_ai_speech(list(self._spoken_sentences))
 
         # Track ai_asked_question: check if last sentence is a question
         if full_response.strip() and self.generation_id == gen_id:
@@ -2393,10 +2400,10 @@ class LiveSession:
         except Exception as e:
             print(f"STT Whisper error: {e}", flush=True)
 
-    # ── ContinuousSTT Callbacks (Phase 12) ────────────────────────
+    # ── DeepgramSTT Callbacks (Phase 12) ─────────────────────────
 
     def _on_transcript_segment(self, segment):
-        """Called when ContinuousSTT produces a clean transcript segment."""
+        """Called when DeepgramSTT produces a clean transcript segment."""
         if self._bus:
             self._bus.emit("continuous_stt_segment",
                            gen=self.generation_id,
@@ -2407,18 +2414,27 @@ class LiveSession:
                          buffer_depth=len(self._transcript_buffer))
 
     def _on_stt_stats(self, stats):
-        """Called periodically with ContinuousSTT performance stats."""
+        """Called periodically with DeepgramSTT performance stats."""
         parts = [
             f"segs={stats['segment_count']}",
             f"hal={stats['hallucination_count']}",
             f"lat={stats['avg_latency_ms']:.0f}ms",
             f"buf={stats['buffer_depth']}",
         ]
-        if 'vram_level' in stats:
-            parts.append(f"vram={stats.get('vram_level', '?')}")
-        if 'vram_used_mb' in stats:
-            parts.append(f"{stats['vram_used_mb']}MB")
-        print(f"ContinuousSTT stats: {' | '.join(parts)}", flush=True)
+        if 'connected' in stats:
+            parts.append(f"connected={stats['connected']}")
+        if 'reconnect_attempts' in stats:
+            parts.append(f"reconnects={stats['reconnect_attempts']}")
+        print(f"DeepgramSTT stats: {' | '.join(parts)}", flush=True)
+
+    def _on_deepgram_unavailable(self):
+        """Called when DeepgramSTT exhausts reconnection attempts."""
+        print("Live session: Deepgram unavailable, switching to Whisper fallback", flush=True)
+        self._emit_event("stt_fallback", reason="deepgram_unavailable")
+        loop = asyncio.get_event_loop()
+        loop.call_soon_threadsafe(
+            lambda: asyncio.ensure_future(self._stt_whisper_fallback())
+        )
 
     # ── Pipeline Stage 3: LLM (Claude CLI) ────────────────────────
 
@@ -2639,6 +2655,8 @@ class LiveSession:
                         await asyncio.sleep(0.5)
                         if self.playing_audio:
                             self.playing_audio = False
+                            if self._deepgram_stt:
+                                self._deepgram_stt.set_playing_audio(False)
                             self._stt_gated = False
                             self._unmute_mic()
                             if not self.muted:
@@ -2669,6 +2687,8 @@ class LiveSession:
                     # Skip re-gating for post-barge-in trail clip (user is already talking)
                     if not self.playing_audio:
                         self.playing_audio = True
+                        if self._deepgram_stt:
+                            self._deepgram_stt.set_playing_audio(True)
                         if not self._post_barge_in:
                             self._set_status("speaking")
                             self._stt_gated = True
@@ -2721,6 +2741,8 @@ class LiveSession:
             print("Live session: Interrupting response", flush=True)
             self.generation_id += 1
             self.playing_audio = False
+            if self._deepgram_stt:
+                self._deepgram_stt.set_playing_audio(False)
             self._stt_gated = False
             self._vad_speech_count = 0
             # Reset composer and drain audio queue
@@ -2779,6 +2801,8 @@ class LiveSession:
 
         # 8. Transition state — ungating triggers _was_stt_gated reset in STT stage
         self.playing_audio = False
+        if self._deepgram_stt:
+            self._deepgram_stt.set_playing_audio(False)
         self._stt_gated = False
 
         # 9. Unmute mic (undo the _llm_stage mute from thinking phase)
@@ -2919,19 +2943,22 @@ class LiveSession:
             print(f"Live session: VRAM monitor active ({vram_stats['used_mb']}MB used, "
                   f"{vram_stats['utilization_pct']}%)", flush=True)
 
-        self._continuous_stt = ContinuousSTT(
+        self._deepgram_transcript_q = asyncio.Queue(maxsize=50)
+        self._deepgram_stt = DeepgramSTT(
+            api_key=self.deepgram_api_key,
             transcript_buffer=self._transcript_buffer,
-            vram_monitor=self._vram_monitor,
+            transcript_q=self._deepgram_transcript_q,
             aec_device_name=self.config.get("aec_device_name", "Echo Cancellation Source")
                 if hasattr(self, 'config') and isinstance(getattr(self, 'config', None), dict)
                 else "Echo Cancellation Source",
             on_segment=self._on_transcript_segment,
             on_stats=self._on_stt_stats,
+            on_unavailable=self._on_deepgram_unavailable,
         )
 
         self._set_status("listening")
         self._reset_idle_timer()
-        print("Live session: Pipeline started (with StreamComposer + ContinuousSTT)", flush=True)
+        print("Live session: Pipeline started (with StreamComposer + DeepgramSTT)", flush=True)
 
         try:
             # Run interrupt checker as background task
@@ -2948,7 +2975,7 @@ class LiveSession:
                 self._playback_stage(),
                 interrupt_loop(),
                 self._sse_server_stage(),
-                self._continuous_stt.start(),  # Phase 12: always-on STT
+                self._deepgram_stt.start(),  # Phase 12: Deepgram streaming STT
             ]
 
             await asyncio.gather(*stages, return_exceptions=True)
@@ -2959,8 +2986,8 @@ class LiveSession:
             self._log_event("session_end",
                             duration_s=round(time.time() - self._started_at, 1))
             self.running = False
-            if self._continuous_stt:
-                self._continuous_stt.stop()
+            if self._deepgram_stt:
+                self._deepgram_stt.stop()
             if self._composer:
                 self._composer.stop()
             if self._vram_monitor:
@@ -3030,8 +3057,8 @@ class LiveSession:
     def stop(self):
         """Stop the session gracefully."""
         self.running = False
-        if self._continuous_stt:
-            self._continuous_stt.stop()
+        if self._deepgram_stt:
+            self._deepgram_stt.stop()
         if self._composer:
             self._composer.stop()
         self._cancel_idle_timer()
