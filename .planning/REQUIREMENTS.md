@@ -1,59 +1,58 @@
-# Requirements: Push-to-Talk v2.0
+# Requirements: Push-to-Talk v2.0 (Refreshed)
 
-**Defined:** 2026-02-21
+**Defined:** 2026-02-22
 **Core Value:** An always-present AI that listens, understands context, and contributes when it has something useful to add
 
 ## v2.0 Requirements
 
-Requirements for v2.0 Always-On Observer milestone.
+Requirements for v2.0 Always-On Observer milestone (Deepgram streaming + local decision model architecture).
 
-### Continuous Input Stream
+### Streaming STT Infrastructure
 
-- [ ] **CSTR-01**: Audio capture runs continuously without PTT activation, gated by Silero VAD to only process speech segments
-- [ ] **CSTR-02**: Whisper STT transcribes speech segments continuously, producing a stream of timestamped transcripts
-- [ ] **CSTR-03**: Rolling transcript buffer maintains a sliding window of recent transcripts (configurable, ~5-10 minutes) as the monitoring LLM's context
-- [ ] **CSTR-04**: Transcript buffer includes speaker attribution where detectable (user vs AI vs other)
-- [ ] **CSTR-05**: Audio feedback loop prevention via PipeWire echo cancellation prevents the AI from hearing and responding to its own speech
+- [ ] **STT-01**: Deepgram Nova-3 WebSocket streams real-time transcripts as the user speaks, producing TranscriptSegment objects in the existing TranscriptBuffer
+- [ ] **STT-02**: Silero VAD manages Deepgram connection lifecycle — connect on first speech detection, KeepAlive during silence, disconnect after extended quiet (not per-chunk audio gating)
+- [ ] **STT-03**: KeepAlive messages maintain WebSocket during silence without incurring Deepgram audio billing
+- [ ] **STT-04**: Utterance boundaries detected via dual trigger (`speech_final` + `utterance_end_ms`) for reliable sentence detection in noisy environments
+- [ ] **STT-05**: Echo suppression prevents AI from hearing its own speech — PipeWire AEC as primary, transcript fingerprinting against recent AI speech as secondary
+- [ ] **STT-06**: Local Whisper loads on demand as fallback when Deepgram is unavailable (network down, API error)
 
-### Monitoring Decision Engine
+### Decision Engine
 
-- [ ] **MNTR-01**: Ollama (Llama 3.2 3B) evaluates the transcript buffer after each speech segment and outputs a structured JSON decision (should_respond, confidence, response_type, tone)
-- [ ] **MNTR-02**: Name-based activation ("hey Russel" / "Russell" / "Russ") bypasses confidence threshold — AI always responds when addressed by name
-- [ ] **MNTR-03**: Name detection during AI playback triggers barge-in interruption (replacing PTT-based interruption)
-- [ ] **MNTR-04**: Decision engine considers addressee detection, relevance, urgency, and interruption cost when deciding whether to respond
-- [ ] **MNTR-05**: Configurable confidence threshold controls how aggressively the AI participates (low = proactive, high = conservative)
+- [ ] **DCSN-01**: Llama 3.1 8B via Ollama evaluates the transcript buffer after each utterance and outputs a structured JSON decision (should_respond, confidence, response_type, tone, reasoning)
+- [ ] **DCSN-02**: Name-based activation ("hey Russel" / "Russell" / "Russ" and fuzzy variants) bypasses confidence threshold — AI always responds when addressed by name
+- [ ] **DCSN-03**: Decision engine considers addressee detection, relevance, urgency, and interruption cost when deciding whether to respond
+- [ ] **DCSN-04**: Configurable confidence threshold controls how aggressively the AI participates (low = proactive, high = conservative)
+- [ ] **DCSN-05**: Transcript segments include speaker attribution (user vs AI) that the decision engine uses for context
 
 ### Response Backend
 
 - [ ] **RESP-01**: System automatically selects response backend (Claude CLI or Ollama) based on query complexity, network availability, and expected latency
-- [ ] **RESP-02**: Ollama generates quick conversational responses (~200ms) for simple interactions and proactive contributions
+- [ ] **RESP-02**: Ollama generates quick conversational responses (~200ms) for simple interactions
 - [ ] **RESP-03**: Claude CLI handles complex queries, tool-using requests, and multi-step reasoning (existing pipeline)
-- [ ] **RESP-04**: Response tone/style adapts to conversation context — technical in work discussions, casual in banter, supportive when user sounds frustrated
+- [ ] **RESP-04**: Response tone adapts to conversation context — technical in work discussions, casual in banter, supportive when user sounds frustrated
+- [ ] **RESP-05**: Name spoken during AI playback triggers barge-in interruption (replacing PTT-based interruption)
+- [ ] **RESP-06**: Graceful degradation chain: Deepgram down → load local Whisper; Ollama down → heuristic classifier + Claude CLI; network down → Ollama only
 
 ### Proactive Participation
 
 - [ ] **PRCT-01**: AI proactively contributes to conversations when it has relevant information, even without being addressed
 - [ ] **PRCT-02**: Attention signal (brief verbal cue or audio chime) plays before unsolicited proactive responses
 - [ ] **PRCT-03**: Interruptibility detection suppresses proactive responses when user appears busy (long silence = deep work, explicit "quiet mode" command)
-- [ ] **PRCT-04**: Conversation balance tracking prevents the AI from dominating the conversation
+- [ ] **PRCT-04**: Conversation balance tracking prevents the AI from dominating — no more than one unsolicited response per ~3 conversational turns
+
+### Polish + Enrichment
+
+- [ ] **PLSH-01**: Non-speech vocalizations (coughs, sighs, laughter) detected and trigger contextual responses
+- [ ] **PLSH-02**: Post-session curator daemon analyzes conversations, identifies response gaps, and generates new quick response clips
+- [ ] **PLSH-03**: Library pruning removes or deprioritizes clips with low effectiveness based on usage tracking
+- [ ] **PLSH-04**: System distinguishes primary user voice from other audio sources (TV, guests) using Deepgram diarization or energy heuristics
 
 ### Resource Management
 
-- [ ] **RSRC-01**: System runs continuously for 8+ hours without memory leaks, GPU exhaustion, or CPU runaway
-- [ ] **RSRC-02**: Transcript buffer is bounded (ring buffer) with configurable size, older entries dropped or summarized
-- [ ] **RSRC-03**: GPU VRAM manages concurrent Whisper + Ollama inference within RTX 3070 8GB budget
-- [ ] **RSRC-04**: Graceful degradation chain: Ollama down → heuristic classifier + Claude CLI; network down → Ollama only; GPU pressure → downgrade Whisper model
-
-### Non-Speech & Library (from v1.2)
-
-- [ ] **NSPL-01**: Non-speech vocalizations (coughs, sighs, laughter) detected from STT rejection metadata trigger contextual responses
-- [ ] **NSPL-02**: Post-session curator daemon analyzes conversations, identifies response gaps, and generates new quick response clips
-- [ ] **NSPL-03**: Library pruning removes or deprioritizes clips with low effectiveness based on usage tracking
-
-### Multi-Speaker Awareness
-
-- [ ] **SPKR-01**: System distinguishes primary user voice from other audio sources (TV, guests, other people) using energy profiles and proximity heuristics
-- [ ] **SPKR-02**: Speaker attribution labels in transcript buffer improve decision engine accuracy (respond to user, not TV dialogue)
+- [ ] **RSRC-01**: System runs continuously for 8+ hours without memory leaks, GPU exhaustion, or degraded quality
+- [ ] **RSRC-02**: TranscriptBuffer is bounded (ring buffer) with configurable size, older entries dropped automatically
+- [ ] **RSRC-03**: GPU VRAM manages Ollama Llama 3.1 8B within RTX 3070 8GB budget
+- [ ] **RSRC-04**: Deepgram API cost stays under $0.30/day for typical usage (8hr session, ~30 min actual speech)
 
 ## v3 Requirements
 
@@ -71,57 +70,59 @@ Deferred to future milestones.
 
 ### Advanced Response
 
-- **RESP-05**: Dynamic TTS fillers generated on-the-fly with contextual text
-- **RESP-06**: Multiple voice/personality profiles with distinct response libraries
+- **RESP-07**: Dynamic TTS fillers generated on-the-fly with contextual text
+- **RESP-08**: Multiple voice/personality profiles with distinct response libraries
 
 ## Out of Scope
 
 | Feature | Reason |
 |---------|--------|
-| Hardware wake word detection (Picovoice/openWakeWord) | Whisper STT already runs continuously — name detection on transcripts is simpler and cheaper |
-| Cloud-based monitoring LLM | Privacy concern (always-on mic), adds latency, costs money, violates local-first philosophy |
-| Full conversation transcription storage | Surveillance feature — rolling buffer is ephemeral by design |
-| Speech-to-speech model (GPT-4o Realtime) | Cloud-only, expensive, designed for 1:1 conversation not ambient monitoring |
-| Multi-room / multi-device mesh | Massive scope expansion — one device, one room, one mic |
-| Routine-based proactivity | Different product — Russel participates in conversations, doesn't initiate from silence |
+| Fully local STT (no cloud) | Deepgram streaming provides 10x better latency than local Whisper for always-on use. Local Whisper retained as fallback only. |
+| Hardware wake word detection (Picovoice/openWakeWord) | Deepgram transcribes continuously — name detection on transcripts is simpler |
+| Speech-to-speech model (GPT-4o Realtime) | Too expensive for always-on ($5-20+/hr with context accumulation) |
+| Full conversation storage | Surveillance concern — rolling buffer is ephemeral by design |
+| Multi-room / multi-device | One device, one room, one mic |
+| OpenAI Realtime API as observer | Context accumulation makes it cost-prohibitive for ambient listening |
 
 ## Traceability
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CSTR-01 | Phase 12 | Pending |
-| CSTR-02 | Phase 12 | Pending |
-| CSTR-03 | Phase 12 | Pending |
-| CSTR-04 | Phase 13 | Pending |
-| CSTR-05 | Phase 12 | Pending |
-| MNTR-01 | Phase 13 | Pending |
-| MNTR-02 | Phase 13 | Pending |
-| MNTR-03 | Phase 14 | Pending |
-| MNTR-04 | Phase 13 | Pending |
-| MNTR-05 | Phase 13 | Pending |
-| RESP-01 | Phase 14 | Pending |
-| RESP-02 | Phase 14 | Pending |
-| RESP-03 | Phase 14 | Pending |
-| RESP-04 | Phase 14 | Pending |
-| PRCT-01 | Phase 15 | Pending |
-| PRCT-02 | Phase 15 | Pending |
-| PRCT-03 | Phase 15 | Pending |
-| PRCT-04 | Phase 15 | Pending |
-| RSRC-01 | Phase 14 | Pending |
-| RSRC-02 | Phase 12 | Pending |
-| RSRC-03 | Phase 12 | Pending |
-| RSRC-04 | Phase 14 | Pending |
-| NSPL-01 | Phase 16 | Pending |
-| NSPL-02 | Phase 16 | Pending |
-| NSPL-03 | Phase 16 | Pending |
-| SPKR-01 | Phase 16 | Pending |
-| SPKR-02 | Phase 16 | Pending |
+| STT-01 | TBD | Pending |
+| STT-02 | TBD | Pending |
+| STT-03 | TBD | Pending |
+| STT-04 | TBD | Pending |
+| STT-05 | TBD | Pending |
+| STT-06 | TBD | Pending |
+| DCSN-01 | TBD | Pending |
+| DCSN-02 | TBD | Pending |
+| DCSN-03 | TBD | Pending |
+| DCSN-04 | TBD | Pending |
+| DCSN-05 | TBD | Pending |
+| RESP-01 | TBD | Pending |
+| RESP-02 | TBD | Pending |
+| RESP-03 | TBD | Pending |
+| RESP-04 | TBD | Pending |
+| RESP-05 | TBD | Pending |
+| RESP-06 | TBD | Pending |
+| PRCT-01 | TBD | Pending |
+| PRCT-02 | TBD | Pending |
+| PRCT-03 | TBD | Pending |
+| PRCT-04 | TBD | Pending |
+| PLSH-01 | TBD | Pending |
+| PLSH-02 | TBD | Pending |
+| PLSH-03 | TBD | Pending |
+| PLSH-04 | TBD | Pending |
+| RSRC-01 | TBD | Pending |
+| RSRC-02 | TBD | Pending |
+| RSRC-03 | TBD | Pending |
+| RSRC-04 | TBD | Pending |
 
 **Coverage:**
-- v2.0 requirements: 27 total
-- Mapped to phases: 27
-- Unmapped: 0
+- v2.0 requirements: 29 total
+- Mapped to phases: 0 (pending roadmap)
+- Unmapped: 29
 
 ---
-*Requirements defined: 2026-02-21*
-*Last updated: 2026-02-21 after roadmap creation*
+*Requirements defined: 2026-02-22*
+*Last updated: 2026-02-22 after architectural pivot*
