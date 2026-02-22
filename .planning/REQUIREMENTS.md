@@ -88,41 +88,41 @@ Deferred to future milestones.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| STT-01 | TBD | Pending |
-| STT-02 | TBD | Pending |
-| STT-03 | TBD | Pending |
-| STT-04 | TBD | Pending |
-| STT-05 | TBD | Pending |
-| STT-06 | TBD | Pending |
-| DCSN-01 | TBD | Pending |
-| DCSN-02 | TBD | Pending |
-| DCSN-03 | TBD | Pending |
-| DCSN-04 | TBD | Pending |
-| DCSN-05 | TBD | Pending |
-| RESP-01 | TBD | Pending |
-| RESP-02 | TBD | Pending |
-| RESP-03 | TBD | Pending |
-| RESP-04 | TBD | Pending |
-| RESP-05 | TBD | Pending |
-| RESP-06 | TBD | Pending |
-| PRCT-01 | TBD | Pending |
-| PRCT-02 | TBD | Pending |
-| PRCT-03 | TBD | Pending |
-| PRCT-04 | TBD | Pending |
-| PLSH-01 | TBD | Pending |
-| PLSH-02 | TBD | Pending |
-| PLSH-03 | TBD | Pending |
-| PLSH-04 | TBD | Pending |
-| RSRC-01 | TBD | Pending |
-| RSRC-02 | TBD | Pending |
-| RSRC-03 | TBD | Pending |
-| RSRC-04 | TBD | Pending |
+| STT-01 | Phase 12 | Pending |
+| STT-02 | Phase 12 | Pending |
+| STT-03 | Phase 12 | Pending |
+| STT-04 | Phase 12 | Pending |
+| STT-05 | Phase 12 | Pending |
+| STT-06 | Phase 12 | Pending |
+| DCSN-01 | Phase 13 | Pending |
+| DCSN-02 | Phase 13 | Pending |
+| DCSN-03 | Phase 13 | Pending |
+| DCSN-04 | Phase 13 | Pending |
+| DCSN-05 | Phase 13 | Pending |
+| RESP-01 | Phase 14 | Pending |
+| RESP-02 | Phase 14 | Pending |
+| RESP-03 | Phase 14 | Pending |
+| RESP-04 | Phase 14 | Pending |
+| RESP-05 | Phase 14 | Pending |
+| RESP-06 | Phase 14 | Pending |
+| PRCT-01 | Phase 15 | Pending |
+| PRCT-02 | Phase 15 | Pending |
+| PRCT-03 | Phase 15 | Pending |
+| PRCT-04 | Phase 15 | Pending |
+| PLSH-01 | Phase 16 | Pending |
+| PLSH-02 | Phase 16 | Pending |
+| PLSH-03 | Phase 16 | Pending |
+| PLSH-04 | Phase 16 | Pending |
+| RSRC-01 | Phase 14 | Pending |
+| RSRC-02 | Phase 12 | Pending |
+| RSRC-03 | Phase 14 | Pending |
+| RSRC-04 | Phase 12 | Pending |
 
 **Coverage:**
 - v2.0 requirements: 29 total
-- Mapped to phases: 0 (pending roadmap)
-- Unmapped: 29
+- Mapped to phases: 29
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-02-22*
-*Last updated: 2026-02-22 after architectural pivot*
+*Last updated: 2026-02-22 -- All requirements mapped to phases*
