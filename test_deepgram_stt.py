@@ -374,6 +374,142 @@ def test_on_segment_not_for_hallucinations():
 
 
 # ══════════════════════════════════════════════════════════════════
+# Test Group 11: Echo Suppression
+# ══════════════════════════════════════════════════════════════════
+
+@test("Echo exact match is filtered and not emitted")
+def test_echo_exact_match_filtered():
+    """Set recent AI speech, send identical text as speech_final.
+    Verify it is filtered (not emitted to TranscriptBuffer)."""
+    stt, tb = make_stt()
+
+    # Set recent AI speech
+    stt.set_recent_ai_speech(["Hello, how can I help you?"])
+
+    # Send a speech_final matching the AI speech exactly
+    stt._on_message(make_result_event(
+        "Hello, how can I help you?", is_final=True, speech_final=True
+    ))
+
+    assert len(tb) == 0, f"Echo should be filtered, but got {len(tb)} segments"
+
+
+@test("Echo fuzzy match is filtered (partial match above threshold)")
+def test_echo_fuzzy_match_filtered():
+    """Set recent AI speech, send partial/similar text.
+    Verify it is filtered with fuzzy matching (>= 70% similarity)."""
+    stt, tb = make_stt()
+
+    stt.set_recent_ai_speech(["I'd be happy to help with that"])
+
+    # Partial match -- missing last word but still very similar
+    stt._on_message(make_result_event(
+        "I'd be happy to help with", is_final=True, speech_final=True
+    ))
+
+    assert len(tb) == 0, f"Fuzzy echo should be filtered, but got {len(tb)} segments"
+
+
+@test("Echo case-insensitive matching filters different casing/punctuation")
+def test_echo_case_insensitive():
+    """Set recent AI speech with specific casing. Send text with different
+    casing and slight punctuation differences. Verify filtered."""
+    stt, tb = make_stt()
+
+    stt.set_recent_ai_speech(["The answer is forty-two"])
+
+    # Different case, different hyphenation
+    stt._on_message(make_result_event(
+        "the answer is forty two", is_final=True, speech_final=True
+    ))
+
+    assert len(tb) == 0, f"Case-insensitive echo should be filtered, got {len(tb)} segments"
+
+
+@test("Non-echo transcript passes through (not filtered)")
+def test_non_echo_not_filtered():
+    """Set recent AI speech about weather. Send unrelated transcript.
+    Verify it passes through (NOT filtered)."""
+    stt, tb = make_stt()
+
+    stt.set_recent_ai_speech(["The weather is nice today"])
+
+    stt._on_message(make_result_event(
+        "Can you check my calendar?", is_final=True, speech_final=True
+    ))
+
+    assert len(tb) == 1, f"Non-echo should pass through, got {len(tb)} segments"
+    assert tb.get_since(0)[0].text == "Can you check my calendar?"
+
+
+@test("Echo timing window expires -- old AI speech no longer filtered")
+def test_echo_timing_window():
+    """Set recent AI speech, then advance time beyond the echo window.
+    Matching text should pass through because the window expired."""
+    from deepgram_stt import ECHO_WINDOW_SECONDS
+
+    stt, tb = make_stt()
+
+    stt.set_recent_ai_speech(["Hello, how can I help you?"])
+
+    # Manually expire the echo fingerprints by backdating their timestamps
+    stt._echo_fingerprints = [
+        (text, timestamp - ECHO_WINDOW_SECONDS - 1.0)
+        for text, timestamp in stt._echo_fingerprints
+    ]
+
+    # Now send matching text -- should pass through (window expired)
+    stt._on_message(make_result_event(
+        "Hello, how can I help you?", is_final=True, speech_final=True
+    ))
+
+    assert len(tb) == 1, f"Expired echo window should not filter, got {len(tb)} segments"
+
+
+@test("Echo during playback is suppressed by both playback gating and echo filter")
+def test_echo_during_playback_suppressed():
+    """Set playing_audio=True AND set recent AI speech.
+    Verify transcript is suppressed (belt and suspenders)."""
+    stt, tb = make_stt()
+
+    stt.set_recent_ai_speech(["The current time is three o'clock"])
+    stt.set_playing_audio(True)
+
+    stt._on_message(make_result_event(
+        "The current time is three o'clock", is_final=True, speech_final=True
+    ))
+
+    assert len(tb) == 0, "Should be suppressed by playback gating AND echo filter"
+
+
+@test("set_recent_ai_speech updates and replaces echo buffer")
+def test_set_recent_ai_speech_updates_buffer():
+    """Call set_recent_ai_speech with initial sentences, verify buffer updated.
+    Call again with new sentences, verify old ones are replaced."""
+    stt, tb = make_stt()
+
+    # Set initial sentences
+    stt.set_recent_ai_speech(["sentence one", "sentence two"])
+    assert len(stt._echo_fingerprints) == 2, \
+        f"Expected 2 fingerprints, got {len(stt._echo_fingerprints)}"
+
+    # Verify the texts are normalized (lowercased)
+    texts = [fp[0] for fp in stt._echo_fingerprints]
+    assert "sentence one" in texts
+    assert "sentence two" in texts
+
+    # Replace with new sentences
+    stt.set_recent_ai_speech(["new sentence alpha", "new sentence beta", "new sentence gamma"])
+    assert len(stt._echo_fingerprints) == 3, \
+        f"Expected 3 fingerprints after update, got {len(stt._echo_fingerprints)}"
+
+    # Old sentences should be gone
+    texts = [fp[0] for fp in stt._echo_fingerprints]
+    assert "sentence one" not in texts, "Old fingerprints should be replaced"
+    assert "new sentence alpha" in texts
+
+
+# ══════════════════════════════════════════════════════════════════
 # Run all tests
 # ══════════════════════════════════════════════════════════════════
 
