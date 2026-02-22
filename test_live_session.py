@@ -2766,6 +2766,233 @@ def test_buffer_time_eviction():
 
 
 # ══════════════════════════════════════════════════════════════════
+# Test Group 28: ContinuousSTT
+# ══════════════════════════════════════════════════════════════════
+
+@test("ContinuousSTT: speech + silence triggers transcription and segment in buffer")
+async def test_cstt_speech_then_silence():
+    """10 speech chunks + 10 silence chunks -> 1 transcription, 1 segment in buffer."""
+    from transcript_buffer import TranscriptBuffer, TranscriptSegment
+    from continuous_stt import ContinuousSTT
+
+    buf = TranscriptBuffer(max_segments=200, max_age_seconds=300.0)
+    segments_received = []
+
+    def on_seg(seg):
+        segments_received.append(seg)
+
+    cstt = ContinuousSTT(
+        transcript_buffer=buf,
+        vram_monitor=None,
+        aec_device_name=None,
+        on_segment=on_seg,
+    )
+
+    # Mock VAD: first 10 chunks return high prob, next 10 return low
+    chunk_index = [0]
+    original_run_vad = cstt._run_vad
+
+    def mock_vad(audio_bytes):
+        idx = chunk_index[0]
+        chunk_index[0] += 1
+        if idx < 10:
+            return 0.8  # speech
+        return 0.1  # silence
+
+    cstt._run_vad = mock_vad
+
+    # Mock Whisper: return a valid transcript
+    transcribe_calls = []
+
+    def mock_transcribe(pcm_data):
+        transcribe_calls.append(pcm_data)
+        return "hello world"
+
+    cstt._whisper_transcribe = mock_transcribe
+
+    # Feed 20 chunks (10 speech + 10 silence) through the internal queue
+    for i in range(20):
+        audio_data = b'\x01\x00' * 2048  # 4096 bytes
+        await cstt._audio_q.put(audio_data)
+
+    # Signal stop after processing
+    cstt._running = True
+    # Process all chunks
+    await cstt._process_loop_once_for_test(20)
+
+    assert len(transcribe_calls) == 1, f"Expected 1 transcription call, got {len(transcribe_calls)}"
+    assert len(buf) == 1, f"Expected 1 segment in buffer, got {len(buf)}"
+    assert len(segments_received) == 1, f"Expected 1 segment callback, got {len(segments_received)}"
+    assert segments_received[0].text == "hello world"
+    assert segments_received[0].source == "user"
+
+
+@test("ContinuousSTT: hallucination filtered, 0 segments in buffer")
+async def test_cstt_hallucination_filtered():
+    """10 speech chunks + Whisper returns 'thank you' -> hallucination filtered, 0 segments."""
+    from transcript_buffer import TranscriptBuffer
+    from continuous_stt import ContinuousSTT
+
+    buf = TranscriptBuffer(max_segments=200, max_age_seconds=300.0)
+    segments_received = []
+
+    cstt = ContinuousSTT(
+        transcript_buffer=buf,
+        on_segment=lambda seg: segments_received.append(seg),
+    )
+
+    chunk_index = [0]
+    def mock_vad(audio_bytes):
+        idx = chunk_index[0]
+        chunk_index[0] += 1
+        if idx < 10:
+            return 0.8
+        return 0.1
+
+    cstt._run_vad = mock_vad
+    cstt._whisper_transcribe = lambda pcm: "thank you"
+
+    for i in range(20):
+        await cstt._audio_q.put(b'\x01\x00' * 2048)
+
+    cstt._running = True
+    await cstt._process_loop_once_for_test(20)
+
+    assert len(buf) == 0, f"Expected 0 segments (hallucination filtered), got {len(buf)}"
+    assert len(segments_received) == 0, f"Expected 0 segment callbacks, got {len(segments_received)}"
+
+
+@test("ContinuousSTT: safety cap fires after MAX_BUFFER_SECONDS")
+async def test_cstt_safety_cap():
+    """120+ continuous speech chunks (>10s) -> safety cap fires, transcription called."""
+    from transcript_buffer import TranscriptBuffer
+    from continuous_stt import ContinuousSTT
+
+    buf = TranscriptBuffer(max_segments=200, max_age_seconds=300.0)
+    transcribe_calls = []
+
+    cstt = ContinuousSTT(transcript_buffer=buf)
+
+    # All chunks are speech (no silence to trigger normal transcription)
+    cstt._run_vad = lambda audio_bytes: 0.8
+    def mock_transcribe(pcm):
+        transcribe_calls.append(len(pcm))
+        return "long speech segment"
+    cstt._whisper_transcribe = mock_transcribe
+
+    # MAX_BUFFER_CHUNKS = ~118 (10s / 85ms). Feed 130 chunks.
+    for i in range(130):
+        await cstt._audio_q.put(b'\x01\x00' * 2048)
+
+    cstt._running = True
+    await cstt._process_loop_once_for_test(130)
+
+    assert len(transcribe_calls) >= 1, f"Safety cap should trigger at least 1 transcription, got {len(transcribe_calls)}"
+    assert len(buf) >= 1, f"Expected at least 1 segment from safety cap, got {len(buf)}"
+
+
+@test("ContinuousSTT: all silence -> no transcription")
+async def test_cstt_all_silence():
+    """All silence chunks -> no transcription called."""
+    from transcript_buffer import TranscriptBuffer
+    from continuous_stt import ContinuousSTT
+
+    buf = TranscriptBuffer(max_segments=200, max_age_seconds=300.0)
+    transcribe_calls = []
+
+    cstt = ContinuousSTT(transcript_buffer=buf)
+    cstt._run_vad = lambda audio_bytes: 0.05  # all silence
+    cstt._whisper_transcribe = lambda pcm: (transcribe_calls.append(1), "noise")[1]
+
+    for i in range(30):
+        await cstt._audio_q.put(b'\x00' * 4096)
+
+    cstt._running = True
+    await cstt._process_loop_once_for_test(30)
+
+    assert len(transcribe_calls) == 0, f"Expected 0 transcription calls for silence, got {len(transcribe_calls)}"
+    assert len(buf) == 0, f"Expected 0 segments for silence, got {len(buf)}"
+
+
+@test("ContinuousSTT: AEC device fallback")
+async def test_cstt_aec_fallback():
+    """AEC device 'Echo Cancellation Source' not available -> falls back to None."""
+    from continuous_stt import ContinuousSTT
+    from transcript_buffer import TranscriptBuffer
+
+    buf = TranscriptBuffer()
+
+    # Mock pasimple to fail on AEC device
+    mock_pasimple = MagicMock()
+    def mock_pa_init(*args, **kwargs):
+        if kwargs.get('device_name') == "Echo Cancellation Source":
+            raise Exception("No such device")
+        return MagicMock()
+    mock_pasimple.PaSimple = mock_pa_init
+    mock_pasimple.PA_STREAM_RECORD = 1
+    mock_pasimple.PA_SAMPLE_S16LE = 3
+
+    cstt = ContinuousSTT(
+        transcript_buffer=buf,
+        aec_device_name="Echo Cancellation Source",
+    )
+
+    with patch.dict('sys.modules', {'pasimple': mock_pasimple}):
+        device = cstt._resolve_device()
+
+    assert device is None, f"Should fall back to None (default mic), got '{device}'"
+
+
+@test("ContinuousSTT: stats tracking")
+async def test_cstt_stats():
+    """After processing segments, stats reflect segment and hallucination counts."""
+    from transcript_buffer import TranscriptBuffer
+    from continuous_stt import ContinuousSTT
+
+    buf = TranscriptBuffer(max_segments=200, max_age_seconds=300.0)
+
+    cstt = ContinuousSTT(transcript_buffer=buf)
+
+    # Simulate some processed segments
+    cstt._segment_count = 5
+    cstt._hallucination_count = 2
+    cstt._whisper_latencies = [100.0, 150.0, 200.0]
+
+    stats = cstt.stats
+    assert stats['segment_count'] == 5, f"Expected segment_count=5, got {stats['segment_count']}"
+    assert stats['hallucination_count'] == 2, f"Expected hallucination_count=2, got {stats['hallucination_count']}"
+    assert stats['avg_latency_ms'] == 150.0, f"Expected avg_latency_ms=150.0, got {stats['avg_latency_ms']}"
+    assert stats['buffer_depth'] == 0, f"Expected buffer_depth=0, got {stats['buffer_depth']}"
+
+
+@test("ContinuousSTT: non-speech audio does not accumulate")
+async def test_cstt_non_speech_no_accumulate():
+    """VAD < 0.5 chunks do not accumulate in the speech buffer."""
+    from transcript_buffer import TranscriptBuffer
+    from continuous_stt import ContinuousSTT
+
+    buf = TranscriptBuffer()
+    cstt = ContinuousSTT(transcript_buffer=buf)
+    cstt._run_vad = lambda audio_bytes: 0.2  # below threshold
+
+    for i in range(20):
+        await cstt._audio_q.put(b'\x00' * 4096)
+
+    cstt._running = True
+    await cstt._process_loop_once_for_test(20)
+
+    # The internal audio buffer should be empty (nothing accumulated)
+    assert len(cstt._audio_buffer) == 0, f"Speech buffer should be empty, got {len(cstt._audio_buffer)} bytes"
+
+
+@test("ContinuousSTT: uses distil-large-v3 model")
+def test_cstt_model_name():
+    """ContinuousSTT uses distil-large-v3, not large-v3."""
+    from continuous_stt import ContinuousSTT, WHISPER_MODEL_NAME
+    assert WHISPER_MODEL_NAME == "distil-large-v3", f"Expected distil-large-v3, got {WHISPER_MODEL_NAME}"
+
+
+# ══════════════════════════════════════════════════════════════════
 # Run all tests
 # ══════════════════════════════════════════════════════════════════
 
