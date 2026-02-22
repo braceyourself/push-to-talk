@@ -53,6 +53,10 @@ RECONNECT_MAX_DELAY = 30.0    # backoff cap
 MAX_RECONNECT_ATTEMPTS = 10
 PLAYBACK_COOLDOWN = 0.3       # seconds after TTS ends before accepting transcripts
 
+# Echo suppression (defense-in-depth alongside PipeWire AEC)
+ECHO_WINDOW_SECONDS = 5.0          # how long AI speech fingerprints remain active
+ECHO_SIMILARITY_THRESHOLD = 0.7    # SequenceMatcher ratio above which text is echo
+
 # Stats reporting
 STATS_INTERVAL_SECONDS = 5.0
 
@@ -103,6 +107,9 @@ class DeepgramSTT:
         # VAD (reuse Silero ONNX)
         self._vad_model = None
         self._vad_state = None
+
+        # Echo suppression: fingerprints of recent AI speech [(normalized_text, timestamp)]
+        self._echo_fingerprints = []
 
         # Transcript accumulation (between is_final segments until speech_final)
         self._accumulated_finals = []
@@ -190,6 +197,20 @@ class DeepgramSTT:
         self._playing_audio = playing
         if not playing:
             self._playback_end_time = time.time()
+
+    def set_recent_ai_speech(self, sentences):
+        """Update the echo fingerprint buffer with recent AI speech.
+
+        Called by LiveSession when the AI generates speech. These
+        fingerprints are compared against incoming transcripts to detect
+        echo (AI speech leaking through AEC into the mic signal).
+
+        Args:
+            sentences: list of strings the AI recently spoke
+        """
+        self._echo_fingerprints = [
+            (s.lower().strip(), time.time()) for s in sentences if s.strip()
+        ]
 
     # ── Connection lifecycle ──────────────────────────────────────
 
@@ -321,6 +342,43 @@ class DeepgramSTT:
         """Handle WebSocket error event."""
         print(f"DeepgramSTT: Error: {error}", flush=True)
 
+    # ── Echo suppression ──────────────────────────────────────────
+
+    def _is_echo(self, text):
+        """Check if transcript matches recent AI speech (echo leak through AEC).
+
+        PipeWire AEC is the primary echo cancellation layer, but residual
+        echo can leak through -- especially with cloud STT where network
+        latency widens the timing window. This provides defense-in-depth
+        by comparing incoming transcripts against recent AI speech using
+        fuzzy matching within a timing window.
+
+        Returns True if the text is likely echo (should be filtered).
+        """
+        if not self._echo_fingerprints:
+            return False
+
+        from difflib import SequenceMatcher
+
+        now = time.time()
+        normalized = text.lower().strip()
+
+        for ai_text, timestamp in self._echo_fingerprints:
+            # Skip expired fingerprints
+            if now - timestamp > ECHO_WINDOW_SECONDS:
+                continue
+
+            # Fuzzy match using SequenceMatcher
+            ratio = SequenceMatcher(None, normalized, ai_text).ratio()
+            if ratio > ECHO_SIMILARITY_THRESHOLD:
+                return True
+
+            # Substring check: if the transcript is contained within AI speech
+            if len(normalized) > 5 and normalized in ai_text:
+                return True
+
+        return False
+
     # ── Transcript emission ───────────────────────────────────────
 
     def _emit_transcript(self, text):
@@ -329,6 +387,11 @@ class DeepgramSTT:
         if self._playing_audio:
             return
         if time.time() - self._playback_end_time < PLAYBACK_COOLDOWN:
+            return
+
+        # Echo suppression: filter transcripts matching recent AI speech
+        if self._is_echo(text):
+            print(f"DeepgramSTT: Filtered echo: \"{text}\"", flush=True)
             return
 
         # Hallucination filter (reuse existing)
