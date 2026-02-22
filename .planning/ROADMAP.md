@@ -61,7 +61,13 @@ Phases 10-11 (library growth, non-speech) folded into v2.0 as PLSH-01/02/03.
   3. Deepgram WebSocket transitions between active (streaming audio), idle (KeepAlive, free), and sleep (disconnected) based on speech activity -- idle and sleep periods cost nothing
   4. When network drops mid-sentence, system reconnects and no audio is permanently lost -- Whisper loads as fallback if Deepgram stays unreachable
   5. A full 8-hour session with ~30 min actual speech stays under $0.30 Deepgram cost and the transcript buffer stays bounded (no memory growth)
-**Plans**: TBD
+**Plans:** 5 plans
+Plans:
+- [ ] 12-01-PLAN.md — TDD: DeepgramSTT core class (WebSocket, VAD lifecycle, transcript accumulation)
+- [ ] 12-02-PLAN.md — Config/requirements update (SDK pin, API key wiring)
+- [ ] 12-03-PLAN.md — TDD: Echo suppression (transcript fingerprinting)
+- [ ] 12-04-PLAN.md — Live session integration (rewrite _stt_stage, wire DeepgramSTT)
+- [ ] 12-05-PLAN.md — Integration tests, pipeline diagram, deployment verification
 
 ### Phase 13: Decision Engine + Name Activation
 **Goal**: A local LLM monitors the transcript stream and reliably decides when to respond -- always answering when addressed by name, never responding to background noise or TV dialogue
@@ -120,7 +126,7 @@ Phases execute in numeric order: 12 -> 13 -> 14 -> 15 -> 16
 | 9. Semantic Matching + Pipeline Polish | v1.2 | 3/3 | Complete | 2026-02-20 |
 | 10. Library Growth + Pruning | v1.2 | -- | Deferred to v2.0 (PLSH-02/03) | -- |
 | 11. Non-Speech Awareness | v1.2 | -- | Deferred to v2.0 (PLSH-01) | -- |
-| 12. Deepgram Streaming Infrastructure | v2.0 | 0/TBD | Not started | - |
+| 12. Deepgram Streaming Infrastructure | v2.0 | 0/5 | Planned | - |
 | 13. Decision Engine + Name Activation | v2.0 | 0/TBD | Not started | - |
 | 14. Response Backend + Integration | v2.0 | 0/TBD | Not started | - |
 | 15. Proactive Participation | v2.0 | 0/TBD | Not started | - |
