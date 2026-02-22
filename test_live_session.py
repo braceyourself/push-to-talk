@@ -3177,6 +3177,56 @@ def test_stop_calls_deepgram_stop():
 
 
 # ══════════════════════════════════════════════════════════════════
+# Test Group 30: Deepgram Pipeline Integration (Plan 12-05)
+# ══════════════════════════════════════════════════════════════════
+
+@test("DeepgramSTT: _stt_stage tags frames with correct generation_id")
+async def test_stt_stage_generation_id_tagging():
+    """Emitted frames should carry the session's current generation_id."""
+    from transcript_buffer import TranscriptSegment
+
+    session = make_session()
+    session.running = True
+    session._stt_out_q = asyncio.Queue(maxsize=50)
+    session._stt_flush_event = asyncio.Event()
+    session._deepgram_transcript_q = asyncio.Queue(maxsize=50)
+    session.generation_id = 42  # Non-zero to confirm tagging, not default
+    session._bus = None
+
+    segment = TranscriptSegment(text="Generation check", timestamp=time.time(), source="user")
+    await session._deepgram_transcript_q.put(segment)
+
+    async def run_stt_briefly():
+        task = asyncio.create_task(session._stt_stage())
+        await asyncio.sleep(0.2)
+        session.running = False
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    await run_stt_briefly()
+
+    frames = []
+    while not session._stt_out_q.empty():
+        frames.append(session._stt_out_q.get_nowait())
+
+    assert len(frames) == 2, f"Expected 2 frames (EOU + TRANSCRIPT), got {len(frames)}"
+
+    eou_frame = frames[0]
+    transcript_frame = frames[1]
+
+    assert eou_frame.type == FrameType.END_OF_UTTERANCE
+    assert eou_frame.generation_id == 42, f"EOU frame generation_id should be 42, got {eou_frame.generation_id}"
+
+    assert transcript_frame.type == FrameType.TRANSCRIPT
+    assert transcript_frame.generation_id == 42, f"TRANSCRIPT frame generation_id should be 42, got {transcript_frame.generation_id}"
+    assert transcript_frame.data == "Generation check"
+
+
+# ══════════════════════════════════════════════════════════════════
 # Run all tests
 # ══════════════════════════════════════════════════════════════════
 
