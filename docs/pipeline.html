@@ -48,21 +48,33 @@ graph TD
         SIG["live_mute_toggle"] -.-> |"50ms async poll"| MIC
     end
 
-    subgraph "Stage 2: STT"
-        AIQ --> BRANCH{State?}
-        BRANCH --> |muted| DISCARD["discard"]
-        BRANCH --> |"gated · AI speaking"| VAD["VAD barge-in"]
-        VAD --> |"6 chunks · ~500ms"| BARGE["trigger_barge_in"]
-        BRANCH --> |normal| BUF["Buffer audio + track RMS"]
+    subgraph "DeepgramSTT · Parallel Component"
+        direction LR
+        DGCAP["Audio Capture<br/>pasimple thread"] --> DGVAD["Silero VAD<br/>lifecycle gating"]
+        DGVAD --> |Active| DGWS["Deepgram WebSocket<br/>Nova-3 streaming"]
+        DGVAD --> |Idle| DGKA["KeepAlive<br/>heartbeat"]
+        DGVAD --> |Sleep| DGDC["Disconnect<br/>reconnect on speech"]
+        DGWS --> |"is_final + speech_final<br/>accumulation"| DGBUF["TranscriptBuffer"]
+        DGBUF --> ECHO{"Echo Suppression<br/>fingerprint match?"}
+        ECHO --> |echo| DGREJ["reject"]
+        ECHO --> |"not echo"| HALLUC2{"Hallucination?"}
+        HALLUC2 --> |yes| DGREJ
+        HALLUC2 --> |no| DTQ[("_deepgram_transcript_q")]
+    end
 
-        BUF --> TRIGGER{Transcribe?}
-        TRIGGER --> |"0.8s silence + speech"| WHISPER
-        TRIGGER --> |"10s safety cap"| WHISPER
-        TRIGGER --> |"flush · mic muted"| WHISPER
+    subgraph "Stage 2: STT Consumer"
+        DTQ --> STTBRANCH{State?}
+        STTBRANCH --> |muted| DISCARD["discard"]
+        STTBRANCH --> |"_stt_gated"| GATED["discard + set _was_stt_gated"]
+        STTBRANCH --> |"was_gated transition"| TDISC["discard post-echo segment"]
+        STTBRANCH --> |normal| SOQ[("_stt_out_q<br/>EOU + TRANSCRIPT frames")]
+    end
 
-        WHISPER["Whisper STT"] --> HALLUC{Hallucination?}
-        HALLUC --> |yes| REJECT["reject"]
-        HALLUC --> |no| SOQ[("stt_out_q")]
+    subgraph "Stage 2b: Barge-in VAD"
+        AIQ --> BARGEV{State?}
+        BARGEV --> |"not gated"| DRAIN["drain queue"]
+        BARGEV --> |"_stt_gated + barge_in_enabled"| BVAD["VAD speech detection"]
+        BVAD --> |"6+ chunks sustained"| BARGE["trigger_barge_in"]
     end
 
     subgraph "Stage 3: LLM"
@@ -73,7 +85,7 @@ graph TD
         FORK --> CLI
 
         subgraph "Filler Path · concurrent"
-            FILLER["_filler_manager"] --> CLASS["Classifier IPC · <5ms"]
+            FILLER["_filler_manager"] --> CLASS["Classifier IPC · lt 5ms"]
             CLASS --> |"heuristic · short"| CAT
             CLASS --> |"semantic · longer"| CAT
             CAT["task · question · conversational · social · emotional · ack"]
@@ -122,17 +134,23 @@ graph TD
 
     subgraph "Stage 5: Playback"
         AOQ --> PA["PyAudio output"]
-        PA --> |"playing = true"| VAD
-        PA --> |END_OF_TURN| UNMUTE["unmute · listening"]
+        PA --> |"playing = true<br/>_stt_gated = true"| BARGEV
+        PA --> |"_spoken_sentences"| ECHOFP["set_recent_ai_speech<br/>echo fingerprints"]
+        ECHOFP -.-> ECHO
+        PA --> |END_OF_TURN| UNMUTE["unmute · _stt_gated = false"]
     end
 
     style BARGE fill:#ff6b6b,color:#fff
-    style WHISPER fill:#4ecdc4,color:#fff
+    style DGWS fill:#4ecdc4,color:#fff
+    style DGVAD fill:#45b7d1,color:#fff
     style CLASS fill:#45b7d1,color:#fff
     style TTS fill:#96ceb4,color:#fff
     style PA fill:#ffeaa7,color:#333
     style CLIP fill:#dda0dd,color:#333
     style TOOL fill:#f0ad4e,color:#fff
+    style ECHO fill:#ff9ff3,color:#333
+    style DGKA fill:#feca57,color:#333
+    style DGDC fill:#576574,color:#fff
     </pre>
   </div>
 </div>
