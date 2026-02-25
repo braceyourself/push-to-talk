@@ -10,10 +10,13 @@ import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, GLib, Pango
 import cairo
+import math
 import os
 import json
+import struct
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -117,8 +120,6 @@ def save_openai_api_key(key):
 
 LOG_CMD = ['journalctl', '--user', '-u', 'push-to-talk', '-n', '5', '--no-pager', '-o', 'cat']
 DOT_SIZE = 20
-PILL_WIDTH = 120
-PILL_HEIGHT = 28
 CORNER_MARGIN = 10
 
 # Colors for each status
@@ -1211,6 +1212,192 @@ class StatusPopup(Gtk.Window):
         self.show_all()
 
 
+class GlowOverlay(Gtk.Window):
+    """Fullscreen transparent overlay with audio-reactive glowing borders."""
+
+    GLOW_BASE = 8        # minimum glow width (px) when silent
+    GLOW_MAX = 50        # maximum glow width (px) at peak speech
+    SMOOTHING = 0.25     # EMA factor — lower = smoother
+
+    def __init__(self):
+        super().__init__()
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_accept_focus(False)
+        self.set_app_paintable(True)
+        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        self.stick()  # show on all workspaces
+
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+
+        # Cover primary monitor
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor()
+        if monitor:
+            geom = monitor.get_geometry()
+            self.move(geom.x, geom.y)
+            self.set_default_size(geom.width, geom.height)
+            self.resize(geom.width, geom.height)
+        else:
+            self.fullscreen()
+
+        self.connect('realize', self._make_click_through)
+        self.connect('draw', self._on_draw)
+
+        self._level = 0.0          # smoothed audio level 0..1
+        self._raw_level = 0.0      # latest raw level
+        self._monitoring = False
+        self._audio_thread = None
+        self._update_timer = None
+
+    def _make_click_through(self, widget):
+        """Input passes through to windows below."""
+        region = cairo.Region(cairo.RectangleInt(0, 0, 0, 0))
+        self.get_window().input_shape_combine_region(region, 0, 0)
+
+    def _on_draw(self, widget, cr):
+        cr.set_operator(1)  # CLEAR
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+
+        w = self.get_allocated_width()
+        h = self.get_allocated_height()
+        level = self._level
+
+        # Glow parameters
+        base_alpha = 0.35
+        peak_alpha = 0.9
+        alpha = base_alpha + level * (peak_alpha - base_alpha)
+        glow_w = self.GLOW_BASE + level * (self.GLOW_MAX - self.GLOW_BASE)
+
+        # Red-crimson glow color
+        r, g, b = 0.95, 0.15, 0.1
+
+        # Corner boost: brighter corners give a nice framing effect
+        corner_size = glow_w * 1.6
+
+        # --- Draw 4 edge gradients ---
+        # Top
+        grad = cairo.LinearGradient(0, 0, 0, glow_w)
+        grad.add_color_stop_rgba(0, r, g, b, alpha)
+        grad.add_color_stop_rgba(1, r, g, b, 0)
+        cr.set_source(grad)
+        cr.rectangle(0, 0, w, glow_w)
+        cr.fill()
+
+        # Bottom
+        grad = cairo.LinearGradient(0, h, 0, h - glow_w)
+        grad.add_color_stop_rgba(0, r, g, b, alpha)
+        grad.add_color_stop_rgba(1, r, g, b, 0)
+        cr.set_source(grad)
+        cr.rectangle(0, h - glow_w, w, glow_w)
+        cr.fill()
+
+        # Left
+        grad = cairo.LinearGradient(0, 0, glow_w, 0)
+        grad.add_color_stop_rgba(0, r, g, b, alpha)
+        grad.add_color_stop_rgba(1, r, g, b, 0)
+        cr.set_source(grad)
+        cr.rectangle(0, 0, glow_w, h)
+        cr.fill()
+
+        # Right
+        grad = cairo.LinearGradient(w, 0, w - glow_w, 0)
+        grad.add_color_stop_rgba(0, r, g, b, alpha)
+        grad.add_color_stop_rgba(1, r, g, b, 0)
+        cr.set_source(grad)
+        cr.rectangle(w - glow_w, 0, glow_w, h)
+        cr.fill()
+
+        # --- Corner radial glows for extra punch ---
+        corners = [(0, 0), (w, 0), (0, h), (w, h)]
+        for cx, cy in corners:
+            grad = cairo.RadialGradient(cx, cy, 0, cx, cy, corner_size)
+            grad.add_color_stop_rgba(0, r, g, b, alpha * 0.7)
+            grad.add_color_stop_rgba(1, r, g, b, 0)
+            cr.set_source(grad)
+            cr.rectangle(
+                cx - corner_size, cy - corner_size,
+                corner_size * 2, corner_size * 2
+            )
+            cr.fill()
+
+        return False
+
+    # --- Public API ---
+
+    def start(self):
+        """Show the glow and start audio-reactive monitoring."""
+        self._monitoring = True
+        self._level = 0.0
+        self._raw_level = 0.0
+        self.show_all()
+        # Re-apply click-through after show
+        if self.get_window():
+            region = cairo.Region(cairo.RectangleInt(0, 0, 0, 0))
+            self.get_window().input_shape_combine_region(region, 0, 0)
+        self._update_timer = GLib.timeout_add(33, self._tick)  # ~30 fps
+        self._audio_thread = threading.Thread(target=self._monitor_audio, daemon=True)
+        self._audio_thread.start()
+
+    def stop(self):
+        """Hide the glow and stop monitoring."""
+        self._monitoring = False
+        if self._update_timer:
+            GLib.source_remove(self._update_timer)
+            self._update_timer = None
+        self._level = 0.0
+        self.hide()
+
+    def _tick(self):
+        """Smooth the level and redraw."""
+        if not self._monitoring:
+            return False
+        # Exponential moving average
+        self._level += self.SMOOTHING * (self._raw_level - self._level)
+        self.queue_draw()
+        return True
+
+    def _monitor_audio(self):
+        """Capture mic input and compute RMS in a background thread."""
+        try:
+            import pyaudio
+        except ImportError:
+            print("GlowOverlay: pyaudio not available, static glow only", flush=True)
+            self._raw_level = 0.3  # fallback: constant moderate glow
+            return
+
+        pa = pyaudio.PyAudio()
+        stream = None
+        try:
+            stream = pa.open(
+                format=pyaudio.paInt16, channels=1, rate=16000,
+                input=True, frames_per_buffer=1024
+            )
+            while self._monitoring:
+                data = stream.read(1024, exception_on_overflow=False)
+                samples = struct.unpack(f'{len(data) // 2}h', data)
+                rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
+                # Map RMS to 0..1  (speech ~500-8000, whisper ~200-500)
+                self._raw_level = min(1.0, max(0.0, (rms - 150) / 5000))
+        except Exception as e:
+            print(f"GlowOverlay audio error: {e}", flush=True)
+            self._raw_level = 0.3
+        finally:
+            if stream:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except:
+                    pass
+            pa.terminate()
+
+
 class StatusIndicator(Gtk.Window):
     def __init__(self):
         super().__init__()
@@ -1220,11 +1407,8 @@ class StatusIndicator(Gtk.Window):
         self.popup = None
         self.hover_timeout = None
 
-        # Recording pill animation
-        self.pulse_alpha = 0.9
-        self.pulse_direction = -1  # -1 = dimming, 1 = brightening
-        self.pulse_timer = None
-        self.is_expanded = False
+        # Glow overlay for recording
+        self.glow_overlay = GlowOverlay()
 
         # Drag state
         self.dragging = False
@@ -1295,49 +1479,19 @@ class StatusIndicator(Gtk.Window):
         self.show_all()
 
     def on_draw(self, widget, cr):
-        import math
         cr.set_operator(1)
         cr.set_source_rgba(0, 0, 0, 0)
         cr.paint()
 
-        if self.is_expanded:
-            # Draw pill shape with recording indicator
-            w, h = PILL_WIDTH, PILL_HEIGHT
-            radius = h / 2
-            alpha = self.pulse_alpha
+        color = COLORS.get(self.status, COLORS['idle'])
+        cr.set_source_rgba(*color)
+        cr.arc(DOT_SIZE / 2, DOT_SIZE / 2, DOT_SIZE / 2 - 2, 0, 2 * math.pi)
+        cr.fill()
 
-            # Dark semi-transparent background
-            cr.set_source_rgba(0.1, 0.1, 0.1, 0.85)
-            cr.new_path()
-            cr.arc(radius, h / 2, radius, math.pi / 2, 3 * math.pi / 2)
-            cr.arc(w - radius, h / 2, radius, -math.pi / 2, math.pi / 2)
-            cr.close_path()
-            cr.fill()
-
-            # Pulsing red recording dot
-            dot_x = 16
-            dot_y = h / 2
-            cr.set_source_rgba(1.0, 0.2, 0.2, alpha)
-            cr.arc(dot_x, dot_y, 5, 0, 2 * math.pi)
-            cr.fill()
-
-            # "Dictating" text
-            cr.set_source_rgba(1.0, 1.0, 1.0, 0.95)
-            cr.select_font_face("Sans", 0, 0)
-            cr.set_font_size(12)
-            cr.move_to(28, h / 2 + 4)
-            cr.show_text("Dictating...")
-        else:
-            # Normal dot
-            color = COLORS.get(self.status, COLORS['idle'])
-            cr.set_source_rgba(*color)
-            cr.arc(DOT_SIZE / 2, DOT_SIZE / 2, DOT_SIZE / 2 - 2, 0, 2 * math.pi)
-            cr.fill()
-
-            cr.set_source_rgba(0.2, 0.2, 0.2, 0.5)
-            cr.set_line_width(1)
-            cr.arc(DOT_SIZE / 2, DOT_SIZE / 2, DOT_SIZE / 2 - 2, 0, 2 * math.pi)
-            cr.stroke()
+        cr.set_source_rgba(0.2, 0.2, 0.2, 0.5)
+        cr.set_line_width(1)
+        cr.arc(DOT_SIZE / 2, DOT_SIZE / 2, DOT_SIZE / 2 - 2, 0, 2 * math.pi)
+        cr.stroke()
 
         return False
 
@@ -1483,53 +1637,19 @@ class StatusIndicator(Gtk.Window):
             GLib.source_remove(self.success_timeout)
             self.success_timeout = None
 
+        old_status = self.status
         self.status = status
 
-        if status == 'recording' and not self.is_expanded:
-            self._expand_pill()
-        elif status != 'recording' and self.is_expanded:
-            self._collapse_pill()
+        # Glow overlay: show on recording, hide otherwise
+        if status == 'recording' and old_status != 'recording':
+            self.glow_overlay.start()
+        elif status != 'recording' and old_status == 'recording':
+            self.glow_overlay.stop()
 
         self.queue_draw()
 
         if status == 'success':
             self.success_timeout = GLib.timeout_add(1500, self.return_to_idle)
-
-    def _expand_pill(self):
-        """Expand from dot to recording pill."""
-        self.is_expanded = True
-        self.pulse_alpha = 0.9
-        self.pulse_direction = -1
-        self.set_default_size(PILL_WIDTH, PILL_HEIGHT)
-        self.resize(PILL_WIDTH, PILL_HEIGHT)
-        # Shift left so pill is roughly centered on the original dot position
-        self.move(self.pos_x - (PILL_WIDTH - DOT_SIZE) // 2, self.pos_y - (PILL_HEIGHT - DOT_SIZE) // 2)
-        self.pulse_timer = GLib.timeout_add(50, self._pulse_tick)
-
-    def _collapse_pill(self):
-        """Collapse from pill back to dot."""
-        self.is_expanded = False
-        if self.pulse_timer:
-            GLib.source_remove(self.pulse_timer)
-            self.pulse_timer = None
-        self.set_default_size(DOT_SIZE, DOT_SIZE)
-        self.resize(DOT_SIZE, DOT_SIZE)
-        self.move(self.pos_x, self.pos_y)
-
-    def _pulse_tick(self):
-        """Animate the recording dot pulse."""
-        if not self.is_expanded:
-            self.pulse_timer = None
-            return False
-        self.pulse_alpha += self.pulse_direction * 0.04
-        if self.pulse_alpha <= 0.3:
-            self.pulse_alpha = 0.3
-            self.pulse_direction = 1
-        elif self.pulse_alpha >= 0.9:
-            self.pulse_alpha = 0.9
-            self.pulse_direction = -1
-        self.queue_draw()
-        return True
 
     def return_to_idle(self):
         self.status = 'idle'
