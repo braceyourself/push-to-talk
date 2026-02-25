@@ -1215,9 +1215,9 @@ class StatusPopup(Gtk.Window):
 class GlowOverlay(Gtk.Window):
     """Fullscreen transparent overlay with audio-reactive glowing borders."""
 
-    GLOW_BASE = 8        # minimum glow width (px) when silent
-    GLOW_MAX = 50        # maximum glow width (px) at peak speech
-    SMOOTHING = 0.25     # EMA factor — lower = smoother
+    GLOW_BASE = 20       # minimum glow width (px) when silent
+    GLOW_MAX = 120       # maximum glow width (px) at peak speech
+    SMOOTHING = 0.3      # EMA factor — lower = smoother
 
     def __init__(self):
         super().__init__()
@@ -1269,17 +1269,17 @@ class GlowOverlay(Gtk.Window):
         h = self.get_allocated_height()
         level = self._level
 
-        # Glow parameters
-        base_alpha = 0.35
-        peak_alpha = 0.9
+        # Glow parameters — punchy and unmissable
+        base_alpha = 0.55
+        peak_alpha = 1.0
         alpha = base_alpha + level * (peak_alpha - base_alpha)
         glow_w = self.GLOW_BASE + level * (self.GLOW_MAX - self.GLOW_BASE)
 
-        # Red-crimson glow color
-        r, g, b = 0.95, 0.15, 0.1
+        # Hot red-orange glow color
+        r, g, b = 1.0, 0.12, 0.05
 
         # Corner boost: brighter corners give a nice framing effect
-        corner_size = glow_w * 1.6
+        corner_size = glow_w * 2.0
 
         # --- Draw 4 edge gradients ---
         # Top
@@ -1318,7 +1318,8 @@ class GlowOverlay(Gtk.Window):
         corners = [(0, 0), (w, 0), (0, h), (w, h)]
         for cx, cy in corners:
             grad = cairo.RadialGradient(cx, cy, 0, cx, cy, corner_size)
-            grad.add_color_stop_rgba(0, r, g, b, alpha * 0.7)
+            grad.add_color_stop_rgba(0, r, g, b, alpha * 0.9)
+            grad.add_color_stop_rgba(0.3, r, g, b, alpha * 0.5)
             grad.add_color_stop_rgba(1, r, g, b, 0)
             cr.set_source(grad)
             cr.rectangle(
