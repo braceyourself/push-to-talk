@@ -1888,6 +1888,7 @@ class TrayIndicator:
     def __init__(self):
         self.status = 'idle'
         self.success_timeout = None
+        self.glow_overlay = GlowOverlay()
         self.icon_dir = tempfile.mkdtemp(prefix='ptt-icons-')
         self.icon_paths = {}
 
@@ -1988,10 +1989,16 @@ class TrayIndicator:
             GLib.source_remove(self.success_timeout)
             self.success_timeout = None
 
+        old_status = self.status
         self.status = status
         icon_path = self.icon_paths.get(status, self.icon_paths['idle'])
         self.indicator.set_icon_full(icon_path, STATUS_TEXT.get(status, status))
-        self.status_item.set_label(STATUS_TEXT.get(status, status))
+
+        # Glow overlay: show on recording, hide otherwise
+        if status == 'recording' and old_status != 'recording':
+            self.glow_overlay.start()
+        elif status != 'recording' and old_status == 'recording':
+            self.glow_overlay.stop()
 
         if status == 'success':
             self.success_timeout = GLib.timeout_add(1500, self.return_to_idle)
@@ -2000,7 +2007,6 @@ class TrayIndicator:
         self.status = 'idle'
         icon_path = self.icon_paths.get('idle')
         self.indicator.set_icon_full(icon_path, 'Idle - Ready')
-        self.status_item.set_label('Idle - Ready')
         self.success_timeout = None
         STATUS_FILE.write_text('idle')
         return False
