@@ -117,6 +117,8 @@ def save_openai_api_key(key):
 
 LOG_CMD = ['journalctl', '--user', '-u', 'push-to-talk', '-n', '5', '--no-pager', '-o', 'cat']
 DOT_SIZE = 20
+PILL_WIDTH = 120
+PILL_HEIGHT = 28
 CORNER_MARGIN = 10
 
 # Colors for each status
@@ -1218,6 +1220,12 @@ class StatusIndicator(Gtk.Window):
         self.popup = None
         self.hover_timeout = None
 
+        # Recording pill animation
+        self.pulse_alpha = 0.9
+        self.pulse_direction = -1  # -1 = dimming, 1 = brightening
+        self.pulse_timer = None
+        self.is_expanded = False
+
         # Drag state
         self.dragging = False
         self.drag_start_x = 0
@@ -1232,7 +1240,6 @@ class StatusIndicator(Gtk.Window):
         self.set_accept_focus(False)
         self.set_app_paintable(True)
         self.set_default_size(DOT_SIZE, DOT_SIZE)
-        self.set_resizable(False)
         self.set_type_hint(Gdk.WindowTypeHint.DOCK)
 
         # Enable events
@@ -1288,19 +1295,49 @@ class StatusIndicator(Gtk.Window):
         self.show_all()
 
     def on_draw(self, widget, cr):
+        import math
         cr.set_operator(1)
         cr.set_source_rgba(0, 0, 0, 0)
         cr.paint()
 
-        color = COLORS.get(self.status, COLORS['idle'])
-        cr.set_source_rgba(*color)
-        cr.arc(DOT_SIZE / 2, DOT_SIZE / 2, DOT_SIZE / 2 - 2, 0, 2 * 3.14159)
-        cr.fill()
+        if self.is_expanded:
+            # Draw pill shape with recording indicator
+            w, h = PILL_WIDTH, PILL_HEIGHT
+            radius = h / 2
+            alpha = self.pulse_alpha
 
-        cr.set_source_rgba(0.2, 0.2, 0.2, 0.5)
-        cr.set_line_width(1)
-        cr.arc(DOT_SIZE / 2, DOT_SIZE / 2, DOT_SIZE / 2 - 2, 0, 2 * 3.14159)
-        cr.stroke()
+            # Dark semi-transparent background
+            cr.set_source_rgba(0.1, 0.1, 0.1, 0.85)
+            cr.new_path()
+            cr.arc(radius, h / 2, radius, math.pi / 2, 3 * math.pi / 2)
+            cr.arc(w - radius, h / 2, radius, -math.pi / 2, math.pi / 2)
+            cr.close_path()
+            cr.fill()
+
+            # Pulsing red recording dot
+            dot_x = 16
+            dot_y = h / 2
+            cr.set_source_rgba(1.0, 0.2, 0.2, alpha)
+            cr.arc(dot_x, dot_y, 5, 0, 2 * math.pi)
+            cr.fill()
+
+            # "Dictating" text
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.95)
+            cr.select_font_face("Sans", 0, 0)
+            cr.set_font_size(12)
+            cr.move_to(28, h / 2 + 4)
+            cr.show_text("Dictating...")
+        else:
+            # Normal dot
+            color = COLORS.get(self.status, COLORS['idle'])
+            cr.set_source_rgba(*color)
+            cr.arc(DOT_SIZE / 2, DOT_SIZE / 2, DOT_SIZE / 2 - 2, 0, 2 * math.pi)
+            cr.fill()
+
+            cr.set_source_rgba(0.2, 0.2, 0.2, 0.5)
+            cr.set_line_width(1)
+            cr.arc(DOT_SIZE / 2, DOT_SIZE / 2, DOT_SIZE / 2 - 2, 0, 2 * math.pi)
+            cr.stroke()
 
         return False
 
@@ -1447,10 +1484,52 @@ class StatusIndicator(Gtk.Window):
             self.success_timeout = None
 
         self.status = status
+
+        if status == 'recording' and not self.is_expanded:
+            self._expand_pill()
+        elif status != 'recording' and self.is_expanded:
+            self._collapse_pill()
+
         self.queue_draw()
 
         if status == 'success':
             self.success_timeout = GLib.timeout_add(1500, self.return_to_idle)
+
+    def _expand_pill(self):
+        """Expand from dot to recording pill."""
+        self.is_expanded = True
+        self.pulse_alpha = 0.9
+        self.pulse_direction = -1
+        self.set_default_size(PILL_WIDTH, PILL_HEIGHT)
+        self.resize(PILL_WIDTH, PILL_HEIGHT)
+        # Shift left so pill is roughly centered on the original dot position
+        self.move(self.pos_x - (PILL_WIDTH - DOT_SIZE) // 2, self.pos_y - (PILL_HEIGHT - DOT_SIZE) // 2)
+        self.pulse_timer = GLib.timeout_add(50, self._pulse_tick)
+
+    def _collapse_pill(self):
+        """Collapse from pill back to dot."""
+        self.is_expanded = False
+        if self.pulse_timer:
+            GLib.source_remove(self.pulse_timer)
+            self.pulse_timer = None
+        self.set_default_size(DOT_SIZE, DOT_SIZE)
+        self.resize(DOT_SIZE, DOT_SIZE)
+        self.move(self.pos_x, self.pos_y)
+
+    def _pulse_tick(self):
+        """Animate the recording dot pulse."""
+        if not self.is_expanded:
+            self.pulse_timer = None
+            return False
+        self.pulse_alpha += self.pulse_direction * 0.04
+        if self.pulse_alpha <= 0.3:
+            self.pulse_alpha = 0.3
+            self.pulse_direction = 1
+        elif self.pulse_alpha >= 0.9:
+            self.pulse_alpha = 0.9
+            self.pulse_direction = -1
+        self.queue_draw()
+        return True
 
     def return_to_idle(self):
         self.status = 'idle'

@@ -267,8 +267,13 @@ class DeepgramSTT:
 
         self._dg_connection = dg_connection
 
-        # Start the WebSocket listener (SDK manages internally)
-        dg_connection.start_listening()
+        # start_listening() is BLOCKING (sync websocket receive loop).
+        # Run it in a daemon thread so the async event loop stays free
+        # for _audio_forward_loop() to send audio concurrently.
+        listener_thread = threading.Thread(
+            target=dg_connection.start_listening, daemon=True
+        )
+        listener_thread.start()
 
         self._connected = True
         self._reconnect_attempts = 0
@@ -282,13 +287,14 @@ class DeepgramSTT:
                 dg_connection.send_control(
                     ListenV1ControlMessage(type="Finalize")
                 )
-                # Exit context manager
+                # Exit context manager (closes WebSocket, unblocks listener thread)
                 self._dg_context.__exit__(None, None, None)
             except Exception:
                 pass
             self._connected = False
             self._dg_connection = None
             self._dg_context = None
+            listener_thread.join(timeout=5.0)
 
     # ── Deepgram event handlers ───────────────────────────────────
 
@@ -299,7 +305,11 @@ class DeepgramSTT:
     def _on_message(self, result, *args, **kwargs):
         """Handle Deepgram transcription results.
 
-        Deepgram sends three types of results:
+        The MESSAGE event fires for ALL event types (MetadataEvent,
+        SpeechStartedEvent, UtteranceEndEvent, ResultsEvent). Only
+        ResultsEvent has a .channel attribute with transcript data.
+
+        For ResultsEvent, Deepgram sends three sub-types:
         1. interim (is_final=False): partial/speculative transcript
         2. final (is_final=True, speech_final=False): confirmed text chunk
         3. speech_final (is_final=True, speech_final=True): end of utterance
@@ -307,6 +317,12 @@ class DeepgramSTT:
         We accumulate is_final chunks and flush on speech_final.
         """
         try:
+            # Only process Results events (type='Results') which have transcript data.
+            # Other events (MetadataEvent, SpeechStartedEvent, UtteranceEndEvent)
+            # also have a 'channel' field but it's List[int], not ListenV1Channel.
+            if getattr(result, 'type', None) != 'Results':
+                return
+
             channel = result.channel
             alternatives = channel.alternatives
             if not alternatives:
@@ -410,7 +426,6 @@ class DeepgramSTT:
         # Append to transcript buffer (shared with decision model)
         self._transcript_buffer.append(segment)
         self._segment_count += 1
-        print(f"STT [deepgram]: {text}", flush=True)
 
         # Callback for live_session event emission
         if self._on_segment:
