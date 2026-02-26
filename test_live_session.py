@@ -3226,6 +3226,147 @@ async def test_stt_stage_generation_id_tagging():
     assert transcript_frame.data == "Generation check"
 
 
+@test("DeepgramSTT: make_session stores deepgram_api_key on session")
+def test_deepgram_api_key_stored():
+    """Verify make_session() passes deepgram_api_key to the session object."""
+    session = make_session(deepgram_api_key="my-deepgram-key")
+    assert session.deepgram_api_key == "my-deepgram-key", \
+        f"Expected 'my-deepgram-key', got '{session.deepgram_api_key}'"
+
+
+@test("DeepgramSTT: _stt_stage discards first segment after gated->ungated transition")
+async def test_stt_stage_gated_transition_discard():
+    """When _stt_gated transitions from True to False, the first segment
+    arriving after ungating should be discarded (post-echo protection).
+    The second segment should pass through normally."""
+    from transcript_buffer import TranscriptSegment
+
+    session = make_session()
+    session.running = True
+    session._stt_out_q = asyncio.Queue(maxsize=50)
+    session._stt_flush_event = asyncio.Event()
+    session._deepgram_transcript_q = asyncio.Queue(maxsize=50)
+    session.generation_id = 0
+    session._bus = None
+
+    # Start with _was_stt_gated = True (simulates just-ungated state)
+    session._was_stt_gated = True
+    session._stt_gated = False
+
+    # First segment after ungating -- should be discarded
+    seg1 = TranscriptSegment(text="Post-echo discard me", timestamp=time.time(), source="user")
+    # Second segment -- should pass through
+    seg2 = TranscriptSegment(text="Real speech after gating", timestamp=time.time(), source="user")
+
+    await session._deepgram_transcript_q.put(seg1)
+    await session._deepgram_transcript_q.put(seg2)
+
+    async def run_stt_briefly():
+        task = asyncio.create_task(session._stt_stage())
+        await asyncio.sleep(0.3)
+        session.running = False
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    await run_stt_briefly()
+
+    frames = []
+    while not session._stt_out_q.empty():
+        frames.append(session._stt_out_q.get_nowait())
+
+    # Only the second segment should produce frames (EOU + TRANSCRIPT)
+    transcripts = [f for f in frames if f.type == FrameType.TRANSCRIPT]
+    assert len(transcripts) == 1, f"Expected 1 TRANSCRIPT (discarded post-echo), got {len(transcripts)}"
+    assert transcripts[0].data == "Real speech after gating"
+
+
+@test("DeepgramSTT: _stt_stage resets _post_barge_in after emitting frames")
+async def test_stt_stage_resets_post_barge_in():
+    """After emitting frames, _post_barge_in should be set to False."""
+    from transcript_buffer import TranscriptSegment
+
+    session = make_session()
+    session.running = True
+    session._stt_out_q = asyncio.Queue(maxsize=50)
+    session._stt_flush_event = asyncio.Event()
+    session._deepgram_transcript_q = asyncio.Queue(maxsize=50)
+    session.generation_id = 0
+    session._bus = None
+    session._post_barge_in = True  # Set to True before the test
+
+    segment = TranscriptSegment(text="Reset barge in", timestamp=time.time(), source="user")
+    await session._deepgram_transcript_q.put(segment)
+
+    async def run_stt_briefly():
+        task = asyncio.create_task(session._stt_stage())
+        await asyncio.sleep(0.2)
+        session.running = False
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    await run_stt_briefly()
+
+    assert session._post_barge_in == False, "_post_barge_in should be reset to False after emitting"
+
+    # Verify frames were actually emitted
+    frames = []
+    while not session._stt_out_q.empty():
+        frames.append(session._stt_out_q.get_nowait())
+    assert len(frames) == 2, f"Expected 2 frames, got {len(frames)}"
+
+
+@test("DeepgramSTT: _stt_stage handles multiple segments sequentially")
+async def test_stt_stage_multiple_segments():
+    """Multiple segments on the queue should each produce EOU + TRANSCRIPT pairs."""
+    from transcript_buffer import TranscriptSegment
+
+    session = make_session()
+    session.running = True
+    session._stt_out_q = asyncio.Queue(maxsize=50)
+    session._stt_flush_event = asyncio.Event()
+    session._deepgram_transcript_q = asyncio.Queue(maxsize=50)
+    session.generation_id = 5
+    session._bus = None
+
+    # Queue 3 segments
+    for i in range(3):
+        seg = TranscriptSegment(text=f"Segment {i}", timestamp=time.time(), source="user")
+        await session._deepgram_transcript_q.put(seg)
+
+    async def run_stt_briefly():
+        task = asyncio.create_task(session._stt_stage())
+        await asyncio.sleep(0.5)
+        session.running = False
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    await run_stt_briefly()
+
+    frames = []
+    while not session._stt_out_q.empty():
+        frames.append(session._stt_out_q.get_nowait())
+
+    eou_frames = [f for f in frames if f.type == FrameType.END_OF_UTTERANCE]
+    transcript_frames = [f for f in frames if f.type == FrameType.TRANSCRIPT]
+
+    assert len(eou_frames) == 3, f"Expected 3 EOU frames, got {len(eou_frames)}"
+    assert len(transcript_frames) == 3, f"Expected 3 TRANSCRIPT frames, got {len(transcript_frames)}"
+    assert [f.data for f in transcript_frames] == ["Segment 0", "Segment 1", "Segment 2"]
+    assert all(f.generation_id == 5 for f in frames), "All frames should have generation_id=5"
+
+
 # ══════════════════════════════════════════════════════════════════
 # Run all tests
 # ══════════════════════════════════════════════════════════════════
