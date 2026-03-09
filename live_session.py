@@ -31,6 +31,7 @@ from task_manager import TaskManager, ClaudeTask, TaskStatus
 from event_bus import EventBus, EventBusWriter, BusEvent, EventType, build_llm_context
 from deepgram_stt import DeepgramSTT
 from transcript_buffer import TranscriptBuffer, TranscriptSegment
+from backchannel import generate_backchannel_tts
 try:
     from vram_monitor import VRAMMonitor
 except ImportError:
@@ -59,7 +60,7 @@ TTS_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx"
 
 # Piper TTS configuration
 PIPER_CMD = str(Path.home() / ".local" / "share" / "push-to-talk" / "venv" / "bin" / "piper")
-PIPER_MODEL = str(Path.home() / ".local" / "share" / "push-to-talk" / "piper-voices" / "en_US-lessac-medium.onnx")
+PIPER_MODEL = str(Path.home() / ".local" / "share" / "push-to-talk" / "piper-voices" / "en_GB-cori-high.onnx")
 PIPER_SAMPLE_RATE = 22050
 
 # Tool intent map: human-readable descriptions for overlay display during tool use
@@ -264,6 +265,9 @@ class LiveSession:
 
         # AI question tracking (for trivial detection context)
         self._ai_asked_question = False
+
+        # Last assistant text for backchannel context
+        self._last_assistant_text = ''
 
         # Stream composer (created in run())
         self._composer = None
@@ -1179,15 +1183,35 @@ class LiveSession:
         if confidence < 0.4:
             category = "acknowledgment"
 
-        # Step 4: Lookup clip from response library
+        # Step 4: Race Haiku backchannel vs 800ms deadline
+        t_filler_start = time.time()
+        backchannel_text = None
+        backchannel_pcm = None
+        last_assistant = self._last_assistant_text or ''
+
+        try:
+            result = await asyncio.wait_for(
+                generate_backchannel_tts(user_text, category=category, last_assistant_text=last_assistant),
+                timeout=0.8  # 800ms total budget for Haiku + Piper
+            )
+            if result:
+                backchannel_text, backchannel_pcm = result
+                elapsed_ms = (time.time() - t_filler_start) * 1000
+                print(f"  [backchannel] Haiku: \"{backchannel_text}\" ({elapsed_ms:.0f}ms)", flush=True)
+        except asyncio.TimeoutError:
+            print("  [backchannel] Haiku timed out (>800ms), falling back to clip", flush=True)
+        except Exception as e:
+            print(f"  [backchannel] Haiku error: {e}, falling back to clip", flush=True)
+
+        # Step 5: Lookup clip from response library (fallback if Haiku failed)
         response = None
         clip_pcm = None
-        if self._response_library.is_loaded():
+        if not backchannel_pcm and self._response_library.is_loaded():
             response = self._response_library.lookup(category, subcategory=subcategory)
             if response:
                 clip_pcm = self._response_library.get_clip_pcm(response.id)
 
-        # Step 5: Log classification trace
+        # Step 6: Log classification trace
         self._log_event("classification",
             input_text=user_text,
             category=category,
@@ -1197,10 +1221,11 @@ class LiveSession:
             trivial=False,
             clip_id=response.id if response else None,
             clip_phrase=response.phrase if response else None,
-            fallback_used=response is None,
+            fallback_used=response is None and backchannel_pcm is None,
+            backchannel_text=backchannel_text,
         )
 
-        # Step 6: Gate -- skip if LLM responds fast (500ms)
+        # Step 7: Gate -- skip if LLM responds fast (500ms)
         try:
             await asyncio.wait_for(cancel_event.wait(), timeout=0.5)
             return
@@ -1210,12 +1235,25 @@ class LiveSession:
         if cancel_event.is_set():
             return
 
-        # Step 6b: Skip if user is still speaking (speech energy within last 500ms)
+        # Step 7b: Skip if user is still speaking (speech energy within last 500ms)
         if time.time() - self._last_speech_energy_time < 0.5:
             print("  [filler] Skipped — user still speaking", flush=True)
             return
 
-        # Step 7: Play clip via composer (or direct if composer not available)
+        # Step 8: Play backchannel (Haiku) or fall back to clip
+        if backchannel_pcm:
+            resampled = self._resample_22050_to_24000(backchannel_pcm)
+            if self._composer:
+                await self._composer.enqueue(
+                    AudioSegment(SegmentType.FILLER_CLIP, data=resampled)
+                )
+            else:
+                await self._play_filler_audio(resampled, cancel_event)
+            if backchannel_text:
+                self._log_event("assistant", text=backchannel_text, filler=True, backchannel=True)
+            return
+
+        # Step 9: Play pre-recorded clip via composer (or direct if composer not available)
         if clip_pcm:
             clip_pcm = self._resample_22050_to_24000(clip_pcm)
             # Mark social fillers as sufficient — composer will suppress LLM TTS
@@ -1234,7 +1272,7 @@ class LiveSession:
                 self._response_library.record_usage(response.id, barged_in=barged)
             return
 
-        # Step 8: Ultimate fallback -- existing random ack clip (old system)
+        # Step 10: Ultimate fallback -- existing random ack clip (old system)
         clip = self._pick_filler("acknowledgment")
         if clip:
             if self._composer:
@@ -2015,9 +2053,10 @@ class LiveSession:
                         if self._deepgram_stt and hasattr(self._deepgram_stt, 'set_recent_ai_speech'):
                             self._deepgram_stt.set_recent_ai_speech(list(self._spoken_sentences))
 
-        # Track ai_asked_question: check if last sentence is a question
+        # Track ai_asked_question and last assistant text for backchannel context
         if full_response.strip() and self.generation_id == gen_id:
             self._full_response_text = full_response.strip()
+            self._last_assistant_text = full_response[-200:] if full_response else ''
             last_sentence = self._spoken_sentences[-1] if self._spoken_sentences else ""
             if last_sentence.rstrip().endswith("?") or _AI_QUESTION_PATTERNS.search(last_sentence):
                 self._ai_asked_question = True
