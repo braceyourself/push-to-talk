@@ -13,7 +13,7 @@ Milestone: v2.0 Always-On Observer (Refreshed)
 Phase: 12 of 16 (Deepgram Streaming Infrastructure)
 Plan: --
 Status: Ready to plan
-Last activity: 2026-02-22 -- Roadmap created (5 phases, 29 requirements mapped)
+Last activity: 2026-03-09 -- Completed quick-003 (Haiku-driven backchannel responses)
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -58,12 +58,16 @@ v2.0 milestone decisions:
 
 - Assistant tool creation feature (user idea captured during Phase 8 execution)
 
+### Quick Tasks Completed
+
+- **quick-003:** Haiku-driven backchannel responses (2026-03-09) -- anthropic SDK added, backchannel.py module, 800ms race in _filler_manager
+
 ### Blockers/Concerns
 
 None.
 
 ## Session Continuity
 
-Last session: 2026-02-22
-Stopped at: Roadmap created, ready to plan Phase 12
+Last session: 2026-03-09
+Stopped at: Completed quick-003 (Haiku-driven backchannel responses)
 Resume file: None
