@@ -3368,6 +3368,133 @@ async def test_stt_stage_multiple_segments():
 
 
 # ══════════════════════════════════════════════════════════════════
+# Test Group: Backchannel Module
+# ══════════════════════════════════════════════════════════════════
+
+@test("generate_backchannel returns short text")
+async def test_generate_backchannel_returns_short_text():
+    """Mock Anthropic API to return a canned response. Verify short string returned."""
+    import backchannel as bc
+
+    # Reset singleton client
+    bc._client = None
+
+    mock_message = MagicMock()
+    mock_message.content = [MagicMock(text="Good question")]
+
+    mock_client = MagicMock()
+    mock_client.messages = MagicMock()
+    mock_client.messages.create = AsyncMock(return_value=mock_message)
+
+    with patch.object(bc, '_get_client', return_value=mock_client):
+        result = await bc.generate_backchannel("what's the weather like?")
+
+    assert result is not None, "Expected a string result"
+    assert result == "Good question"
+    words = result.split()
+    assert 1 <= len(words) <= 5, f"Expected 1-5 words, got {len(words)}: {result}"
+
+
+@test("generate_backchannel returns None on error")
+async def test_generate_backchannel_returns_none_on_error():
+    """Mock the API to raise an exception. Verify returns None."""
+    import backchannel as bc
+
+    bc._client = None
+
+    mock_client = MagicMock()
+    mock_client.messages = MagicMock()
+    mock_client.messages.create = AsyncMock(side_effect=Exception("API error"))
+
+    with patch.object(bc, '_get_client', return_value=mock_client):
+        result = await bc.generate_backchannel("test")
+
+    assert result is None, f"Expected None on error, got {result}"
+
+
+@test("generate_backchannel_tts returns tuple on success")
+async def test_generate_backchannel_tts_returns_tuple():
+    """Mock both API and Piper subprocess. Verify returns (text, bytes)."""
+    import backchannel as bc
+
+    bc._client = None
+
+    mock_message = MagicMock()
+    mock_message.content = [MagicMock(text="Good question")]
+
+    mock_client = MagicMock()
+    mock_client.messages = MagicMock()
+    mock_client.messages.create = AsyncMock(return_value=mock_message)
+
+    fake_pcm = b'\x00\x01' * 1000  # fake PCM bytes
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(fake_pcm, b''))
+
+    with patch.object(bc, '_get_client', return_value=mock_client), \
+         patch('asyncio.create_subprocess_exec', AsyncMock(return_value=mock_proc)):
+        result = await bc.generate_backchannel_tts("what do you think?")
+
+    assert result is not None, "Expected a tuple result"
+    text, pcm = result
+    assert text == "Good question"
+    assert pcm == fake_pcm
+
+
+@test("generate_backchannel_tts returns None on TTS failure")
+async def test_generate_backchannel_tts_returns_none_on_tts_failure():
+    """Mock API success but Piper failure. Verify returns None."""
+    import backchannel as bc
+
+    bc._client = None
+
+    mock_message = MagicMock()
+    mock_message.content = [MagicMock(text="Oh interesting")]
+
+    mock_client = MagicMock()
+    mock_client.messages = MagicMock()
+    mock_client.messages.create = AsyncMock(return_value=mock_message)
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(b'', b'error'))
+
+    with patch.object(bc, '_get_client', return_value=mock_client), \
+         patch('asyncio.create_subprocess_exec', AsyncMock(return_value=mock_proc)):
+        result = await bc.generate_backchannel_tts("test")
+
+    assert result is None, f"Expected None on TTS failure, got {result}"
+
+
+@test("backchannel includes context when last_assistant_text provided")
+async def test_backchannel_includes_context_when_provided():
+    """Verify the user message passed to API contains context string."""
+    import backchannel as bc
+
+    bc._client = None
+
+    mock_message = MagicMock()
+    mock_message.content = [MagicMock(text="You're welcome")]
+
+    mock_client = MagicMock()
+    mock_client.messages = MagicMock()
+    mock_client.messages.create = AsyncMock(return_value=mock_message)
+
+    with patch.object(bc, '_get_client', return_value=mock_client):
+        result = await bc.generate_backchannel(
+            "thanks",
+            last_assistant_text="I fixed the bug for you"
+        )
+
+    # Verify the API was called with context in the user message
+    call_args = mock_client.messages.create.call_args
+    messages = call_args.kwargs.get('messages', call_args[1].get('messages', []))
+    user_msg = messages[0]['content'] if messages else ''
+    assert 'I fixed the bug for you' in user_msg, \
+        f"Expected context in user message, got: {user_msg}"
+    assert result == "You're welcome"
+
+
+# ══════════════════════════════════════════════════════════════════
 # Run all tests
 # ══════════════════════════════════════════════════════════════════
 

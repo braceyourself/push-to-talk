@@ -37,3 +37,6 @@ model2vec
 
 # Sentence boundary detection
 pysbd
+
+# Anthropic API (for Haiku backchannel generation)
+anthropic
