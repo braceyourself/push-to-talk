@@ -774,9 +774,7 @@ class PushToTalk:
         self.vocab = VocabularyManager(VOCAB_FILE)
         self.history = deque(maxlen=HISTORY_SIZE)
 
-        print("Loading Whisper model...", flush=True)
-        self.model = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="int8_float16")
-        print(f"Whisper model '{WHISPER_MODEL}' loaded (faster-whisper, int8_float16).", flush=True)
+        # Whisper model is lazy-loaded on first transcription to avoid OOM at startup
         print(f"Push-to-Talk ready. Hold {ptt_name} to dictate.", flush=True)
 
         # Ensure mic is unmuted on startup (cleanup from interrupted sessions)
@@ -795,12 +793,20 @@ class PushToTalk:
             print("Auto-starting live session (auto_start_listening=true)", flush=True)
             self.start_live_session()
 
+    def _ensure_whisper_model(self):
+        """Lazy-load Whisper model on first use to avoid OOM at startup."""
+        if self.model is None:
+            print("Loading Whisper model (first use)...", flush=True)
+            self.model = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="int8_float16")
+            print(f"Whisper model '{WHISPER_MODEL}' loaded (faster-whisper, int8_float16).", flush=True)
+
     def _transcribe_file(self, audio_path: str, initial_prompt: str = None) -> str:
         """Transcribe an audio file using faster-whisper. Returns stripped text."""
         kwargs = dict(language='en', beam_size=5, condition_on_previous_text=False)
         if initial_prompt:
             kwargs['initial_prompt'] = initial_prompt
         with self.model_lock:
+            self._ensure_whisper_model()
             segments_gen, info = self.model.transcribe(audio_path, **kwargs)
             return " ".join(s.text.strip() for s in segments_gen).strip()
 

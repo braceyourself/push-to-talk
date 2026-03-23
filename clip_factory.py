@@ -32,7 +32,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 PIPER_CMD = str(Path.home() / ".local" / "share" / "push-to-talk" / "venv" / "bin" / "piper")
-PIPER_MODEL = str(Path.home() / ".local" / "share" / "push-to-talk" / "piper-voices" / "en_US-lessac-medium.onnx")
+PIPER_MODEL = str(Path.home() / ".local" / "share" / "push-to-talk" / "piper-voices" / "en_GB-cori-high.onnx")
 
 SAMPLE_RATE = 22050  # Piper native sample rate
 

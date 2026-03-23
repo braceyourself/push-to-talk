@@ -36,11 +36,24 @@ HAIKU_MODEL = "claude-haiku-4-5-20251001"
 SYSTEM_PROMPT = (
     "You generate ultra-short backchannel responses (1-5 words) to acknowledge "
     "what someone just said before a fuller response arrives. Match the tone: "
-    "casual for chat, attentive for questions, energetic for tasks. Never use "
-    'filler words like "um" or "uh". Just the words, no quotes or punctuation '
-    "except ! or ?. Examples: \"Oh interesting\", \"Yeah for sure\", "
-    "\"Good question\", \"On it\", \"Ha nice\""
+    "casual for chat, attentive for questions, energetic for tasks.\n\n"
+    "RULES:\n"
+    "- Output ONLY the spoken words. Nothing else.\n"
+    "- Never output stage directions, descriptions, or meta-commentary "
+    "(e.g. \"silent\", \"nods\", \"pauses\", \"thinking\", \"laughs\").\n"
+    "- Never use quotes, asterisks, brackets, or parentheses.\n"
+    "- Never use filler words like \"um\" or \"uh\".\n"
+    "- Only punctuation allowed: ! or ?\n\n"
+    "Examples: Oh interesting, Yeah for sure, Good question, On it, Ha nice"
 )
+
+# Responses that are meta-descriptions, not actual spoken words
+_BLOCKED_RESPONSES = frozenset({
+    "silent", "silence", "nods", "nod", "pauses", "pause", "thinking",
+    "laughs", "laugh", "smiles", "smile", "listens", "listening",
+    "waits", "waiting", "hmm", "...", "considers",
+})
+
 
 # Module-level singleton client (lazy-initialized)
 _client = None
@@ -53,6 +66,21 @@ def _get_client():
         import anthropic
         _client = anthropic.AsyncAnthropic()
     return _client
+
+
+def _validate_response(text: str) -> str | None:
+    """Filter out meta-descriptions and stage directions from Haiku output."""
+    import re
+    # Strip quotes, asterisks, brackets, parentheses
+    text = re.sub(r'[*\[\]()"\']', '', text).strip()
+    # Check against blocklist (case-insensitive, whole-response match)
+    if text.lower() in _BLOCKED_RESPONSES:
+        logger.debug("Blocked backchannel response: %r", text)
+        return None
+    # Reject if it looks like a stage direction: *action* or [action]
+    if not text or len(text) > 40:
+        return None
+    return text
 
 
 async def generate_backchannel(
@@ -90,7 +118,9 @@ async def generate_backchannel(
         if response.content:
             text = response.content[0].text.strip()
             if text:
-                return text
+                cleaned = _validate_response(text)
+                if cleaned:
+                    return cleaned
 
         return None
     except Exception as e:

@@ -273,6 +273,12 @@ class StreamComposer:
         if not isinstance(text, str) or not text.strip():
             return
 
+        # Filter stage directions like *silent*, *nods*, *pauses* etc.
+        stripped = text.strip()
+        if stripped.startswith('*') and stripped.endswith('*') and len(stripped) < 40:
+            logger.debug("Dropping stage direction from TTS: %r", stripped)
+            return
+
         # Filler already served as the response — drop LLM TTS
         if self._filler_sufficient:
             return

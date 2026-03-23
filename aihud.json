@@ -1,0 +1,32 @@
+{
+  "notifications": [
+    {
+      "id": "n177383973755139c8f93b",
+      "type": "test",
+      "summary": "Test notification",
+      "ts": 1773839737.5512755
+    },
+    {
+      "id": "n1774283281944a8854a72",
+      "type": "task_complete",
+      "summary": "Task 'test task' completed in 5.0s",
+      "ts": 1774283281.9442892
+    },
+    {
+      "id": "n1774283327852ad11e782",
+      "type": "task_complete",
+      "summary": "Task 'test task' completed in 5.0s",
+      "ts": 1774283327.8522568
+    },
+    {
+      "id": "n1774283337013aaaeab84",
+      "type": "task_complete",
+      "summary": "Task 'test task' completed in 5.0s",
+      "ts": 1774283337.0136938
+    }
+  ],
+  "tasks": [],
+  "learnings": [
+    "Test learning"
+  ]
+}

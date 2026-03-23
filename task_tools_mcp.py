@@ -213,6 +213,37 @@ TOOLS = [
             "required": []
         }
     },
+    {
+        "name": "check_hud",
+        "description": (
+            "Check the HUD for notification details, task status, and recent learnings. "
+            "Use when you see notifications in the HUD context and want full details, or want "
+            "to refresh your view of current state. Triggers a follow-up round to see updated HUD."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "dismiss_notification",
+        "description": (
+            "Dismiss a notification after you've addressed it. "
+            "This decreases the notification count in the HUD. "
+            "Pass the notification ID that was shown in check_hud output."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "notification_id": {
+                    "type": "string",
+                    "description": "The notification ID to dismiss (from check_hud output)"
+                }
+            },
+            "required": ["notification_id"]
+        }
+    },
 ]
 
 

@@ -32,6 +32,7 @@ from event_bus import EventBus, EventBusWriter, BusEvent, EventType, build_llm_c
 from deepgram_stt import DeepgramSTT
 from transcript_buffer import TranscriptBuffer, TranscriptSegment
 from backchannel import generate_backchannel_tts
+import aihud
 try:
     from vram_monitor import VRAMMonitor
 except ImportError:
@@ -325,6 +326,12 @@ class LiveSession:
         # Find claude CLI
         self._claude_cli_path = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
 
+        # HUD follow-up loop flag
+        self._hud_followup = False
+
+        # Custodian daemon
+        self._custodian_process = None
+
     # ── Personality (reused unchanged) ──────────────────────────────
 
     def _build_personality(self):
@@ -394,6 +401,26 @@ class LiveSession:
             print(f"Live session: Learner spawned (PID {self._learner_process.pid})", flush=True)
         except Exception as e:
             print(f"Live session: Failed to spawn learner: {e}", flush=True)
+
+    def _spawn_custodian(self):
+        """Spawn the background custodian daemon that reviews and prunes HUD/memories."""
+        custodian_script = Path(__file__).parent / "custodian.py"
+        if not custodian_script.exists():
+            print("Live session: custodian.py not found, skipping", flush=True)
+            return
+        # Pass session dir — custodian resolves to events.jsonl
+        session_dir = self._session_log_path.parent if self._session_log_path else None
+        if not session_dir:
+            return
+        cmd = [sys.executable, str(custodian_script), str(session_dir)]
+        try:
+            self._custodian_process = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+            print(f"Live session: Custodian spawned (PID {self._custodian_process.pid})", flush=True)
+        except Exception as e:
+            print(f"Live session: Failed to spawn custodian: {e}", flush=True)
 
     def _spawn_clip_factory(self):
         """Spawn the clip factory to top up the acknowledgment filler pool."""
@@ -686,13 +713,25 @@ class LiveSession:
                 } for e in events])
             return json.dumps([])
 
+        elif name == "check_hud":
+            hud = aihud.read_hud()
+            self._hud_followup = True
+            return json.dumps(hud)
+
+        elif name == "dismiss_notification":
+            notif_id = args.get("notification_id", "")
+            if notif_id:
+                aihud.dismiss_notification(notif_id)
+                return json.dumps({"success": True, "message": f"Notification {notif_id} dismissed"})
+            return json.dumps({"error": "No notification_id provided"})
+
         else:
             return json.dumps({"error": f"Unknown tool: {name}"})
 
     # ── Notifications ──────────────────────────────────────────────
 
     async def _on_task_complete(self, task):
-        """Handle task completion — emit bus event + queue notification for delivery."""
+        """Handle task completion — emit bus event + add to HUD."""
         if not self.running:
             return
         duration = (task.completed_at or time.time()) - (task.started_at or task.created_at)
@@ -701,19 +740,13 @@ class LiveSession:
             self._bus.emit("task_complete", gen=self.generation_id,
                           task_id=task.id, task_name=task.name,
                           duration=f"{duration:.1f}s", output_summary=output_tail[:1500])
-        self._notification_queue.append({
-            "type": "task_complete",
-            "task_id": task.id, "task_name": task.name,
-            "duration": f"{duration:.1f}s",
-            "output_summary": output_tail[:1500],
-            "project_dir": str(task.project_dir)
-        })
-        print(f"Live session: Queued completion notification for task {task.id} '{task.name}'", flush=True)
-        if not self.playing_audio:
-            await self._flush_notifications()
+        # Add to HUD
+        summary = f"Task '{task.name}' completed in {duration:.1f}s"
+        aihud.add_notification("task_complete", summary)
+        print(f"Live session: Added completion notification to HUD for task {task.id} '{task.name}'", flush=True)
 
     async def _on_task_failed(self, task):
-        """Handle task failure — emit bus event + queue notification for delivery."""
+        """Handle task failure — emit bus event + add to HUD."""
         if not self.running:
             return
         duration = (task.completed_at or time.time()) - (task.started_at or task.created_at)
@@ -722,17 +755,10 @@ class LiveSession:
             self._bus.emit("task_failed", gen=self.generation_id,
                           task_id=task.id, task_name=task.name,
                           duration=f"{duration:.1f}s", error_output=output_tail[:1500])
-        self._notification_queue.append({
-            "type": "task_failed",
-            "task_id": task.id, "task_name": task.name,
-            "duration": f"{duration:.1f}s",
-            "exit_code": task.return_code,
-            "error_output": output_tail[:1500],
-            "project_dir": str(task.project_dir)
-        })
-        print(f"Live session: Queued failure notification for task {task.id} '{task.name}'", flush=True)
-        if not self.playing_audio:
-            await self._flush_notifications()
+        # Add to HUD
+        summary = f"Task '{task.name}' failed after {duration:.1f}s (exit {task.return_code})"
+        aihud.add_notification("task_failed", summary)
+        print(f"Live session: Added failure notification to HUD for task {task.id} '{task.name}'", flush=True)
 
     async def _flush_notifications(self):
         """Deliver queued task notifications by sending to CLI."""
@@ -778,29 +804,50 @@ class LiveSession:
             await self._send_to_cli(message)
             await self._read_cli_response()
 
-    def _build_task_context(self) -> str:
-        """Build ambient task context string to prepend to user messages."""
-        running = self.task_manager.get_running_tasks()
-        recent_completed = [
-            t for t in self.task_manager.get_all_tasks()
-            if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
-            and t.completed_at and (time.time() - t.completed_at) < 300
-        ]
-        if not running and not recent_completed:
-            return ""
+    def _build_hud(self) -> str:
+        """Build compact HUD context line to prepend to user messages.
 
+        Format:
+        ---HUD---
+        🔔 2 | 📋 fix tests (45s) | 📝 Bun>npm, dog Biscuit
+        ---------
+        """
+        hud = aihud.read_hud()
+
+        # Collect HUD components
         parts = []
+
+        # Notification count
+        notif_count = len(hud.get("notifications", []))
+        if notif_count > 0:
+            parts.append(f"🔔 {notif_count}")
+
+        # Running tasks
+        running = hud.get("tasks", [])
         if running:
             task_strs = [
-                f"'{t.name}' (running {time.time() - (t.started_at or t.created_at):.0f}s)"
+                f"{t.get('name', 'task')} ({t.get('elapsed', '?')})"
                 for t in running
+                if t.get('status') == 'running'
             ]
-            parts.append(f"Running tasks: {', '.join(task_strs)}")
-        if recent_completed:
-            task_strs = [f"'{t.name}' ({t.status.value})" for t in recent_completed[:3]]
-            parts.append(f"Recently finished: {', '.join(task_strs)}")
+            if task_strs:
+                parts.append(f"📋 {', '.join(task_strs)}")
 
-        return "[Background task status] " + ". ".join(parts)
+        # Recent learnings
+        learnings = hud.get("learnings", [])
+        if learnings:
+            # Abbreviate learnings (max 50 chars total)
+            learning_strs = [
+                learning[:20] if len(learning) > 20 else learning
+                for learning in learnings[-3:]
+            ]
+            parts.append(f"📝 {', '.join(learning_strs)}")
+
+        if not parts:
+            return ""
+
+        hud_line = " | ".join(parts)
+        return f"---HUD---\n{hud_line}\n---------\n"
 
     # ── Status and timers ──────────────────────────────────────────
 
@@ -2422,9 +2469,9 @@ class LiveSession:
                         self._filler_manager(transcript, self._filler_cancel)
                     )
 
-                # Build user message with ambient task context + pipeline context
-                task_context = self._build_task_context()
-                user_content = f"{task_context}\n\n{transcript}" if task_context else transcript
+                # Build user message with HUD context + pipeline context
+                hud = self._build_hud()
+                user_content = f"{hud}{transcript}" if hud else transcript
 
                 # Inject pipeline context from event bus
                 if self._bus:
@@ -2456,6 +2503,24 @@ class LiveSession:
                     self._response_reader_task = None
                 t_done = time.time()
                 print(f"  [timing] CLI response: {t_done - t_sent:.2f}s, total: {t_done - t_start:.2f}s", flush=True)
+
+                # HUD follow-up loop — if check_hud was called, send updated HUD context
+                self._hud_followup = False
+                followup_count = 0
+                while self._hud_followup and followup_count < 3:
+                    self._hud_followup = False
+                    followup_count += 1
+                    print(f"Live session: HUD follow-up {followup_count}", flush=True)
+                    hud = self._build_hud()
+                    followup_msg = f"{hud}[HUD refreshed]" if hud else "[HUD refreshed]"
+                    await self._send_to_cli(followup_msg)
+                    self._response_reader_task = asyncio.create_task(self._read_cli_response())
+                    try:
+                        await self._response_reader_task
+                    except asyncio.CancelledError:
+                        print("Live session: CLI read cancelled during HUD followup", flush=True)
+                    finally:
+                        self._response_reader_task = None
 
                 # Cancel filler and acknowledgment if still running
                 if self._filler_cancel:
@@ -2851,6 +2916,7 @@ class LiveSession:
         active_file.parent.mkdir(parents=True, exist_ok=True)
         active_file.write_text(str(session_dir))
         self._spawn_learner()
+        self._spawn_custodian()
         self._spawn_clip_factory()
         self._spawn_classifier()
         self._ensure_seed_library()
@@ -2954,7 +3020,8 @@ class LiveSession:
 
             # Clean up background processes
             for name, proc in [("learner", self._learner_process),
-                               ("clip factory", self._clip_factory_process)]:
+                               ("clip factory", self._clip_factory_process),
+                               ("custodian", self._custodian_process)]:
                 if proc and proc.poll() is None:
                     try:
                         proc.terminate()

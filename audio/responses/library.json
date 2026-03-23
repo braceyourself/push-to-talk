@@ -112,6 +112,16 @@
       "last_used": 0.0
     },
     {
+      "id": "question_hmm,_let_me_think_about_that_001",
+      "category": "question",
+      "subcategory": "",
+      "phrase": "Hmm, let me think about that.",
+      "filename": "hmm,_let_me_think_about_that_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
       "id": "question_oh,_interesting_001",
       "category": "question",
       "subcategory": "",
@@ -197,6 +207,16 @@
       "subcategory": "greeting",
       "phrase": "Hey!",
       "filename": "hey!_001.wav",
+      "use_count": 0,
+      "barge_in_count": 0,
+      "last_used": 0.0
+    },
+    {
+      "id": "social_hey,_what's_up_001",
+      "category": "social",
+      "subcategory": "greeting",
+      "phrase": "Hey, what's up.",
+      "filename": "hey,_what's_up_001.wav",
       "use_count": 0,
       "barge_in_count": 0,
       "last_used": 0.0
@@ -317,16 +337,6 @@
       "subcategory": "excitement",
       "phrase": "Hell yeah.",
       "filename": "hell_yeah_001.wav",
-      "use_count": 0,
-      "barge_in_count": 0,
-      "last_used": 0.0
-    },
-    {
-      "id": "emotional_that_sucks_001",
-      "category": "emotional",
-      "subcategory": "frustration",
-      "phrase": "That sucks.",
-      "filename": "that_sucks_001.wav",
       "use_count": 0,
       "barge_in_count": 0,
       "last_used": 0.0

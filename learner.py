@@ -19,6 +19,7 @@ import subprocess
 from pathlib import Path
 
 from event_bus import EventBusWriter
+import aihud
 
 # Evaluation thresholds
 IDLE_SECONDS = 10       # seconds of no new events before evaluating
@@ -195,6 +196,12 @@ def process_extraction_output(output: str) -> str | None:
             filepath.write_text(header + content + "\n")
         print(f"Learner: Wrote to {filename}: {content[:60]}...", flush=True)
 
+        # Also add to HUD learnings
+        # Extract just the fact text (without comment markers)
+        fact_text = content.split("<!--")[0].strip()
+        if fact_text:
+            aihud.add_learning(fact_text)
+
     return notification if notification else None
 
 
@@ -287,6 +294,7 @@ def tail_and_evaluate(bus_path: Path):
                 if notification:
                     try:
                         bus_writer.emit("learner_notify", summary=notification)
+                        aihud.add_notification("learning", notification)
                         print(f"Learner: Notification emitted: {notification[:60]}...", flush=True)
                     except Exception as e:
                         print(f"Learner: Failed to emit notification: {e}", flush=True)
