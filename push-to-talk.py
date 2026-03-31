@@ -257,7 +257,7 @@ def load_config():
         "live_tts": "openai",            # "openai" or "piper"
         "live_fillers": True,            # Play filler sounds during processing
         "live_barge_in": True,           # Allow speaking over AI response
-        "auto_start_listening": True,    # Auto-start live session on service startup
+        "auto_start_listening": False,   # Auto-start live session on service startup
         "live_auto_mute": True,          # Allow key-based muting (tap/hold to mute)
         "live_idle_timeout": 0,          # Idle disconnect (seconds). 0 = never (always-on)
         # Deepgram streaming STT settings
