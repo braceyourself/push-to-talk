@@ -20,6 +20,7 @@ from deepgram.extensions.types.sockets.listen_v1_control_message import (
 SAMPLE_RATE = 16000
 CHANNELS = 1
 CHUNK_SIZE = 4096  # ~128ms at 16kHz 16-bit mono
+FINALIZE_WAIT = 1.5  # seconds to wait for final transcript after key release
 
 
 class StreamingDictation:
@@ -31,10 +32,12 @@ class StreamingDictation:
         self._on_status = on_status or (lambda s: None)
         self._running = False
         self._stop_event = threading.Event()
+        self._finalized = threading.Event()
         self._dg_connection = None
         self._dg_context = None
         self._record_proc = None
-        self._has_typed = False  # Whether we've typed anything yet
+        self._listener_thread = None
+        self._has_typed = False
 
     @property
     def running(self):
@@ -46,47 +49,23 @@ class StreamingDictation:
             return
         self._running = True
         self._stop_event.clear()
+        self._finalized.clear()
         self._has_typed = False
         threading.Thread(target=self._run, daemon=True).start()
 
     def stop(self):
-        """Stop streaming dictation gracefully."""
-        if not self._running:
-            return
-        self._running = False
+        """Signal stop — the worker thread handles graceful shutdown."""
         self._stop_event.set()
-
-        if self._record_proc:
-            try:
-                self._record_proc.terminate()
-                self._record_proc.wait(timeout=2)
-            except Exception:
-                pass
-            self._record_proc = None
-
-        if self._dg_connection:
-            try:
-                self._dg_connection.send_control(
-                    ListenV1ControlMessage(type="Finalize")
-                )
-            except Exception:
-                pass
-
-        if self._dg_context:
-            try:
-                self._dg_context.__exit__(None, None, None)
-            except Exception:
-                pass
-            self._dg_context = None
-        self._dg_connection = None
 
     def _run(self):
         """Connect to Deepgram, capture audio, stream it, type results."""
+        dg_connection = None
+        dg_context = None
         try:
             self._on_status('recording')
 
             client = DeepgramClient(api_key=self._api_key)
-            self._dg_context = client.listen.v1.connect(
+            dg_context = client.listen.v1.connect(
                 model="nova-3",
                 encoding="linear16",
                 sample_rate=str(SAMPLE_RATE),
@@ -98,20 +77,20 @@ class StreamingDictation:
                 punctuate="true",
                 language="en",
             )
-            dg_connection = self._dg_context.__enter__()
+            dg_connection = dg_context.__enter__()
+            self._dg_connection = dg_connection
+            self._dg_context = dg_context
 
             dg_connection.on(EventType.OPEN, self._on_open)
             dg_connection.on(EventType.MESSAGE, self._on_message)
             dg_connection.on(EventType.ERROR, self._on_error)
             dg_connection.on(EventType.CLOSE, self._on_close)
 
-            self._dg_connection = dg_connection
-
             # start_listening() is BLOCKING — run in daemon thread
-            listener_thread = threading.Thread(
+            self._listener_thread = threading.Thread(
                 target=dg_connection.start_listening, daemon=True
             )
-            listener_thread.start()
+            self._listener_thread.start()
 
             # Capture audio from default mic via PipeWire
             self._record_proc = subprocess.Popen(
@@ -124,7 +103,7 @@ class StreamingDictation:
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )
 
-            # Forward audio chunks to Deepgram
+            # Forward audio chunks to Deepgram until stop signal
             while not self._stop_event.is_set():
                 data = self._record_proc.stdout.read(CHUNK_SIZE)
                 if not data:
@@ -134,11 +113,40 @@ class StreamingDictation:
                 except Exception:
                     break
 
+            # ── Key released: flush remaining audio ──────────────────
+            # Stop recording
+            if self._record_proc:
+                self._record_proc.terminate()
+                self._record_proc.wait(timeout=2)
+                self._record_proc = None
+
+            # Tell Deepgram to flush its buffer and send final transcript
+            self._on_status('processing')
+            try:
+                dg_connection.send_control(
+                    ListenV1ControlMessage(type="Finalize")
+                )
+            except Exception:
+                pass
+
+            # Wait for the final transcript to arrive
+            self._finalized.wait(timeout=FINALIZE_WAIT)
+
         except Exception as e:
             print(f"StreamingDictation: error: {e}", flush=True)
             self._on_status('error')
         finally:
-            self.stop()
+            # Clean up connection
+            if dg_context:
+                try:
+                    dg_context.__exit__(None, None, None)
+                except Exception:
+                    pass
+            if self._listener_thread:
+                self._listener_thread.join(timeout=2)
+            self._dg_connection = None
+            self._dg_context = None
+            self._running = False
             self._on_status('idle')
             print("StreamingDictation: stopped", flush=True)
 
@@ -148,10 +156,11 @@ class StreamingDictation:
         print("StreamingDictation: connected to Deepgram", flush=True)
 
     def _on_close(self, *args):
-        pass
+        self._finalized.set()  # Unblock wait on close
 
     def _on_error(self, *args):
         print(f"StreamingDictation: websocket error", flush=True)
+        self._finalized.set()
 
     def _on_message(self, *args):
         """Handle transcript results — type finals into focused window."""
@@ -166,6 +175,9 @@ class StreamingDictation:
 
             transcript = alternatives[0].transcript.strip()
             if not transcript:
+                # Empty final after Finalize = Deepgram is done
+                if result.is_final and self._stop_event.is_set():
+                    self._finalized.set()
                 return
 
             if not result.is_final:
@@ -179,6 +191,10 @@ class StreamingDictation:
             self._on_final(transcript)
             print(f"StreamingDictation: '{transcript}'", flush=True)
 
+            # If we're in shutdown, this final transcript might be the last
+            if self._stop_event.is_set():
+                self._finalized.set()
+
         except Exception as e:
             print(f"StreamingDictation: message error: {e}", flush=True)
 
@@ -186,36 +202,12 @@ class StreamingDictation:
 
     @staticmethod
     def _type_text(text):
-        """Paste text into the focused window via clipboard.
+        """Type text into the focused window using xdotool.
 
-        Using xdotool type while Right Ctrl is held causes character drops
-        because --clearmodifiers fights with the physical key state.
-        Clipboard paste is a single atomic operation — much more reliable.
+        Transcripts arrive after key release so modifiers are clear.
+        xdotool type is simpler and doesn't interfere with clipboard.
         """
-        # Save current clipboard, paste our text, restore
-        try:
-            old_clip = subprocess.run(
-                ['xclip', '-selection', 'clipboard', '-o'],
-                capture_output=True, timeout=2,
-            ).stdout
-        except Exception:
-            old_clip = None
-
         subprocess.run(
-            ['xclip', '-selection', 'clipboard'],
-            input=text.encode(), timeout=2,
+            ['xdotool', 'type', '--clearmodifiers', '--delay', '8', text],
+            timeout=10, capture_output=True,
         )
-        subprocess.run(
-            ['xdotool', 'key', '--clearmodifiers', 'ctrl+v'],
-            timeout=5,
-        )
-
-        # Restore clipboard after a brief delay
-        if old_clip is not None:
-            try:
-                subprocess.Popen(
-                    ['xclip', '-selection', 'clipboard'],
-                    stdin=subprocess.PIPE,
-                ).communicate(input=old_clip, timeout=2)
-            except Exception:
-                pass

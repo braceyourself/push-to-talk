@@ -1837,6 +1837,7 @@ class LiveSession:
         except Exception as e:
             print(f"Live session: Error sending to CLI: {e}", flush=True)
             self._cli_ready = False
+            self._set_status("listening")
 
     async def _drain_stale_cli_output(self):
         """Drain leftover CLI output from a previous cancelled read until we see a result message."""
@@ -1902,6 +1903,7 @@ class LiveSession:
                     # CLI process ended
                     print("Live session: CLI process ended unexpectedly", flush=True)
                     self._cli_ready = False
+                    self._set_status("listening")
                     break
 
                 line_str = line.decode().strip()

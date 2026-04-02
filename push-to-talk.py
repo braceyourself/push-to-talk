@@ -733,6 +733,7 @@ class PushToTalk:
         self.stream_stop_event = threading.Event()
         self.last_transcribed_words = []  # For deduplication
         self.streaming_dictation = None  # StreamingDictation instance
+        self._stream_stop_timer = None  # Debounce timer for key repeat
 
         # Load config
         self.config = load_config()
@@ -1088,7 +1089,10 @@ class PushToTalk:
             print("Already recording, skipping", flush=True)
             return
         if self.streaming_dictation and self.streaming_dictation.running:
-            print("Streaming dictation active, skipping", flush=True)
+            # Cancel any pending stop from key auto-repeat
+            if self._stream_stop_timer:
+                self._stream_stop_timer.cancel()
+                self._stream_stop_timer = None
             return
 
         # Reload config to pick up any changes from indicator
@@ -1339,6 +1343,14 @@ class PushToTalk:
         )
         self.streaming_dictation.start()
         print("Streaming dictation started (Deepgram real-time)", flush=True)
+
+    def _deferred_stop_streaming(self):
+        """Called after debounce timer — only stops if key is truly released."""
+        self._stream_stop_timer = None
+        if self.streaming_dictation and self.streaming_dictation.running:
+            if not self.ctrl_r_pressed:
+                print("PTT key released, stopping streaming dictation", flush=True)
+                self._stop_streaming_dictation()
 
     def _stop_streaming_dictation(self):
         """Stop real-time Deepgram streaming dictation."""
@@ -2491,10 +2503,12 @@ class PushToTalk:
 
                 return
 
-        # Stop streaming dictation on PTT key release
+        # Stop streaming dictation on PTT key release (debounced for key repeat)
         if key == self.ptt_key and self.streaming_dictation and self.streaming_dictation.running:
-            print("PTT key released, stopping streaming dictation", flush=True)
-            self._stop_streaming_dictation()
+            if self._stream_stop_timer:
+                self._stream_stop_timer.cancel()
+            self._stream_stop_timer = threading.Timer(0.15, self._deferred_stop_streaming)
+            self._stream_stop_timer.start()
             return
 
         # Stop recording when keys are released (but NOT realtime session - that's toggle-based)
