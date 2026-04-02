@@ -86,6 +86,7 @@ if not os.environ.get('XAUTHORITY'):
 
 from faster_whisper import WhisperModel
 from pynput import keyboard
+from streaming_dictation import StreamingDictation
 
 # Import OpenAI for TTS (optional)
 try:
@@ -246,7 +247,7 @@ def load_config():
         "indicator_x": None,
         "indicator_y": None,
         "smart_transcription": False,  # Use AI to fix transcription errors
-        "dictation_mode": "dictate",  # "dictate", "prompt", or "stream"
+        "dictation_mode": "stream",  # "stream" (real-time Deepgram), "dictate", or "prompt"
         "save_audio": False,  # Save recordings to disk
         "audio_dir": "~/Audio/push-to-talk",  # Where to save recordings
         "interview_topic": "",  # Topic for interview mode
@@ -731,6 +732,7 @@ class PushToTalk:
         self.stream_active = False
         self.stream_stop_event = threading.Event()
         self.last_transcribed_words = []  # For deduplication
+        self.streaming_dictation = None  # StreamingDictation instance
 
         # Load config
         self.config = load_config()
@@ -1085,13 +1087,16 @@ class PushToTalk:
         if self.recording or self.stream_active:
             print("Already recording, skipping", flush=True)
             return
+        if self.streaming_dictation and self.streaming_dictation.running:
+            print("Streaming dictation active, skipping", flush=True)
+            return
 
         # Reload config to pick up any changes from indicator
         self.config = load_config()
 
-        # Check for stream mode
+        # Check for stream mode — use Deepgram real-time streaming
         if self.config.get('dictation_mode') == 'stream' and not force:
-            self.start_stream_mode()
+            self._start_streaming_dictation()
             return
 
         self.recording = True
@@ -1314,8 +1319,46 @@ class PushToTalk:
             return True  # Was interrupted
         return False
 
+    def _start_streaming_dictation(self):
+        """Start real-time Deepgram streaming dictation."""
+        api_key = get_deepgram_api_key()
+        if not api_key:
+            print("Streaming dictation requires Deepgram API key", flush=True)
+            self.show_error("Deepgram API key required for streaming dictation")
+            return
+
+        # Mute live session during streaming dictation
+        if self.live_session and not self.live_session.muted:
+            self._ptt_muted_live = True
+            self.live_session.set_muted(True)
+
+        self.streaming_dictation = StreamingDictation(
+            api_key=api_key,
+            on_final=lambda t: self.history.append(t),
+            on_status=set_status,
+        )
+        self.streaming_dictation.start()
+        print("Streaming dictation started (Deepgram real-time)", flush=True)
+
+    def _stop_streaming_dictation(self):
+        """Stop real-time Deepgram streaming dictation."""
+        if self.streaming_dictation and self.streaming_dictation.running:
+            self.streaming_dictation.stop()
+            print("Streaming dictation stopped", flush=True)
+
+        # Restore live session mute
+        if getattr(self, '_ptt_muted_live', False):
+            self._ptt_muted_live = False
+            if self.live_session and self.live_session.running:
+                self.live_session.set_muted(False)
+
+        if self.live_session and self.live_session.running:
+            set_status('listening')
+        else:
+            set_status('idle')
+
     def start_stream_mode(self):
-        """Start streaming transcription - records and transcribes in chunks."""
+        """Start streaming transcription - records and transcribes in chunks (legacy)."""
         self.stream_active = True
         self.stream_stop_event.clear()
         self.last_transcribed_words = []
@@ -2447,6 +2490,12 @@ class PushToTalk:
                         print(f"Live hold ({elapsed_ms}ms): muted (released)", flush=True)
 
                 return
+
+        # Stop streaming dictation on PTT key release
+        if key == self.ptt_key and self.streaming_dictation and self.streaming_dictation.running:
+            print("PTT key released, stopping streaming dictation", flush=True)
+            self._stop_streaming_dictation()
+            return
 
         # Stop recording when keys are released (but NOT realtime session - that's toggle-based)
         if key in (self.ptt_key, self.ai_key):
