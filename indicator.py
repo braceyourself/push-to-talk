@@ -2600,53 +2600,9 @@ def main():
             print("Starting floating indicator", flush=True)
             indicator = StatusIndicator()
 
-    # Create live overlay (hidden by default)
-    global _live_overlay
-    _live_overlay = LiveOverlayWidget()
-
-    # Poll for status updates and show/hide appropriate indicator
-    def check_status():
-        try:
-            cfg = load_config()
-            is_live = cfg.get('ai_mode', 'claude') == 'live'
-            if is_live:
-                # Hide dot indicator if it exists
-                if indicator and isinstance(indicator, StatusIndicator) and indicator.get_visible():
-                    indicator.hide()
-                # Show live overlay
-                if not _live_overlay.get_visible():
-                    _live_overlay.show_all()
-                # Route status updates to overlay (supports JSON metadata)
-                if STATUS_FILE.exists():
-                    content = STATUS_FILE.read_text().strip()
-                    if content.startswith('{'):
-                        try:
-                            data = json.loads(content)
-                            status = data.get('status', 'idle')
-                            metadata = data
-                        except (json.JSONDecodeError, ValueError):
-                            status = content
-                            metadata = None
-                    else:
-                        status = content
-                        metadata = None
-                    # Don't override user-set muted status
-                    if _live_overlay.status == 'muted' and status != 'muted':
-                        pass  # Keep muted until explicitly changed
-                    else:
-                        _live_overlay.update_status(status, metadata)
-            else:
-                # Hide live overlay
-                if _live_overlay.get_visible():
-                    _live_overlay.hide()
-                # Show dot indicator if it exists
-                if indicator and isinstance(indicator, StatusIndicator) and not indicator.get_visible():
-                    indicator.show_all()
-        except Exception:
-            pass
-        return True
-
-    GLib.timeout_add(500, check_status)
+    # Live overlay disabled — status shown in tint2 topbar instead
+    # global _live_overlay
+    # _live_overlay = LiveOverlayWidget()
 
     Gtk.main()
 
