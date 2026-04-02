@@ -186,8 +186,36 @@ class StreamingDictation:
 
     @staticmethod
     def _type_text(text):
-        """Type text into the focused window using xdotool."""
+        """Paste text into the focused window via clipboard.
+
+        Using xdotool type while Right Ctrl is held causes character drops
+        because --clearmodifiers fights with the physical key state.
+        Clipboard paste is a single atomic operation — much more reliable.
+        """
+        # Save current clipboard, paste our text, restore
+        try:
+            old_clip = subprocess.run(
+                ['xclip', '-selection', 'clipboard', '-o'],
+                capture_output=True, timeout=2,
+            ).stdout
+        except Exception:
+            old_clip = None
+
         subprocess.run(
-            ['xdotool', 'type', '--clearmodifiers', '--delay', '8', text],
-            timeout=10, capture_output=True,
+            ['xclip', '-selection', 'clipboard'],
+            input=text.encode(), timeout=2,
         )
+        subprocess.run(
+            ['xdotool', 'key', '--clearmodifiers', 'ctrl+v'],
+            timeout=5,
+        )
+
+        # Restore clipboard after a brief delay
+        if old_clip is not None:
+            try:
+                subprocess.Popen(
+                    ['xclip', '-selection', 'clipboard'],
+                    stdin=subprocess.PIPE,
+                ).communicate(input=old_clip, timeout=2)
+            except Exception:
+                pass

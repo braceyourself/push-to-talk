@@ -2057,7 +2057,7 @@ class LiveOverlayWidget(Gtk.Window):
         self.set_skip_taskbar_hint(True)
         self.set_skip_pager_hint(True)
         self.set_accept_focus(False)
-        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
         self.set_app_paintable(True)
         self.set_default_size(self.OVERLAY_WIDTH, self.OVERLAY_HEIGHT)
         self.set_resizable(True)
